@@ -20,7 +20,7 @@ const PinSchema = new mongoose.Schema({
     tokens: { type: Number, required: true },
     used: { type: Boolean, default: false }
 });
-const Pin = mongoose.model('Pin', PinSchema);
+const Pin = mongoose.model('Pin', PinSchema, 'pines'); // 👈 El tercer parámetro fuerza el nombre de la colección
 
 const PreviewSchema = new mongoose.Schema({
     deviceId: { type: String, required: true },
