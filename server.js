@@ -388,12 +388,12 @@ app.post('/api/redeem', async (req, res) => {
             return res.status(404).json({ error: 'El pin prepago introducido no existe en el sistema.' });
         }
 
-        if (pinEncontrado.usado) {
+        if (pinEncontrado.used) {
             return res.status(400).json({ error: 'Este pin ya fue canjeado. Los códigos son de un único uso.' });
         }
 
         // 🔒 Cambiamos el estado a usado y guardamos el cambio en la base de datos
-        pinEncontrado.usado = true;
+        pinEncontrado.used = true;
         await pinEncontrado.save();
 
         return res.json({
