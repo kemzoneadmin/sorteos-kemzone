@@ -373,32 +373,37 @@ app.get('/api/proxy-image', async (req, res) => {
 // =================================================================
 // 4. ENDPOINT: PROCESADOR DE PINES (MONGO DB INTERGATED)
 // =================================================================
+// 📑 MÓDULO DE VALIDACIÓN DE PINES CON MONGODB
 app.post('/api/redeem', async (req, res) => {
     const { code } = req.body;
     if (!code) return res.status(400).json({ error: 'El código es estrictamente requerido.' });
 
-    const pinLimpio = code.trim().toUpperCase();
-
     try {
+        const pinLimpio = code.trim().toUpperCase();
+        
+        // 🔍 Buscamos el pin directamente en la colección de MongoDB Atlas
         const pinEncontrado = await Pin.findOne({ code: pinLimpio });
 
         if (!pinEncontrado) {
             return res.status(404).json({ error: 'El pin prepago introducido no existe en el sistema.' });
         }
 
-        if (pinEncontrado.used) {
+        if (pinEncontrado.usado) {
             return res.status(400).json({ error: 'Este pin ya fue canjeado. Los códigos son de un único uso.' });
         }
 
-        // 🔒 QUEMADO DEL CÓDIGO DIRECTO EN MONGO
-        pinEncontrado.used = true;
+        // 🔒 Cambiamos el estado a usado y guardamos el cambio en la base de datos
+        pinEncontrado.usado = true;
         await pinEncontrado.save();
-        
-        console.log(`[🎟️ LOG]: Pin prepago redimido con éxito: ${pinLimpio} | +${pinEncontrado.tokens} Tokems.`);
-        return res.json({ success: true, tokens: pinEncontrado.tokens });
+
+        return res.json({
+            success: true,
+            tokens: pinEncontrado.tokens
+        });
 
     } catch (error) {
-        return res.status(500).json({ error: 'Fallo interno en base de datos central.' });
+        console.error('Error en el proceso de canje:', error);
+        return res.status(500).json({ error: 'Error interno del servidor al validar el pin.' });
     }
 });
 
