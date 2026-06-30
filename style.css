@@ -1,0 +1,1409 @@
+/* 🌐 Fuentes de Google para Gaming y UI Premium */
+@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Poppins:wght@400;600&display=swap');
+
+/* =================================================================
+   1. RESET Y ESTILOS GLOBALES
+   ================================================================= */
+* { 
+    margin: 0; 
+    padding: 0; 
+    box-sizing: border-box; 
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+    -webkit-tap-highlight-color: transparent; 
+}
+
+body { 
+    background-color: #0d0d14; 
+    color: white; 
+    min-height: 100vh; 
+    display: flex; 
+    justify-content: center; 
+    align-items: center; 
+    overflow-x: hidden; 
+    position: relative; 
+    transition: background-color 0.4s ease, color 0.4s ease; 
+}
+
+.pantalla { 
+    display: none; 
+    width: 100%; 
+    max-width: 900px; 
+    padding: 20px; 
+    text-align: center; 
+    animation: fadeIn 0.4s ease forwards; 
+    position: relative;
+}
+
+.pantalla.active { display: block; }
+.hidden { display: none !important; }
+
+@keyframes fadeIn { 
+    from { opacity: 0; transform: translateY(10px); } 
+    to { opacity: 1; transform: translateY(0); } 
+}
+
+h2 { 
+    font-size: 2rem; 
+    margin-bottom: 30px; 
+    color: #ff6600; 
+    text-shadow: 0 0 10px rgba(255,102,0,0.3); 
+    transition: color 0.3s ease; 
+}
+
+/* =================================================================
+   2. PANTALLA DE CARGA (SPLASH SCREEN)
+   ================================================================= */
+.splash-container { display: none; height: 100vh; align-items: center; justify-content: center; }
+.splash-container.active { display: flex; }
+.splash-layout { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 20px; width: 100%; }
+
+.logo-wrapper-splash { position: relative; display: inline-block; text-align: center; }
+.logo-text { font-size: 2.5rem; text-transform: uppercase; letter-spacing: 3px; color: #ff6600; text-shadow: 0 0 15px rgba(255, 102, 0, 0.6); margin: 0; transition: color 0.3s ease; }
+
+.kem-splash { position: absolute; width: 160px; height: auto; bottom: 36px; left: 80%; transform: translateX(-50%); filter: drop-shadow(0 6px 10px rgba(0,0,0,0.8)); animation: none !important; z-index: 5; }
+.loader { border: 5px solid rgba(255,255,255,0.05); border-top: 5px solid #ff6600; border-radius: 50%; width: 60px; height: 60px; animation: spin 1s linear infinite; }
+
+@keyframes spin { 100% { transform: rotate(360deg); } }
+
+/* =================================================================
+   3. MENÚ PRINCIPAL Y TARJETAS
+   ================================================================= */
+.opciones-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 15px; }
+
+.menu-card { 
+    background: rgba(26, 26, 36, 0.6); 
+    backdrop-filter: blur(10px); 
+    border: 1px solid rgba(255, 255, 255, 0.05); 
+    border-radius: 16px; 
+    padding: 25px 15px; 
+    color: white; 
+    cursor: pointer; 
+    transition: 0.3s; 
+    box-shadow: 0 10px 20px rgba(0,0,0,0.3); 
+}
+.menu-card.disabled { opacity: 0.4; cursor: not-allowed; }
+
+.menu-card:nth-child(1):hover:not(.disabled),
+.menu-card:nth-child(3):hover:not(.disabled),
+.menu-card:nth-child(5):hover:not(.disabled) { 
+    border-color: rgba(255, 102, 0, 0.5); 
+    box-shadow: 0 10px 25px rgba(255, 102, 0, 0.2); 
+    transform: translateY(-5px); 
+}
+.menu-card:nth-child(2):hover:not(.disabled) { border-color: rgba(0, 255, 204, 0.5); box-shadow: 0 10px 25px rgba(0, 255, 204, 0.2); transform: translateY(-5px); }
+.icon { font-size: 2.5rem; display: block; margin-bottom: 10px; }
+
+.premium-card { background: linear-gradient(135deg, rgba(26, 26, 36, 0.8), rgba(40, 20, 40, 0.6)); border: 1px solid rgba(255, 0, 255, 0.3) !important; box-shadow: 0 5px 15px rgba(255, 0, 255, 0.1); }
+.premium-card:hover:not(.disabled) { border-color: #ff00ff !important; box-shadow: 0 10px 25px rgba(255, 0, 255, 0.3) !important; }
+
+/* =================================================================
+   4. BOTONES FLOTANTES Y CONTROL DE VOLUMEN
+   ================================================================= */
+.float-btn { 
+    position: absolute; top: 55px; width: 45px; height: 45px; 
+    background: rgba(26, 26, 36, 0.8); backdrop-filter: blur(5px); 
+    border: 1px solid rgba(255,255,255,0.05); border-radius: 50%; 
+    color: white; font-size: 1.2rem; cursor: pointer; 
+    display: flex; justify-content: center; align-items: center; 
+    transition: 0.3s; z-index: 100; box-shadow: 0 5px 15px rgba(0,0,0,0.5);
+}
+.btn-config { right: 15px; font-size: 1.4rem; } 
+.btn-config:hover { border-color: #00ffcc; box-shadow: 0 0 15px rgba(0,255,204,0.5); transform: scale(1.1); }
+.btn-vol { right: 15px; } 
+.btn-vol:hover { border-color: #ff6600; box-shadow: 0 0 15px rgba(255,102,0,0.5); transform: scale(1.1); }
+
+.btn-stop { 
+    left: 135px !important; 
+    border: 1px solid rgba(255, 69, 58, 0.4) !important;
+    color: #ff453a !important;
+    background: rgba(26, 26, 36, 0.9) !important;
+}
+.btn-stop:hover { border-color: #ff453a; box-shadow: 0 0 15px rgba(255,69,58,0.5); transform: scale(1.1); }
+.btn-fullscreen { right: 70px; font-size: 1.2rem; } 
+.btn-fullscreen:hover { border-color: #ff00ff; box-shadow: 0 0 15px rgba(255,0,255,0.5); transform: scale(1.1); }
+
+.volume-popup { position: absolute; top: 70px; right: 15px; background: rgba(26, 26, 36, 0.95); backdrop-filter: blur(15px); border: 1px solid rgba(255, 102, 0, 0.3); border-radius: 16px; padding: 15px; width: 220px; box-shadow: 0 15px 35px rgba(0,0,0,0.8); display: flex; flex-direction: column; gap: 10px; z-index: 120; transition: background 0.3s, color 0.3s;}
+.volume-popup h3 { color: #ff6600; font-size: 14px; text-transform: uppercase; margin-bottom: 5px; }
+.volume-row { display: flex; flex-direction: column; gap: 4px; text-align: left;}
+.volume-row label { font-size: 12px; color: #bbb; font-weight: bold; transition: color 0.3s; }
+.volume-row input[type="range"] { width: 100%; accent-color: #ff6600; cursor: pointer; }
+.volume-divider { border: 0; border-top: 1px solid rgba(255,255,255,0.05); margin: 5px 0; }
+.checkbox-row { flex-direction: row; justify-content: space-between; align-items: center; }
+.checkbox-row input[type="checkbox"] { accent-color: #ff6600; width: 16px; height: 16px; }
+
+/* =================================================================
+   5. LAYOUT CONTENEDORES DE MÁQUINAS (GLASSMORPHISM)
+   ================================================================= */
+.titulo-herramienta { color: #ff6600; margin-bottom: 20px; font-size: 2.2rem; font-weight: 900; letter-spacing: 3px; text-shadow: 0 0 15px rgba(255, 102, 0, 0.6); transition: color 0.3s ease; }
+.layout-maquinas { display: flex; gap: 30px; background: rgba(26, 26, 36, 0.5); backdrop-filter: blur(12px); border: 1px solid rgba(255, 255, 255, 0.05); border-radius: 20px; padding: 30px; margin-bottom: 20px; align-items: center; justify-content: center; box-shadow: 0 25px 50px rgba(0,0,0,0.4); position: relative; transition: background 0.3s, border-color 0.3s, box-shadow 0.3s;}
+.panel-izquierdo { flex: 1; display: flex; flex-direction: column; gap: 10px; width: 100%; max-width: 350px;}
+.panel-derecho { flex: 1; display: flex; justify-content: center; align-items: center; width: 100%; position: relative; }
+
+.inputs-row { display: flex; gap: 15px; width: 100%; margin-top: 5px; }
+.input-group { flex: 1; display: flex; flex-direction: column; gap: 5px; text-align: left; }
+.input-group label { font-size: 12px; color: #aaa; font-weight: bold; transition: color 0.3s; }
+.input-group input[type="number"] { width: 100%; background: rgba(13, 13, 20, 0.6); border: 1px solid rgba(255,255,255,0.05); border-radius: 10px; color: white; padding: 10px; font-size: 14px; text-align: center; box-shadow: inset 0 2px 5px rgba(0,0,0,0.5); transition: 0.3s;}
+.input-group input[type="number"]:focus { border-color: rgba(255, 102, 0, 0.5); outline: none; }
+
+textarea { width: 100%; background: rgba(13, 13, 20, 0.6); border: 1px solid rgba(255, 255, 255, 0.05); border-radius: 12px; color: #e0e0e0; padding: 15px; font-size: 1rem; resize: none; outline: none; transition: 0.3s; box-shadow: inset 0 5px 15px rgba(0,0,0,0.6); }
+textarea:focus { border-color: rgba(255, 102, 0, 0.4); box-shadow: 0 0 15px rgba(255, 102, 0, 0.1), inset 0 5px 15px rgba(0,0,0,0.6); }
+
+.controles-ruleta { display: flex; gap: 10px; margin-top: 15px; margin-bottom: 40px; }
+.btn-secundario { background: rgba(45, 45, 63, 0.8); border: 1px solid rgba(255,255,255,0.05); color: white; padding: 12px; border-radius: 10px; cursor: pointer; flex: 1; font-weight: bold; transition: 0.3s; font-size: 1.2rem; box-shadow: 0 4px 10px rgba(0,0,0,0.3);}
+.btn-secundario.mini { font-size: 0.9rem; padding: 8px; margin-top: 5px; }
+.btn-secundario:hover { background: rgba(74, 74, 94, 0.9); transform: translateY(-2px);}
+.btn-accion { background: linear-gradient(45deg, #ff6600, #ff00ff); color: white; border: none; padding: 12px; border-radius: 12px; font-size: 1.2rem; font-weight: 900; cursor: pointer; text-transform: uppercase; transition: 0.3s; flex: 3; box-shadow: 0 8px 20px rgba(255, 102, 0, 0.3); }
+.btn-accion:hover { transform: scale(1.03); box-shadow: 0 10px 25px rgba(255, 0, 255, 0.5); }
+.btn-volver { background: transparent; border: 1px solid rgba(255, 102, 0, 0.5); color: #ccc; padding: 12px 25px; border-radius: 10px; font-size: 1rem; cursor: pointer; transition: 0.3s; margin-top: 10px;}
+.btn-volver:hover { background: rgba(255, 102, 0, 0.1); color: white; border-color: #ff6600;}
+
+/* =================================================================
+   6. MOTOR GRÁFICO RULETA Y ANIMACIÓN DE CUENTA ATRÁS
+   ================================================================= */
+.ruleta-wrapper { position: relative; width: 100%; max-width: 350px; margin: 25px auto 0 auto; display: flex; justify-content: center; align-items: center; aspect-ratio: 1 / 1; }
+.ruleta-wrapper.pre-spin { animation: suspenseVibration 0.15s infinite ease-in-out; }
+@keyframes suspenseVibration { 0%, 100% { transform: translate(0, 0); } 20% { transform: translate(-2px, 2px); } 40% { transform: translate(2px, -2px); } 60% { transform: translate(-2px, -2px); } 80% { transform: translate(2px, 2px); } }
+
+.timer-overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0, 0, 0, 0.85); border-radius: 50%; display: flex; justify-content: center; align-items: center; font-size: 80px; font-weight: bold; color: #ff6600; opacity: 0; pointer-events: none; transition: opacity 0.3s; z-index: 5; text-shadow: 0 0 20px #ff6600;}
+.timer-overlay.active { opacity: 1; }
+.pulse-timer.active.counting { animation: pulseTimer 1s infinite; }
+@keyframes pulseTimer { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.15); } }
+
+.ruleta-sombra { position: absolute; width: 330px; height: 330px; border-radius: 50%; background: #ff6600; filter: blur(40px); opacity: 0.2; z-index: 1; }
+#canvas-ruleta { width: 100%; max-width: 350px; height: auto; aspect-ratio: 1 / 1; border-radius: 50%; border: 6px solid #1e1e28; box-shadow: 0 0 0 2px rgba(255,102,0,0.5), 0 15px 35px rgba(0,0,0,0.6); z-index: 2; flex-shrink: 0; transition: border-color 0.3s ease; }
+.puntero-neon { position: absolute; top: -20px; left: 50%; transform: translateX(-50%); width: 40px; height: 50px; background: #ff6600; clip-path: polygon(50% 100%, 0 0, 100% 0); z-index: 10; filter: drop-shadow(0px 5px 10px rgba(0,0,0,0.8)); border-top: 5px solid white; }
+
+.kem-aviso { display: flex; align-items: center; gap: 12px; background: rgba(255, 102, 0, 0.1); border: 1px solid rgba(255, 102, 0, 0.4); padding: 10px 15px; border-radius: 12px; margin-top: 10px; animation: popUp 0.3s ease-out; transition: 0.3s;}
+.kem-aviso img { width: 45px; height: 45px; filter: drop-shadow(0 4px 6px rgba(0,0,0,0.5)); }
+.kem-aviso-burbuja { font-size: 0.85rem; color: white; text-align: left; line-height: 1.3; transition: 0.3s;}
+.kem-aviso-burbuja b { color: #ff6600; }
+
+/* =================================================================
+   7. MÁQUINA TRAGAPERRAS (SLOTS)
+   ================================================================= */
+.slot-machine-case { background: linear-gradient(145deg, rgba(30, 30, 40, 0.9), rgba(42, 42, 53, 0.9)); border: 1px solid rgba(255, 102, 0, 0.3); border-radius: 20px; padding: 25px; box-shadow: 0 20px 40px rgba(0, 0, 0, 0.6), 0 0 30px rgba(255, 102, 0, 0.15), inset 0 2px 10px rgba(255, 255, 255, 0.05); margin: 0 auto; width: 100%; max-width: 500px; transition: 0.3s;}
+.slot-window { width: 100%; height: 120px !important; display: flex; justify-content: space-around; align-items: center; box-sizing: border-box; padding: 0 5px; background-color: #0b0b10; border-radius: 12px; box-shadow: inset 0 15px 35px rgba(0, 0, 0, 1), 0 1px 0 rgba(255, 255, 255, 0.1); border: 1px solid #000; position: relative; overflow: hidden; transition: 0.3s;}
+.reel-container { flex: 1; min-width: 0; width: 31%; height: 100px; overflow: hidden; position: relative; background: linear-gradient(to bottom, #050505 0%, #1a1a24 50%, #050505 100%); border-radius: 8px; border: none; box-shadow: 0 0 15px rgba(0,0,0,0.8); transition: 0.3s;}
+.reel-strip { display: flex; flex-direction: column; }
+.reel-item { width: 100%; height: 100px; font-size: 1.3rem !important; font-weight: bold; display: block !important; line-height: 100px; text-align: center; color: #fff; text-shadow: 0 0 5px rgba(255, 255, 255, 0.3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding: 0 5px; box-sizing: border-box; transition: 0.3s;}
+.win-line { position: absolute; top: 50%; left: 0; width: 100%; height: 2px; background-color: rgba(255, 0, 255, 0.6); transform: translateY(-50%); z-index: 10; box-shadow: 0 0 15px rgba(255, 0, 255, 0.9); }
+.resultado-box { background: linear-gradient(90deg, rgba(37,37,51,0.6), rgba(26,26,36,0.8)); backdrop-filter: blur(10px); border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 12px; padding: 20px; margin-bottom: 20px; font-size: 1.3rem; font-weight: bold; color: #fff; text-shadow: 0 0 10px rgba(255,255,255,0.4); box-shadow: 0 10px 25px rgba(0,0,0,0.4); transition: all 0.4s ease; }
+
+/* =================================================================
+   8. MODALES Y DIÁLOGOS DE ENTRADA
+   ================================================================= */
+.modal-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0, 0, 0, 0.8); backdrop-filter: blur(8px); display: flex; justify-content: center; align-items: center; z-index: 1500; animation: fadeIn 0.3s ease; }
+.modal-content { background: rgba(26, 26, 36, 0.95); border: 1px solid rgba(255, 102, 0, 0.4); border-radius: 24px; padding: 40px; text-align: center; max-width: 600px; width: 90%; box-shadow: 0 20px 60px rgba(0, 0, 0, 0.8), 0 0 30px rgba(255, 102, 0, 0.2); transform: scale(0.9); animation: popUp 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards; max-height: 90vh; overflow-y: auto; transition: 0.3s;}
+@keyframes popUp { to { transform: scale(1); } }
+
+.modal-titulo { color: #ff6600; font-size: 1.8rem; margin-bottom: 20px; text-transform: uppercase; transition: 0.3s;}
+.modal-subtitulo { color: #aaa; margin-bottom: 25px; font-size: 1.1rem; transition: 0.3s;}
+.modal-nombre { font-size: 3rem; font-weight: 900; color: white; margin-bottom: 30px; text-shadow: 0 0 20px rgba(255, 255, 255, 0.5); word-wrap: break-word; transition: 0.3s;}
+
+.btn-cerrar-flotante { position: absolute; top: 15px; right: 15px; background: transparent; border: none; color: #fff; font-size: 1.5rem; cursor: pointer; transition: 0.3s; }
+.btn-cerrar-flotante:hover { color: #ff3366; transform: scale(1.1); }
+.btn-cerrar-flotante.atras { right: auto; left: 15px; font-size: 1.1rem; color: #ff6600;}
+.btn-cerrar-flotante.atras:hover { color: #fff; }
+
+.lista-multi-ganadores { max-height: 30vh; overflow-y: auto; padding: 0 10px 0 0; margin: 15px auto 30px auto; list-style: none; text-align: left; display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px; }
+.lista-multi-ganadores li { background: rgba(255, 102, 0, 0.1); border: 1px solid rgba(255, 102, 0, 0.2); padding: 10px; border-radius: 10px; font-size: 1.1rem; color: white; overflow: hidden; text-overflow: ellipsis; transition: 0.3s;}
+.lista-multi-ganadores li strong { color: #ff6600; margin-right: 5px;}
+.lista-multi-ganadores::-webkit-scrollbar { width: 6px; }
+.lista-multi-ganadores::-webkit-scrollbar-track { background: rgba(255,255,255,0.05); border-radius: 10px; }
+.lista-multi-ganadores::-webkit-scrollbar-thumb { background: #ff3366; border-radius: 10px; }
+
+.modal-botones { display: flex; gap: 15px; justify-content: center; flex-wrap: wrap; }
+.btn-modal { padding: 12px 20px; border: none; border-radius: 10px; font-size: 1rem; font-weight: bold; cursor: pointer; transition: 0.3s; flex: 1; min-width: 150px;}
+.btn-verde { background: #00ffcc; color: #0d0d14; box-shadow: 0 5px 15px rgba(0, 255, 204, 0.2); } .btn-verde:hover { background: #00ccaa; box-shadow: 0 8px 20px rgba(0, 255, 204, 0.4); transform: translateY(-2px); }
+.btn-rojo { background: #ff3366; color: white; box-shadow: 0 5px 15px rgba(255, 51, 102, 0.2);} .btn-rojo:hover { background: #cc0033; box-shadow: 0 8px 20px rgba(255, 51, 102, 0.4); transform: translateY(-2px); }
+
+.glass-panel-modal { padding-top: 50px; }
+.redes-grid { display: flex; flex-direction: column; gap: 15px; margin-top: 20px; }
+.btn-red { display: flex; align-items: center; justify-content: center; gap: 10px; padding: 15px; border-radius: 12px; font-size: 1.2rem; font-weight: bold; color: white; border: none; cursor: pointer; transition: 0.3s; }
+.btn-red.instagram { background: linear-gradient(45deg, #f09433 0%, #e6683c 25%, #dc2743 50%, #cc2366 75%, #bc1888 100%); box-shadow: 0 5px 15px rgba(220, 39, 67, 0.4); }
+.btn-red.instagram:hover { transform: scale(1.02); box-shadow: 0 8px 20px rgba(220, 39, 67, 0.6); }
+.btn-red.tiktok { background: #000000; border: 1px solid #25F4EE; box-shadow: 0 5px 15px rgba(37, 244, 238, 0.2); }
+.btn-red.tiktok:hover { transform: scale(1.02); box-shadow: -3px 3px 10px #FE2C55, 3px -3px 10px #25F4EE; }
+
+.input-glass { width: 100%; background: rgba(13, 13, 20, 0.6); border: 1px solid rgba(255, 255, 255, 0.2); border-radius: 12px; color: #fff; padding: 15px; font-size: 1rem; outline: none; margin-bottom: 25px; box-shadow: inset 0 5px 15px rgba(0,0,0,0.6); transition: 0.3s;}
+.input-glass:focus { border-color: #ff6600; box-shadow: 0 0 15px rgba(255, 102, 0, 0.3), inset 0 5px 15px rgba(0,0,0,0.6); }
+
+/* Previsualización Scraper */
+.preview-card-moderna { width: 100%; margin-bottom: 25px; transition: 0.3s; }
+.preview-cover-container { width: 100%; aspect-ratio: 1 / 1; background: linear-gradient(45deg, #1a1a24, #0d0d14); border-radius: 16px; display: flex; justify-content: center; align-items: center; font-size: 3rem; overflow: hidden; box-shadow: 0 10px 25px rgba(0,0,0,0.5); margin-bottom: 15px; border: 1px solid rgba(255,255,255,0.05); }
+.preview-cover-container img { width: 100%; height: 100%; object-fit: cover; border-radius: 16px; }
+.preview-details-box { background: rgba(13, 13, 20, 0.8); border: 1px solid rgba(255, 255, 255, 0.05); border-radius: 16px; padding: 15px; display: flex; gap: 15px; align-items: flex-start; text-align: left; }
+.preview-avatar-container { flex-shrink: 0; width: 50px; height: 50px; border-radius: 50%; background: linear-gradient(45deg, #ff6600, #ff00ff); padding: 2px; }
+.preview-avatar-container img { width: 100%; height: 100%; border-radius: 50%; object-fit: cover; background: #1a1a24; }
+.preview-info-moderna { flex: 1; overflow: hidden; display: flex; flex-direction: column; gap: 5px; }
+.preview-info-moderna h4 { color: #fff; font-size: 1.1rem; font-weight: bold; white-space: nowrap; text-overflow: ellipsis; overflow: hidden; margin: 0; }
+.preview-info-moderna p { color: #aaa; font-size: 0.9rem; margin: 0; display: -webkit-box; -webkit-line-clamp: 3; line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; line-height: 1.4; }
+.preview-stats-moderna { display: flex; gap: 10px; margin-top: 5px; }
+.stat-badge { background: rgba(255, 102, 0, 0.2); color: #ff6600; padding: 5px 10px; border-radius: 8px; font-size: 0.85rem; font-weight: bold; border: 1px solid rgba(255, 102, 0, 0.3); }
+
+.clean-select { appearance: none; -webkit-appearance: none; background: transparent; border: none; color: #ff6600; font-size: 1rem; font-weight: bold; padding: 5px 25px 5px 5px; cursor: pointer; outline: none; text-align: right; transition: 0.3s; background-image: url("data:image/svg+xml;charset=US-ASCII,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%2224%22%20height%3D%2224%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22%23ff6600%22%20stroke-width%3D%222%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpolyline%20points%3D%226%209%2012%2015%2018%209%22%3E%3C%2Fpolyline%3E%3C%2Fsvg%3E"); background-repeat: no-repeat; background-position: right center; background-size: 18px; }
+.clean-select option { background: #1a1a24; color: #fff; font-weight: normal; }
+
+.config-grid { display: flex; flex-direction: column; gap: 20px; margin-top: 20px; text-align: left;}
+.config-item { display: flex; justify-content: space-between; align-items: center; background: rgba(0,0,0,0.2); padding: 15px; border-radius: 12px; border: 1px solid rgba(255,255,255,0.05); transition: 0.3s;}
+.config-info { display: flex; align-items: center; gap: 15px; }
+.config-icon { font-size: 1.8rem; transition: 0.3s; }
+.config-info h4 { color: white; margin-bottom: 3px; font-size: 1.1rem; transition: 0.3s;}
+.config-info p { color: #aaa; font-size: 0.85rem; margin: 0; transition: 0.3s;}
+
+.switch { position: relative; display: inline-block; width: 50px; height: 28px; }
+.switch input { opacity: 0; width: 0; height: 0; }
+.slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #2d2d3f; transition: .4s; border-radius: 34px; border: 1px solid rgba(255,255,255,0.1);}
+.slider:before { position: absolute; content: ""; height: 20px; width: 20px; left: 4px; bottom: 3px; background-color: white; transition: .4s; border-radius: 50%; box-shadow: 0 2px 5px rgba(0,0,0,0.3);}
+input:checked + .slider { background-color: #ff6600; border-color: #ff6600; }
+input:checked + .slider:before { transform: translateX(20px); }
+
+/* =================================================================
+   9. INTERFAZ PNGTUBER (ANIMALES Y AUDIO BURBUJAS)
+   ================================================================= */
+.avatar-widget { 
+    position: fixed; z-index: 2000; pointer-events: none; opacity: 0; 
+    display: flex; flex-direction: column; align-items: center; bottom: -750px; 
+    transition: all 0.7s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+}
+.avatar-widget.side-right { right: 1%; transform: translate(120px, 120px) rotate(15deg); }
+.avatar-widget.side-right.active { bottom: -130px; transform: translate(0, 0) rotate(0deg); opacity: 1; }
+.avatar-widget.side-left { left: 1%; transform: translate(-120px, 120px) rotate(-15deg); }
+.avatar-widget.side-left .avatar-img { transform: scaleX(-1); }
+.avatar-widget.side-left.active { bottom: -130px; transform: translate(0, 0) rotate(0deg); opacity: 1; }
+
+.avatar-bubble { 
+    background: rgba(13, 13, 20, 0.98); backdrop-filter: blur(12px); color: #ffffff; 
+    padding: 22px 38px; border-radius: 100px; font-size: 18px; font-weight: 900; 
+    text-align: center; margin-bottom: -4px; opacity: 0; 
+    transform: scale(0.4) translateY(40px); transition: all 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.275) 0.1s; 
+    width: max-content; max-width: 360px; position: relative; z-index: 10; letter-spacing: 0.5px; line-height: 1.4;
+}
+.avatar-widget.side-right .avatar-bubble { border: 3px solid #ff6600; box-shadow: 0 0 30px rgba(255, 102, 0, 0.6), inset 0 0 15px rgba(255, 102, 0, 0.25); }
+.avatar-widget.side-left .avatar-bubble { border: 3px solid #00ffcc; box-shadow: 0 0 30px rgba(0, 255, 204, 0.6), inset 0 0 15px rgba(0, 255, 204, 0.25); }
+.avatar-widget.active .avatar-bubble { opacity: 1; transform: scale(1) translateY(0); }
+.avatar-bubble::after { content: ''; position: absolute; bottom: -9px; left: 50%; transform: translateX(-50%) rotate(45deg); width: 15px; height: 15px; background: rgba(13, 13, 20, 0.98); z-index: -1; }
+.avatar-widget.side-right .avatar-bubble::after { border-right: 3px solid #ff6600; border-bottom: 3px solid #ff6600; }
+.avatar-widget.side-left .avatar-bubble::after { border-right: 3px solid #00ffcc; border-bottom: 3px solid #00ffcc; }
+
+.avatar-img { width: 520px; height: auto; filter: drop-shadow(0 25px 35px rgba(0,0,0,0.85)); position: relative; z-index: 1; }
+.avatar-widget.side-right .avatar-img { animation: floatRight 3.5s infinite ease-in-out; }
+@keyframes floatRight { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-15px); } }
+.avatar-widget.side-left .avatar-img { animation: floatLeft 3.5s infinite ease-in-out; }
+@keyframes floatLeft { 0%, 100% { transform: translateY(0) scaleX(-1); } 50% { transform: translateY(-15px) scaleX(-1); } }
+
+/* =================================================================
+   10. RESPONSIVE DESIGN (DISPOSITIVOS MÓVILES)
+   ================================================================= */
+@media (min-width: 769px) { 
+    .avatar-widget { top: 50%; transform: translateY(-50%); } 
+    .avatar-widget.side-right { right: -500px; left: auto; } 
+    .avatar-widget.side-right.active { right: 15px; opacity: 1; } 
+    .avatar-widget.side-left { left: -500px; right: auto; } 
+    .avatar-widget.side-left.active { left: 15px; opacity: 1; } 
+}
+
+@media (max-width: 768px) {
+    .splash-layout { flex-direction: column; gap: 20px; }
+    .kem-splash { width: 130px; bottom: 26px; left: 80%; }
+    .logo-text { font-size: 2rem; }
+    .titulo-herramienta { margin-top: 55px; font-size: 1.7rem; }
+    .layout-maquinas { flex-direction: column; padding: 20px; gap: 25px; padding-top: 30px;}
+    .opciones-grid { gap: 10px; }
+    .float-btn { top: 15px; width: 40px; height: 40px; }
+    .btn-config { right: 15px; }
+    .btn-vol { right: 15px; }
+    .btn-fullscreen { right: 62px; } 
+    .btn-stop { left: 125px !important; top: 15px !important; }
+    .volume-popup { right: 15px; top: 65px; }
+    .ruleta-wrapper { margin-top: -20px; max-width: 280px; }
+    #canvas-ruleta { max-width: 280px; }
+    .ruleta-sombra { width: 260px; height: 260px; }
+    .modal-nombre { font-size: 2rem; }
+    .avatar-widget { top: auto; bottom: -420px; } 
+    .avatar-widget.side-right { right: -2%; left: auto; transform: translate(60px, 60px) rotate(15deg); } 
+    .avatar-widget.side-right.active { right: 1%; bottom: -55px; opacity: 1; transform: translate(0, 0) rotate(0deg); } 
+    .avatar-widget.side-left { left: -2%; right: auto; transform: translate(-60px, 60px) rotate(-15deg); } 
+    .avatar-widget.side-left.active { left: 1%; bottom: -55px; opacity: 1; transform: translate(0, 0) rotate(0deg); } 
+    .avatar-img { width: 250px; } 
+    .avatar-widget.side-right .avatar-img { animation: floatRightMobile 3.5s infinite ease-in-out; }
+    .avatar-widget.side-left .avatar-img { animation: floatLeftMobile 3.5s infinite ease-in-out; }
+    .avatar-bubble { font-size: 14px; padding: 14px 26px; margin-bottom: -2px; border-radius: 60px; max-width: 260px; }
+    .avatar-bubble::after { width: 10px; height: 10px; bottom: -6px; }
+    .avatar-widget.side-right .avatar-bubble::after { border-right-width: 2.5px; border-bottom-width: 2.5px; }
+    .avatar-widget.side-left .avatar-bubble::after { border-right-width: 2.5px; border-bottom-width: 2.5px; }
+    .token-badge { position: fixed !important; left: 15px !important; top: 15px !important; }
+    
+    .cup-container[data-pos="0"] { left: 4.5% !important; }
+    .cup-container[data-pos="1"] { left: 37% !important; }
+    .cup-container[data-pos="2"] { left: 69.5% !important; }
+    .cup-container { width: 85px !important; height: 110px !important; }
+
+    #canvas-ruleta { max-width: 100% !important; height: auto !important; }
+    .ruleta-sombra { width: 85% !important; height: 85% !important; }
+    textarea { max-height: 100px !important; font-size: 0.9rem !important; }
+    
+    #panel-volumen {
+        position: fixed !important;
+        top: auto !important;
+        bottom: 20px !important;
+        left: 50% !important;
+        transform: translateX(-50%) !important;
+        width: 90% !important;
+        max-width: 320px !important;
+    }
+}
+
+/* =================================================================
+   11. TEMA CLARO (LIGHT MODE)
+   ================================================================= */
+body.light-theme { background-color: #f0f0f5; color: #1a1a24; }
+body.light-theme h2, body.light-theme .titulo-herramienta, body.light-theme .logo-text { color: #ff6600; text-shadow: none; }
+body.light-theme .menu-card { background: rgba(255, 255, 255, 0.8); border: 1px solid rgba(0,0,0,0.1); color: #1a1a24; box-shadow: 0 10px 20px rgba(0,0,0,0.05); }
+body.light-theme .menu-card p { color: #666; }
+body.light-theme .premium-card { background: linear-gradient(135deg, rgba(255, 255, 255, 0.9), rgba(255, 230, 255, 0.6)); border: 1px solid rgba(255, 0, 255, 0.3) !important; }
+body.light-theme .layout-maquinas { background: rgba(255, 255, 255, 0.6); border: 1px solid rgba(0,0,0,0.1); box-shadow: 0 25px 50px rgba(0,0,0,0.05); }
+body.light-theme textarea, body.light-theme .input-glass, body.light-theme .input-group input[type="number"] { background: rgba(255, 255, 255, 0.9); border: 1px solid rgba(0,0,0,0.1); color: #1a1a24; box-shadow: inset 0 2px 5px rgba(0,0,0,0.05); }
+body.light-theme textarea:focus, body.light-theme .input-glass:focus { border-color: #ff6600; box-shadow: 0 0 10px rgba(255,102,0,0.2), inset 0 2px 5px rgba(0,0,0,0.05); }
+body.light-theme .input-group label, body.light-theme .volume-row label { color: #666; }
+body.light-theme .btn-secundario { background: rgba(240, 240, 245, 0.9); color: #1a1a24; border: 1px solid rgba(0,0,0,0.1); box-shadow: 0 4px 10px rgba(0,0,0,0.05); }
+body.light-theme .btn-secundario:hover { background: rgba(220, 220, 230, 0.9); }
+body.light-theme .btn-volver { color: #666; border-color: rgba(0,0,0,0.2); }
+body.light-theme .btn-volver:hover { color: #1a1a24; background: rgba(0,0,0,0.05); border-color: #ff6600;}
+body.light-theme .float-btn { background: rgba(255, 255, 255, 0.9); color: #1a1a24; border: 1px solid rgba(0,0,0,0.1); box-shadow: 0 5px 15px rgba(0,0,0,0.1); }
+body.light-theme .glass-panel-modal, body.light-theme .modal-content, body.light-theme .volume-popup { background: rgba(255, 255, 255, 0.95); border: 1px solid rgba(0,0,0,0.1); color: #1a1a24; box-shadow: 0 20px 60px rgba(0, 0, 0, 0.1); }
+body.light-theme .modal-subtitulo { color: #666; }
+body.light-theme .modal-nombre { color: #1a1a24; text-shadow: none; }
+body.light-theme .lista-multi-ganadores li { background: rgba(255, 102, 0, 0.1); color: #1a1a24; border-color: rgba(255,102,0,0.2);}
+body.light-theme .btn-cerrar-flotante { color: #1a1a24; }
+body.light-theme .slot-machine-case { background: linear-gradient(145deg, #ffffff, #f0f0f5); border: 1px solid rgba(0,0,0,0.1); box-shadow: 0 20px 40px rgba(0,0,0,0.1); }
+body.light-theme .slot-window { background-color: #e0e0e5; border: 1px solid #ccc; box-shadow: inset 0 10px 20px rgba(0,0,0,0.05); }
+body.light-theme .reel-container { background: linear-gradient(to bottom, #ffffff 0%, #f0f0f5 50%, #ffffff 100%); box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+body.light-theme .reel-item { color: #1a1a24; text-shadow: none; }
+body.light-theme .resultado-box { background: linear-gradient(90deg, rgba(255,255,255,0.9), rgba(240,240,245,0.9)); color: #1a1a24; text-shadow: none; border: 1px solid rgba(0,0,0,0.1); box-shadow: 0 10px 25px rgba(0,0,0,0.05); }
+body.light-theme #canvas-ruleta { border-color: #ffffff; box-shadow: 0 0 0 2px rgba(255,102,0,0.3), 0 15px 35px rgba(0,0,0,0.1); }
+body.light-theme .token-badge { background: rgba(255, 255, 255, 0.9); color: #1a1a24; border-color: rgba(255, 215, 0, 0.8); box-shadow: 0 5px 15px rgba(0,0,0,0.1); }
+body.light-theme .tienda-card { background: rgba(255, 255, 255, 0.5); border-color: rgba(0,0,0,0.1); }
+body.light-theme .tienda-card h3 { color: #1a1a24; }
+body.light-theme .tienda-desc { color: #666; }
+body.light-theme .btn-comprar { color: #1a1a24; background: rgba(0,0,0,0.05); }
+body.light-theme #tabla-tasas-tokems { background: #ffffff !important; border: 2px solid #ff6600 !important; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.15) !important; }
+body.light-theme #tabla-tasas-tokems div, body.light-theme #tabla-tasas-tokems span { color: #1a1a24 !important; }
+body.light-theme #tabla-tasas-tokems span[style*="color: #00ffcc"], body.light-theme #tabla-taxas-tokems span[style*="color:#00ffcc"] { color: #008066 !important; }
+body.light-theme #tabla-tasas-tokems div[style*="color: #ff3366"] { color: #c4123a !important; background: rgba(255, 51, 102, 0.06) !important; border: 1px dashed rgba(255, 51, 102, 0.3) !important; }
+body.light-theme .tienda-info-contenedor button { color: #ff6600 !important; border-color: rgba(255, 102, 0, 0.4) !important; background: #ffffff !important; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05) !important; }
+body.light-theme .tienda-info-contenedor button:hover { background: rgba(255, 102, 0, 0.05) !important; }
+body.light-theme .tienda-precio { color: #e65c00 !important; text-shadow: none !important; }
+body.light-theme .tienda-card.popular { background: linear-gradient(180deg, rgba(0, 255, 204, 0.08), #ffffff) !important; border-color: #00b38f !important; box-shadow: 0 10px 25px rgba(0, 179, 143, 0.12) !important; }
+body.light-theme .tienda-card.popular h3 { color: #006652 !important; }
+body.light-theme .modal-titulo { color: #ff6600 !important; text-shadow: none !important; }
+body.light-theme .modal-subtitulo { color: #4a4a5e !important; }
+body.light-theme #preview-count-display { color: #ff6600 !important; }
+body.light-theme #kz-custom-alert .modal-content { background: #ffffff !important; color: #1a1a24 !important; }
+body.light-theme #kz-alert-mensaje { color: #2d2d3f !important; }
+body.light-theme #kz-custom-alert h2 { text-shadow: none !important; }
+body.light-theme .panel-filtros-interno { background: rgba(255, 255, 255, 0.9) !important; border-color: rgba(0, 0, 0, 0.15) !important; box-shadow: inset 0 2px 8px rgba(0,0,0,0.05) !important; }
+body.light-theme .panel-filtros-interno label { color: #2d2d3f !important; }
+body.light-theme .panel-filtros-interno textarea { border-color: rgba(0, 0, 0, 0.1) !important; }
+body.light-theme .winner-rich-card { background: #fff; border-color: #00b38f; box-shadow: 0 10px 30px rgba(0, 179, 143, 0.2); }
+body.light-theme .winner-rich-card h3 { color: #1a1a24; text-shadow: none; }
+body.light-theme .winner-comment { background: #f0f0f5; color: #4a4a5e; border-left-color: #00b38f; }
+body.light-theme .multi-winner-rich { background: #fff !important; border: 1px solid rgba(0, 179, 143, 0.3) !important; }
+body.light-theme .multi-winner-info strong { color: #1a1a24 !important; }
+body.light-theme .multi-winner-text { color: #666; }
+body.light-theme .config-item { background: rgba(255,255,255,0.5); border-color: rgba(0,0,0,0.1); }
+body.light-theme .config-info h4 { color: #1a1a24; }
+body.light-theme .config-info p { color: #666; }
+body.light-theme .slider { background-color: #ccc; border-color: transparent;}
+body.light-theme .clean-select option { background: #fff; color: #1a1a24; }
+body.light-theme .avatar-bubble { background: #111114; color: #fff; border-color: #ff6600; }
+body.light-theme .avatar-bubble::after { border-top-color: #111114; }
+body.light-theme .preview-details-box { background: rgba(255, 255, 255, 0.8); border-color: rgba(0,0,0,0.1); box-shadow: 0 5px 15px rgba(0,0,0,0.05); }
+body.light-theme .preview-info-moderna h4 { color: #1a1a24; }
+body.light-theme .preview-info-moderna p { color: #666; }
+body.light-theme .preview-avatar-container img { background: #fff; }
+
+/* =================================================================
+   12. SISTEMA DE TOKENS Y TIENDA (ANCLADO RELATIVO A LA INTERFAZ)
+   ================================================================= */
+.token-badge {
+    position: absolute; 
+    top: 60px;         
+    left: 20px;        
+    background: rgba(26, 26, 36, 0.8);
+    backdrop-filter: blur(5px);
+    border: 1px solid rgba(255, 215, 0, 0.5);
+    border-radius: 20px;
+    padding: 8px 18px;
+    color: white;
+    font-size: 1.2rem;
+    font-weight: bold;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    z-index: 1100;
+    box-shadow: 0 5px 15px rgba(0,0,0,0.5);
+    transition: 0.3s;
+}
+.token-badge:hover {
+    transform: scale(1.05);
+    border-color: #ffd700;
+    box-shadow: 0 5px 20px rgba(255, 215, 0, 0.3);
+}
+.token-icon { font-size: 1.4rem; }
+
+.tienda-grid { display: flex; gap: 20px; justify-content: center; margin-top: 30px; flex-wrap: wrap; }
+.tienda-card {
+    background: rgba(0, 0, 0, 0.3); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 16px;
+    padding: 25px 20px; flex: 1; min-width: 200px; display: flex; flex-direction: column; align-items: center;
+    position: relative; transition: 0.3s;
+}
+.tienda-card:hover { transform: translateY(-5px); border-color: #ff6600; box-shadow: 0 10px 25px rgba(255, 102, 0, 0.2); }
+.tienda-card.popular { border-color: #00ffcc; background: linear-gradient(180deg, rgba(0, 255, 204, 0.05), rgba(0, 0, 0, 0.4)); transform: scale(1.05); }
+.tienda-card.popular:hover { transform: scale(1.08) translateY(-5px); box-shadow: 0 10px 30px rgba(0, 255, 204, 0.3); }
+.badge-popular { position: absolute; top: -12px; background: #00ffcc; color: #0d0d14; font-size: 0.8rem; font-weight: bold; padding: 4px 12px; border-radius: 20px; text-transform: uppercase; }
+.tienda-card h3 { color: #fff; margin-bottom: 5px; font-size: 1.2rem; }
+.tienda-desc { color: #aaa; font-size: 0.9rem; margin-bottom: 20px; }
+.tienda-precio { font-size: 2.2rem; font-weight: 900; color: #ffd700; margin-bottom: 20px; text-shadow: 0 0 15px rgba(255, 215, 0, 0.3); }
+.btn-comprar { width: 100%; font-size: 1rem; padding: 10px; background: rgba(255, 255, 255, 0.1); }
+.tienda-card.popular .btn-comprar { background: linear-gradient(45deg, #00ffcc, #00b38f); color: #0d0d14; }
+
+/* =================================================================
+   14. TARJETAS DE VICTORIA MASIVAS (RICH CARDS)
+   ================================================================= */
+.winner-rich-card { 
+    background: rgba(13, 13, 20, 0.8); border: 2px solid #00ffcc; border-radius: 20px; padding: 25px; 
+    display: flex; flex-direction: column; align-items: center; gap: 15px; 
+    box-shadow: 0 10px 30px rgba(0, 255, 204, 0.2), inset 0 0 20px rgba(0, 255, 204, 0.1); 
+    margin: 0 auto; max-width: 450px; animation: popUp 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.275); 
+}
+.winner-rich-card img { width: 100px; height: 100px; border-radius: 50%; object-fit: cover; border: 3px solid #ff00ff; box-shadow: 0 0 15px rgba(255, 0, 255, 0.5); background: #1a1a24;}
+.winner-rich-card h3 { color: #fff; font-size: 1.8rem; margin: 0; text-shadow: 0 0 10px rgba(255, 255, 255, 0.5); word-break: break-all; }
+.winner-comment { color: #ccc; font-size: 1rem; font-style: italic; background: rgba(0,0,0,0.4); padding: 15px; border-radius: 12px; border-left: 4px solid #00ffcc; margin: 0; width: 100%; text-align: left; max-height: 120px; overflow-y: auto; word-wrap: break-word;}
+
+.lista-multi-ganadores.rich-list { display: flex; flex-direction: column; gap: 12px; width: 100%; }
+.multi-winner-rich { display: flex !important; align-items: center; gap: 12px; text-align: left; background: rgba(0, 255, 204, 0.05) !important; border: 1px solid rgba(0, 255, 204, 0.2) !important; padding: 12px !important;}
+.multi-winner-rich img { width: 50px; height: 50px; border-radius: 50%; object-fit: cover; border: 2px solid #00ffcc; background: #1a1a24; flex-shrink: 0;}
+.multi-winner-info { display: flex; flex-direction: column; gap: 4px; overflow: hidden; width: 100%; }
+.multi-winner-info strong { color: #fff !important; font-size: 1.1rem; }
+.multi-winner-text { color: #aaa; font-size: 0.85rem; font-style: italic; display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; width: 100%; }
+
+/* =================================================================
+   15. FISICA Y ENTORNO DE LA MÁQUINA DE VASOS (TRILE)
+   ================================================================= */
+.table-surface {
+    width: 100%; height: 300px;
+    background: radial-gradient(ellipse at center, rgba(40, 40, 60, 0.8) 0%, rgba(13, 13, 20, 1) 70%);
+    border-bottom: 4px solid #ff6600; border-radius: 20px; position: relative;
+    display: flex; justify-content: center; align-items: flex-end; padding-bottom: 20px;
+    perspective: 1000px; overflow: hidden;
+}
+.vasos-wrapper { display: flex; justify-content: space-around; width: 90%; position: relative; height: 150px; }
+.cup-container {
+    width: 100px; height: 130px; position: absolute; cursor: pointer;
+    transition: left 0.2s cubic-bezier(0.25, 1, 0.5, 1), bottom 0.3s ease;
+    display: flex; flex-direction: column; align-items: center; bottom: 0;
+}
+
+/* 🎯 SIMETRÍA ABSOLUTA (Misma distancia exacta en los dos bordes exteriores) */
+.cup-container[data-pos="0"] { left: 7%; }
+.cup-container[data-pos="1"] { left: 37%; }
+.cup-container[data-pos="2"] { left: 67%; }
+
+.cup { width: 80px; height: 110px; position: relative; z-index: 2; transition: transform 0.45s ease; }
+
+.cup-body {
+    width: 100%;
+    height: 100%;
+    /* Rojo oscuro en los bordes y brillante al centro (Vaso original) */
+    background: linear-gradient(to right, #990000 0%, #ff1a1a 50%, #990000 100%); 
+    /* Corte de trapecio: angosto arriba, ancho abajo */
+    clip-path: polygon(12% 0, 88% 0, 100% 100%, 0% 100%);
+    border-radius: 4px; 
+    position: relative;
+    transition: background 0.3s ease;
+}
+
+/* 🎯 REEMPLAZADO: Independizado de --premium-c1 para evitar que los vasos se vuelvan naranjas o transparentes */
+body.premium-design-active .cup-body {
+    background-color: var(--premium-cup-color, #ff1a1a) !important;
+    background-image: linear-gradient(to right, rgba(0,0,0,0.6) 0%, rgba(255,255,255,0.1) 50%, rgba(0,0,0,0.6) 100%) !important;
+}
+
+.cup-container.lifted .cup { transform: translateY(-80px) rotate(-10deg); }
+
+.cup-winner-preview {
+    position: absolute;
+    bottom: 10px; 
+    width: 70px;  
+    height: 70px; 
+    background: rgba(11, 11, 16, 0.95); 
+    border: 2px solid #00ffcc; 
+    border-radius: 50%; 
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    font-weight: 900;        
+    color: #fff;
+    z-index: 1;
+    font-size: 0.75rem;       
+    text-align: center;
+    padding: 5px;             
+    box-shadow: 0 0 15px rgba(0, 255, 204, 0.4), inset 0 0 10px rgba(0, 255, 204, 0.15);
+    overflow: hidden;         
+    white-space: normal;      
+    word-wrap: break-word;    
+    opacity: 0;
+    transform: scale(0.5) translateY(20px);
+    transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+}
+
+.cup-container.lifted .cup-winner-preview {
+    opacity: 1;
+    transform: scale(1) translateY(-20px); 
+    border-color: #ff00ff; 
+    box-shadow: 0 0 20px rgba(255, 0, 255, 0.6), inset 0 0 10px rgba(255, 0, 255, 0.2);
+}
+
+@keyframes cup-bounce { 0%, 100% { bottom: 0; } 50% { bottom: 20px; } }
+.shuffling .cup-container { pointer-events: none; }
+
+/* =================================================================
+   16. AVATAR INTERNO EXCLUSIVO PARA EL TABLERO DE VASOS (MINI Y DIAGONAL)
+   ================================================================= */
+.avatar-local-widget {
+    position: absolute;
+    z-index: 1; 
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    pointer-events: none;
+    opacity: 0;
+    transition: all 0.6s cubic-bezier(0.25, 1, 0.5, 1); 
+}
+
+.avatar-local-widget.side-right { 
+    right: -250px; 
+    left: auto; 
+    top: 5%; 
+    bottom: auto; 
+    transform: rotate(-12deg); 
+}
+.avatar-local-widget.side-left { left: 15px; right: auto; bottom: -25px; }
+.avatar-local-widget.side-left #avatarLocalImg { transform: scaleX(-1); } 
+
+.avatar-local-widget.active.side-right { 
+    right: -20px; 
+    top: 10px; 
+    opacity: 1; 
+    transform: rotate(-10deg); 
+}
+.avatar-local-widget.active.side-left { opacity: 1; bottom: -25px; }
+
+.avatar-local-widget #avatarLocalImg {
+    width: 145px; 
+    height: auto;
+    filter: drop-shadow(0 6px 10px rgba(0,0,0,0.7));
+}
+
+.avatar-local-bubble {
+    background: rgba(13, 13, 20, 0.98);
+    border: 2px solid #ff6600;
+    color: #fff;
+    padding: 8px 14px;
+    border-radius: 12px;
+    font-size: 0.8rem;
+    font-weight: 800;
+    text-align: center;
+    max-width: 160px;
+    margin-bottom: -12px;
+    box-shadow: 0 0 12px rgba(255, 102, 0, 0.3);
+    opacity: 0;
+    transform: scale(0.7);
+    transition: all 0.4s ease 0.1s;
+    line-height: 1.3;
+}
+
+.avatar-local-widget.side-left .avatar-local-bubble {
+    border-color: #00ffcc;
+    box-shadow: 0 0 12px rgba(0, 255, 204, 0.3);
+}
+
+.avatar-local-widget.active .avatar-local-bubble { opacity: 1; transform: scale(1); }
+
+#timerOverlayVasos {
+    border-radius: 20px; 
+}
+
+/* Configuración para centrar la tarjeta en la grilla de 2 columnas */
+.boton-tradicional-centro {
+    grid-column: 1 / -1;       /* Ocupa el espacio de la fila completa */
+    justify-self: center;      /* Se clava magnéticamente en todo el centro */
+    
+    /* Esto calcula el ancho exacto de una sola columna restando el espacio del gap (asumiendo 15px o 20px) */
+    width: calc(50% - 10px);   
+    
+    box-sizing: border-box;
+    transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+/* Mantiene el comportamiento responsive en pantallas muy pequeñas */
+@media (max-width: 480px) {
+    .boton-tradicional-centro {
+        width: 100%; /* Si en móviles muy pequeños tus tarjetas ya ocupan el 100%, esta se adapta igual */
+    }
+}
+/* =================================================================
+   🎯 MÓDULO EXCLUSIVO: SORTEO TRADICIONAL PREMIUM POR PASOS (LIMPIO)
+   ================================================================= */
+.tradicional-card-setup {
+    width: 100%;
+    max-width: 480px;
+    margin: 0 auto;
+    background: rgba(26, 26, 36, 0.5);
+    border: 1px solid rgba(255, 215, 0, 0.15);
+    border-radius: 20px;
+    padding: 30px;
+    box-shadow: 0 20px 40px rgba(0,0,0,0.5);
+    animation: fadeIn 0.4s ease forwards;
+}
+
+.panel-cinta-wide {
+    width: 100%;
+    max-width: 860px;
+    margin: 0 auto;
+    animation: fadeIn 0.5s ease forwards;
+}
+
+/* =================================================================
+   🌟 REPOTENCIACIÓN DE NEÓN DORADO: CRISTAL LÍQUIDO Y CEGADOR
+   ================================================================= */
+.boton-tradicional-centro {
+    grid-column: 1 / -1;
+    justify-self: center;
+    width: calc(50% - 10px);
+    box-sizing: border-box;
+    backdrop-filter: blur(10px);
+    
+    /* 🔥 FONDO: Cristal translúcido con un toque medio amarillento/dorado de base */
+    background: linear-gradient(135deg, rgba(55, 45, 15, 0.4), rgba(20, 16, 5, 0.75)) !important;
+    
+    /* 🔥 RELIEVE BASE: Mucho más vivo, brillante y definido sin pasar el cursor */
+    border: 2px solid rgba(255, 215, 0, 0.65) !important; 
+    box-shadow: 0 0 22px rgba(255, 215, 0, 0.25), 
+                inset 0 0 12px rgba(255, 215, 0, 0.15) !important;
+                
+    transition: transform 0.3s cubic-bezier(0.25, 1, 0.5, 1), border-color 0.3s ease, box-shadow 0.3s ease;
+}
+
+.premium-card.boton-tradicional-centro:hover {
+    transform: translateY(-5px) scale(1.02) !important;
+    
+    /* 🔥 HOVER LIMPIO: Mantiene la tonalidad cristalina y viva, sin volverse marrón opaco */
+    background: linear-gradient(135deg, rgba(75, 60, 20, 0.5), rgba(25, 20, 6, 0.8)) !important;
+    
+    /* 🔥 EFECTO RADIACTIVO: Expansión de neón multicapa pura de alta intensidad */
+    border-color: rgba(255, 215, 0, 1) !important;
+    box-shadow: 0 0 35px rgba(255, 215, 0, 0.85), 
+                0 0 15px rgba(255, 215, 0, 0.45), 
+                inset 0 0 20px rgba(255, 215, 0, 0.35) !important; 
+}
+
+.boton-tradicional-centro h3 {
+    color: #ffffff;
+    text-shadow: 0 0 10px rgba(255, 255, 255, 0.1);
+    transition: text-shadow 0.3s ease;
+}
+
+.premium-card.boton-tradicional-centro:hover h3 {
+    color: #ffffff !important;
+    text-shadow: 0 0 15px rgba(255, 215, 0, 0.7) !important;
+}
+
+/* Cinta Gigante Horizontal estilo Casino */
+.caja-carrusel-tradicional-gigante {
+    width: 100%;
+    height: 140px;
+    background: rgba(11, 11, 16, 0.95);
+    border: 3px solid #ffd700;
+    box-shadow: 0 0 30px rgba(255, 215, 0, 0.25), inset 0 0 20px rgba(0, 0, 0, 0.7);
+    border-radius: 16px;
+    position: relative;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+}
+
+/* 🎯 AJUSTE 1: Ticker o selector de triangulito superior dorado */
+.linea-objetivo-tradicional {
+    position: absolute;
+    left: 50%;
+    top: -2px; /* Solapado perfectamente con el borde superior */
+    width: 0;
+    height: 0;
+    border-left: 18px solid transparent;
+    border-right: 18px solid transparent;
+    border-top: 24px solid #ffd700;
+    filter: drop-shadow(0 4px 10px rgba(255, 215, 0, 0.7));
+    z-index: 10;
+    transform: translateX(-50%) rotate(0deg);
+    transform-origin: top center;
+}
+
+/* 🎯 IMPORTANTE: Padding en 0 para que la matemática de app.js sea milimétrica */
+.visor-carrusel-interno {
+    display: flex;
+    align-items: center;
+    gap: 15px; 
+    padding: 0;
+    position: absolute;
+    left: 0;
+    white-space: nowrap;
+    will-change: transform;
+}
+
+.avatar-cinta-tradicional {
+    width: 90px;
+    height: 90px;
+    border-radius: 50%;
+    border: 3px solid rgba(0, 255, 204, 0.4);
+    object-fit: cover;
+    box-shadow: 0 0 12px rgba(0, 255, 204, 0.2);
+    flex-shrink: 0;
+    box-sizing: border-box;
+}
+
+.item-foto-anonima {
+    width: 90px;
+    height: 90px;
+    border-radius: 50%;
+    background: #1a1a24;
+    border: 2px dashed #ffd700;
+    color: #ffd700;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    font-size: 2rem;
+    font-weight: bold;
+    margin: 0 auto;
+}
+
+/* Contenedor de cascada inferior */
+.contenedor-ganadores-abajo {
+    margin-top: 25px;
+    width: 100%;
+    background: rgba(20, 20, 30, 0.5);
+    border: 1px solid rgba(255, 215, 0, 0.1);
+    border-radius: 16px;
+    padding: 20px;
+    box-shadow: 0 10px 25px rgba(0,0,0,0.3);
+}
+
+.contenedor-ganadores-abajo h3 {
+    font-size: 1rem;
+    color: #ffd700;
+    letter-spacing: 2px;
+    margin-bottom: 15px;
+    text-transform: uppercase;
+    text-shadow: 0 0 10px rgba(255,215,0,0.2);
+}
+
+.lista-live-tradicional {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    list-style: none;
+    max-height: 220px;
+    overflow-y: auto;
+    padding-right: 5px;
+}
+
+.lista-live-tradicional::-webkit-scrollbar {
+    width: 6px;
+}
+.lista-live-tradicional::-webkit-scrollbar-thumb {
+    background: #ffd700;
+    border-radius: 10px;
+}
+
+/* Tarjeta individual de ganador acumulado */
+.ganador-item-tradicional {
+    display: flex;
+    align-items: center;
+    gap: 15px;
+    background: rgba(0, 255, 204, 0.03);
+    border: 1px solid rgba(0, 255, 204, 0.15);
+    padding: 10px 15px;
+    border-radius: 12px;
+    text-align: left;
+    animation: popUp 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards;
+}
+
+.ganador-item-tradicional img {
+    width: 48px;
+    height: 48px;
+    border-radius: 50%;
+    border: 2px solid #00ffcc;
+    object-fit: cover;
+    box-shadow: 0 0 8px rgba(0,255,204,0.3);
+}
+
+.ganador-item-tradicional .detalles {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.ganador-item-tradicional .user {
+    color: #ffd700;
+    font-weight: bold;
+    font-size: 1rem;
+}
+
+.ganador-item-tradicional .txt {
+    color: #bbb;
+    font-size: 0.85rem;
+    font-style: italic;
+}
+
+/* 📱 Unificación responsiva para teléfonos */
+@media (max-width: 768px) {
+    .boton-tradicional-centro { width: 100% !important; }
+    .caja-carrusel-tradicional-gigante { height: 110px; }
+    .avatar-cinta-tradicional, .item-foto-anonima { width: 70px; height: 70px; }
+}
+
+/* Corrección de scroll interno para que la tarjeta de setup tradicional sea cómoda en PC y móvil */
+.tradicional-card-setup {
+    max-height: 80vh;
+    overflow-y: auto;
+    padding-right: 8px;
+}
+.tradicional-card-setup::-webkit-scrollbar {
+    width: 5px;
+}
+.tradicional-card-setup::-webkit-scrollbar-thumb {
+    background: rgba(255, 215, 0, 0.3);
+    border-radius: 10px;
+}
+/* Forzar que el panel tradicional no use animaciones de ocultar */
+#panel-filtros-tradicional.panel-filtros-interno {
+    display: flex !important;
+}
+
+/* =================================================================
+   🏆 OPTIMIZACIÓN MECÁNICA: SORTEO TRADICIONAL PREMIUM
+   ================================================================= */
+
+/* 🎯 DETALLE 1: Forzar sombra rectangular perfecta adaptada a la caja del carrusel */
+#timerOverlayTradicional {
+    border-radius: 16px !important;
+}
+
+/* =================================================================
+   🏆 CORRECCIÓN DE FÍSICA: 4 MOVIMIENTOS INICIANDO A LA IZQUIERDA
+   ================================================================= */
+
+@keyframes rozamientoTicker {
+    0% { transform: translateX(-50%) rotate(0deg); }
+    
+    /* 1. MOVIMIENTO: Latigazo inicial sutil hacia la IZQUIERDA (0s a 1.5s) */
+    15% { transform: translateX(-50%) rotate(14deg); }
+    
+    /* 2. MOVIMIENTO: Cae pesado y lento hacia la DERECHA (1.5s a 4.5s) */
+    50% { transform: translateX(-50%) rotate(-10deg); }
+    
+    /* 3. MOVIMIENTO: Recupera sutilmente hacia la IZQUIERDA (4.5s a 7.5s) */
+    83% { transform: translateX(-50%) rotate(4deg); }
+    
+    /* 4. MOVIMIENTO: Freno final y centrado rígido definitivo en el ganador (7.5s a 9s) */
+    100% { transform: translateX(-50%) rotate(0deg); }
+}
+
+/* Aplicación fluida y pesada coordinada con tus 9 segundos netos de giro */
+.linea-objetivo-tradicional.vibrando {
+    animation: rozamientoTicker 9s cubic-bezier(0.25, 0.46, 0.45, 0.94) forwards !important;
+}
+
+/* =================================================================
+   🏆 DISEÑO PREMIUM MINIMALISTA: DORADO SOFT & LUXURY GLASS
+   ================================================================= */
+
+/* Mantiene el agrandado suave y simétrico para todas las tarjetas */
+.menu-card:hover:not(.disabled),
+.premium-card:hover:not(.disabled) {
+    transform: translateY(-4px) scale(1.01) !important;
+    transition: transform 0.35s cubic-bezier(0.25, 1, 0.5, 1), border-color 0.3s ease, box-shadow 0.3s ease !important;
+}
+
+/* Sorteo Tradicional: Estilo minimalista, limpio y soft */
+.boton-tradicional-centro {
+    grid-column: 1 / -1;
+    justify-self: center;
+    width: calc(50% - 10px);
+    box-sizing: border-box;
+    backdrop-filter: blur(12px);
+    
+    /* ✨ FONDO: Cristal oscuro muy fino con un tinte dorado sutil en el fondo */
+    background: linear-gradient(135deg, rgba(255, 215, 0, 0.03), rgba(18, 18, 24, 0.82)) !important;
+    
+    /* ⚡ BORDE FINO: Estilo hilo de oro mate, limpio y sin brillos molestos */
+    border: 1px solid rgba(255, 215, 0, 0.35) !important; 
+    box-shadow: 0 8px 25px rgba(0, 0, 0, 0.4), 
+                inset 0 0 10px rgba(255, 215, 0, 0.05) !important;
+                
+    transition: transform 0.35s cubic-bezier(0.25, 1, 0.5, 1), border-color 0.3s ease, box-shadow 0.3s ease;
+}
+
+/* Hover suave: Incrementa la nitidez del contorno sin explotar en brillo */
+.premium-card.boton-tradicional-centro:hover {
+    background: linear-gradient(135deg, rgba(255, 215, 0, 0.06), rgba(24, 24, 32, 0.88)) !important;
+    
+    /* ⚡ ENFOQUE SOFT: El borde se aclara elegantemente y el resplandor es una seda fina */
+    border-color: rgba(255, 215, 0, 0.75) !important;
+    box-shadow: 0 12px 30px rgba(0, 0, 0, 0.5),
+                0 0 15px rgba(255, 215, 0, 0.15), 
+                inset 0 0 12px rgba(255, 215, 0, 0.1) !important; 
+}
+
+/* =================================================================
+   🎮 IDENTIDAD DE MARCA: TIPOGRAFÍA GAMING ESPORTS
+   ================================================================= */
+
+/* 🎯 LOGO POSITION: Bajamos el logo y suavizamos el impacto visual */
+.pngtuber-header-container { 
+    display: flex; 
+    justify-content: center; 
+    align-items: center; 
+    width: 100%; 
+    margin-bottom: 0px; 
+    margin-top: 80px; /* 🔥 Aumentado de 35px a 80px para dar aire */
+}
+
+/* =================================================================
+   👑 REPARACIÓN DE CABECERA Y MARCA MINIMALISTA (MENÚ PRINCIPAL)
+   ================================================================= */
+
+/* 🎯 SOLUCIÓN 1: Bajar el logo en el Menú Principal (Ya no estará pegado al techo) */
+.header-logo {
+    margin-top: 65px !important; /* 🔥 Espacio perfecto respecto al borde superior */
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 5px;
+}
+
+/* 🎯 SOLUCIÓN 2: Limpieza total del efecto metálico (Wipeout de gradientes viejos) */
+.titulo-brand-kz {
+    font-family: 'Poppins', sans-serif !important;
+    font-weight: 700 !important;
+    font-size: 2.4rem !important;
+    text-transform: uppercase !important;
+    letter-spacing: 5px !important;
+    margin-top: 10px !important;
+    margin-bottom: 0px !important;
+    text-align: center !important;
+    
+    /* 🧼 RESET DE PROPIEDADES: Borramos por completo el degradado e imágenes de fondo anteriores */
+    background: none !important;
+    -webkit-background-clip: unset !important;
+    background-clip: unset !important;
+    
+    /* 🧡 COLOR PLANO PREMIUM: Naranja KemZone puro, sólido y limpio */
+    color: #ff6600 !important;
+    -webkit-text-fill-color: #ff6600 !important; 
+    
+    /* Micro-sombra plana muy fina para despegar sutilmente del fondo oscuro */
+    filter: drop-shadow(0px 2px 4px rgba(0, 0, 0, 0.4)) !important;
+}
+
+/* Subtítulo: Indicador de interfaz limpio y centrado definitivo */
+.subtitulo-brand-kz {
+    font-family: 'Poppins', sans-serif;
+    font-weight: 600;
+    font-size: 1.05rem;
+    text-transform: uppercase;
+    letter-spacing: 4px;
+    text-align: center;
+    margin: 5px auto 25px auto; /* Centrado automático ultra estable */
+    color: rgba(240, 240, 245, 0.9);
+    display: block;
+    width: max-content;
+}
+
+.subtitulo-brand-kz::after {
+    content: '';
+    display: block;
+    width: 40px;
+    height: 2px;
+    background: rgba(255, 106, 0, 0.6);
+    margin: 6px auto 0 auto;
+    border-radius: 2px;
+}
+
+/* 📱 MICRO-FIX RESPONSIVE: Evita que el título gigante rompa en celulares */
+@media (max-width: 768px) {
+    .titulo-brand-kz {
+        font-size: 1.9rem !important;
+        letter-spacing: 3px !important;
+    }
+}
+
+/* =================================================================
+   1. ELIMINAR PARPADEO DEL SCROLL AL INICIAR (SPLASH SCREEN)
+   ================================================================= */
+html:has(.splash-container.active),
+body:has(.splash-container.active) {
+    overflow-y: hidden !important;
+}
+
+/* =================================================================
+   2. SCROLLBAR ADAPTATIVA (TEMA OSCURO / TEMA CLARO)
+   ================================================================= */
+/* Dimensiones globales de la barra */
+::-webkit-scrollbar {
+    width: 8px;  
+    height: 8px; 
+}
+
+/* 🌑 COLORES MODO OSCURO (Por defecto) */
+::-webkit-scrollbar-track {
+    background: #0d0d14; /* Fondo oscuro de la página */
+}
+::-webkit-scrollbar-thumb {
+    background: #1a1a24; /* Gris oscuro integrado */
+    border: 1px solid rgba(255, 255, 255, 0.03); 
+    border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+    background: #21212e; 
+    border-color: rgba(255, 255, 255, 0.08);
+}
+
+/* ☀️ COLORES MODO CLARO (Correspondientes a body.light-theme) */
+body.light-theme::-webkit-scrollbar-track {
+    background: #f0f0f5; /* Fondo claro de la página */
+}
+body.light-theme::-webkit-scrollbar-thumb {
+    background: #c8c8d3; /* Gris claro premium que no desentona */
+    border: 1px solid #f0f0f5; 
+    border-radius: 4px;
+}
+body.light-theme::-webkit-scrollbar-thumb:hover {
+    background: #b0b0bd; /* Se oscurece un pelo al pasar el cursor */
+}
+
+/* 🦊 COMPATIBILIDAD FIREFOX (AUTOMÁTICA) */
+html {
+    scrollbar-width: thin;
+    scrollbar-color: #1a1a24 #0d0d14;
+}
+html:has(body.light-theme) {
+    scrollbar-color: #c8c8d3 #f0f0f5;
+}
+
+/* =================================================================
+   ✨ REPOTENCIACIÓN DE COLOR Y NEÓN PARA MODO CLARO
+   ================================================================= */
+
+/* 🏆 REPARACIÓN INTEGRAL DEL SORTEO TRADICIONAL (Efecto Cristal de Oro) */
+body.light-theme .boton-tradicional-centro {
+    /* Fondo cristalino con tinte oro suave, limpio y brillante */
+    background: linear-gradient(135deg, rgba(255, 215, 0, 0.18), rgba(255, 255, 255, 0.95)) !important;
+    border: 1px solid rgba(212, 175, 55, 0.6) !important; 
+    box-shadow: 0 8px 25px rgba(212, 175, 55, 0.15), 
+                inset 0 0 10px rgba(255, 215, 0, 0.1) !important;
+}
+
+/* Forzar color de textos oscuros legibles en el botón tradicional blanco */
+body.light-theme .boton-tradicional-centro h3 {
+    color: #2d2d3f !important;
+    text-shadow: none !important;
+}
+body.light-theme .boton-tradicional-centro p,
+body.light-theme .boton-tradicional-centro span {
+    color: #5d5d70 !important;
+}
+
+/* Hover Sorteo Tradicional Claro (Glow de Oro nítido) */
+body.light-theme .premium-card.boton-tradicional-centro:hover {
+    background: linear-gradient(135deg, rgba(255, 215, 0, 0.28), rgba(255, 255, 255, 1)) !important;
+    border-color: rgba(212, 175, 55, 1) !important;
+    box-shadow: 0 12px 30px rgba(212, 175, 55, 0.35),
+                0 0 15px rgba(255, 215, 0, 0.2), 
+                inset 0 0 12px rgba(255, 215, 0, 0.15) !important; 
+}
+body.light-theme .premium-card.boton-tradicional-centro:hover h3 {
+    color: #b8860b !important; /* Oro oscuro elegante al pasar el cursor */
+}
+
+
+/* 🧡 ENFOCADO DE COLOR: Tarjetas de Carga Manual (Columna Izquierda) */
+body.light-theme .menu-card:nth-child(1):hover:not(.disabled),
+body.light-theme .menu-card:nth-child(3):hover:not(.disabled),
+body.light-theme .menu-card:nth-child(5):hover:not(.disabled) { 
+    border-color: rgba(255, 102, 0, 0.6) !important; 
+    box-shadow: 0 10px 25px rgba(255, 102, 0, 0.2) !important; 
+    background: rgba(255, 255, 255, 1) !important;
+}
+
+/* 💟 ENFOCADO DE COLOR: Tarjetas Premium (Columna Derecha) */
+body.light-theme .premium-card:hover:not(.disabled) { 
+    border-color: rgba(255, 0, 255, 0.6) !important; 
+    box-shadow: 0 10px 25px rgba(255, 0, 255, 0.2) !important; 
+    background: rgba(255, 255, 255, 1) !important;
+}
+
+/* =================================================================
+   🥛 PASO 1: ARREGLO EXCLUSIVO PARA EL ENTORNO DE LOS VASOS
+   ================================================================= */
+
+/* Cambiar la caja negra de fondo del panel derecho a un gris/blanco limpio satinado */
+body.light-theme #pantalla-vasos .panel-derecho {
+    background: #e9e9f0 !important;
+    border: 1px solid rgba(0, 0, 0, 0.08) !important;
+    border-radius: 20px !important;
+    padding: 15px !important;
+    box-shadow: inset 0 2px 8px rgba(0, 0, 0, 0.05) !important;
+}
+
+/* Modificar la mesa interna del juego para que tenga una estética limpia de madera clara de stream */
+body.light-theme .table-surface {
+    background: radial-gradient(ellipse at center, #ffffff 0%, #e2e2eb 100%) !important;
+    border-bottom: 4px solid #ff6600 !important;
+    box-shadow: 0 10px 25px rgba(0, 0, 0, 0.05), inset 0 1px 0 rgba(255, 255, 255, 0.8) !important;
+}
+
+/* Evitar que el círculo de previsualización del ganador se rompa con fondo negro */
+body.light-theme .cup-winner-preview {
+    background: #ffffff !important;
+    color: #1a1a24 !important;
+    border: 2px solid #00ffcc !important;
+    box-shadow: 0 0 12px rgba(0, 255, 204, 0.3) !important;
+}
+
+/* =================================================================
+   ☀️ ADAPTACIÓN PREMIUM PARA BOTONES DE DETENER Y CONTADORES (MODO CLARO)
+   ================================================================= */
+body.light-theme .btn-stop {
+    background: rgba(255, 255, 255, 0.95) !important;
+    border: 1px solid rgba(255, 59, 48, 0.5) !important;
+    color: #ff3b30 !important;
+    box-shadow: 0 4px 12px rgba(255, 59, 48, 0.15) !important;
+}
+
+body.light-theme .btn-stop:hover {
+    background: #ff3b30 !important;
+    color: #ffffff !important;
+    box-shadow: 0 6px 18px rgba(255, 59, 48, 0.4) !important;
+    transform: scale(1.1);
+}
+
+/* Ajuste del fondo de los contadores circulares (Ruleta, Slots y Tradicional) */
+body.light-theme .timer-overlay {
+    background: rgba(240, 240, 245, 0.92) !important;
+    color: #ff6600 !important;
+    text-shadow: 0 0 15px rgba(255, 102, 0, 0.2) !important;
+}
+
+/* Ajuste específico para el contenedor de vasos (Trile) */
+body.light-theme #timerOverlayVasos {
+    background: rgba(233, 233, 240, 0.95) !important;
+    color: #ff6600 !important;
+    text-shadow: none !important;
+}
+
+/* =================================================================
+   🎰 REPARACIÓN ESTRUCTURAL DE LA CUENTA ATRÁS DEL TRAGAPERRAS
+   ================================================================= */
+
+/* 1. Forzamos que el fondo del tragaperras sea rectangular y estático */
+#timerOverlaySlots.timer-overlay {
+    border-radius: 12px !important; /* Cuadrado adaptado a .slot-window */
+    height: 100% !important;
+    width: 100% !important;
+    top: 0 !important;
+    left: 0 !important;
+    background: rgba(11, 11, 16, 0.93) !important; /* Fondo negro fijo */
+    color: #ff6600 !important;
+    
+    /* 🔥 EL TRUCO MAESTRO: Desactivamos el pulso viejo del contenedor para que no se mueva el fondo */
+    animation: none !important; 
+    
+    /* Creamos una nueva animación dedicada exclusivamente a bombear el contenido interno */
+    animation: pulseContenidoSlots 1s infinite ease-in-out !important;
+}
+
+/* 2. Variante del fondo estático para el Modo Claro */
+body.light-theme #timerOverlaySlots.timer-overlay {
+    background: rgba(224, 224, 229, 0.96) !important; /* Fondo gris/blanco fijo */
+    color: #ff6600 !important;
+}
+
+/* 3. Animación fluida de escala que agranda y achica el número sin deformar la caja */
+@keyframes pulseContenidoSlots {
+    0%, 100% {
+        transform: scale(1);
+        text-shadow: 0 0 15px rgba(255, 102, 0, 0.6);
+    }
+    50% {
+        transform: scale(1.22); /* Agranda el número un 22% elásticamente */
+        text-shadow: 0 0 30px rgba(255, 102, 0, 1), 0 0 10px rgba(255, 255, 255, 0.4);
+    }
+}
+
+/* =================================================================
+   ⚡ EFECTO DE DESTELLO RADIACTIVO PARA BOTONES EN CARGA (SCRAPER)
+   ================================================================= */
+/* Contenedor seguro para el destello */
+.btn-accion.loading-active {
+    position: relative !important;
+    overflow: hidden !important;
+    opacity: 0.85 !important; /* Look ligeramente translúcido pero vibrante */
+    filter: brightness(1.1);
+}
+
+/* El rayo de luz que recorre el relieve */
+.btn-accion.loading-active::after {
+    content: '' !important;
+    position: absolute !important;
+    top: 0;
+    left: -150%;
+    width: 60%;
+    height: 100%;
+    background: linear-gradient(
+        90deg,
+        rgba(255, 255, 255, 0) 0%,
+        rgba(255, 255, 255, 0.45) 50%,
+        rgba(255, 255, 255, 0) 100%
+    ) !important;
+    transform: skewX(-30deg) !important; /* Inclinación diagonal del destello */
+    animation: barraDestelloKZ 1.4s infinite ease-in-out !important;
+}
+
+/* Animación de barrido infinito de izquierda a derecha */
+@keyframes barraDestelloKZ {
+    0% {
+        left: -150%;
+    }
+    100% {
+        left: 150%;
+    }
+}
+
+/* =================================================================
+   🚨 MODAL DE ADVERTENCIA PREMIUM (ABORT SEARCH)
+   ================================================================= */
+.confirm-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(6, 6, 9, 0.85);
+    backdrop-filter: blur(8px);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    z-index: 9999;
+    animation: fadeInConfirm 0.2s ease-out;
+}
+
+.confirm-box {
+    background: #13131a;
+    border: 2px solid #ff4444;
+    box-shadow: 0 0 30px rgba(255, 68, 68, 0.25);
+    border-radius: 16px;
+    padding: 30px;
+    max-width: 420px;
+    width: 90%;
+    text-align: center;
+    color: #ffffff;
+}
+
+.confirm-icon {
+    font-size: 2.5rem;
+    margin-bottom: 10px;
+    animation: pulseWarning 1s infinite alternate;
+}
+
+.confirm-box h3 {
+    color: #ff4444;
+    font-size: 1.6rem;
+    letter-spacing: 1px;
+    margin-bottom: 15px;
+}
+
+.confirm-highlight {
+    color: #ffb300;
+    font-weight: bold;
+    margin-bottom: 10px;
+}
+
+.confirm-question {
+    font-size: 0.95rem;
+    opacity: 0.8;
+    margin-bottom: 25px;
+}
+
+.confirm-buttons {
+    display: flex;
+    gap: 15px;
+    justify-content: center;
+}
+
+.btn-confirm-exit {
+    background: #ff4444;
+    color: white;
+    border: none;
+    padding: 12px 20px;
+    border-radius: 8px;
+    font-weight: bold;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.btn-confirm-exit:hover {
+    background: #cc2a2a;
+    box-shadow: 0 0 15px rgba(255, 68, 68, 0.4);
+}
+
+.btn-confirm-stay {
+    background: #22222f;
+    color: #ffffff;
+    border: 1px solid #44445c;
+    padding: 12px 20px;
+    border-radius: 8px;
+    font-weight: bold;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.btn-confirm-stay:hover {
+    background: #323246;
+}
+
+@keyframes fadeInConfirm {
+    from { opacity: 0; transform: scale(0.95); }
+    to { opacity: 1; transform: scale(1); }
+}
+
+/* 🎟️ POSICIONAMIENTO DEL BOTÓN DE CANJE */
+.redeem-badge-btn {
+    left: 145px !important; /* Desplazado a la derecha del contador original */
+    border-color: rgba(0, 255, 204, 0.4) !important;
+}
+.redeem-badge-btn:hover {
+    border-color: #00ffcc !important;
+    box-shadow: 0 5px 20px rgba(0, 255, 204, 0.3) !important;
+}
+
+@media (max-width: 768px) {
+    .redeem-badge-btn {
+        left: auto !important;
+        right: 15px !important; /* En móviles se clava en la esquina superior derecha */
+        top: 15px !important;
+    }
+}
