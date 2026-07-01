@@ -451,13 +451,24 @@ app.post('/api/shopify-webhook', async (req, res) => {
     try {
         const order = req.body;
 
-        // 1. Extraer el deviceId que guardamos en los atributos
+        // 1. Extraer el deviceId (Soportando atributos y propiedades de línea)
+        let deviceId = null;
+        
+        // Revisar atributos generales de la nota
         const atributos = order.note_attributes || [];
         const deviceIdAttr = atributos.find(attr => attr.name === 'deviceId');
-        const deviceId = deviceIdAttr ? deviceIdAttr.value : null;
+        if (deviceIdAttr) deviceId = deviceIdAttr.value;
 
-        if (!deviceId) {
-            console.log("⚠️ Webhook recibido pero el pedido no incluye un 'deviceId'. Ignorando.");
+        // Revisar propiedades del producto comprado (El método más seguro)
+        if (!deviceId && order.line_items && order.line_items.length > 0) {
+            const props = order.line_items[0].properties || [];
+            const propAttr = props.find(p => p.name === 'deviceId');
+            if (propAttr) deviceId = propAttr.value;
+        }
+
+        // 🛡️ Filtro anti-fantasmas: Bloquea si es nulo o si es la palabra "null"
+        if (!deviceId || deviceId === 'null' || deviceId === 'undefined') {
+            console.log("⚠️ Webhook ignorado: No se detectó un deviceId válido.");
             return res.status(200).send("Pedido sin deviceId"); 
         }
 
