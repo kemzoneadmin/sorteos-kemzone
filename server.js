@@ -456,13 +456,15 @@ app.post('/api/shopify-webhook', async (req, res) => {
         
         // Revisar atributos generales de la nota
         const atributos = order.note_attributes || [];
-        const deviceIdAttr = atributos.find(attr => attr.name === 'deviceId');
+        // Cambia 'deviceId' por '_deviceId'
+const deviceIdAttr = atributos.find(attr => attr.name === '_deviceId');
         if (deviceIdAttr) deviceId = deviceIdAttr.value;
 
         // Revisar propiedades del producto comprado (El método más seguro)
         if (!deviceId && order.line_items && order.line_items.length > 0) {
             const props = order.line_items[0].properties || [];
-            const propAttr = props.find(p => p.name === 'deviceId');
+            // Cambia 'deviceId' por '_deviceId'
+const propAttr = props.find(p => p.name === '_deviceId');
             if (propAttr) deviceId = propAttr.value;
         }
 
