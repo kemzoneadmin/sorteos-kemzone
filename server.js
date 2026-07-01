@@ -14,13 +14,15 @@ mongoose.connect(process.env.MONGODB_URI)
     .then(() => console.log('📦 Conectado con éxito a MongoDB Atlas'))
     .catch(err => console.error('❌ Error crítico al conectar a MongoDB:', err));
 
+// =================================================================
 // 📝 ESQUEMAS Y MODELOS DE BASE DE DATOS
+// =================================================================
 const PinSchema = new mongoose.Schema({
     code: { type: String, unique: true, uppercase: true, trim: true },
     tokens: { type: Number, required: true },
     used: { type: Boolean, default: false }
 });
-const Pin = mongoose.model('Pin', PinSchema, 'pines'); // 👈 El tercer parámetro fuerza el nombre de la colección
+const Pin = mongoose.model('Pin', PinSchema, 'pines'); 
 
 const PreviewSchema = new mongoose.Schema({
     deviceId: { type: String, required: true },
@@ -28,6 +30,13 @@ const PreviewSchema = new mongoose.Schema({
     count: { type: Number, default: 0 }
 });
 const Preview = mongoose.model('Preview', PreviewSchema);
+
+// 💰 NUEVO ESQUEMA: SALDOS DE USUARIOS (Para guardar las compras de Shopify)
+const BalanceSchema = new mongoose.Schema({
+    deviceId: { type: String, required: true, unique: true },
+    tokens: { type: Number, default: 0 }
+});
+const Balance = mongoose.model('Balance', BalanceSchema);
 
 // 🔒 CLIENTE APIFY PROTEGIDO CON VARIABLES DE ENTORNO
 const client = new ApifyClient({
@@ -131,7 +140,6 @@ app.post('/api/preview', async (req, res) => {
     const identificadorDestino = deviceId || `ip_${ipUsuario}`;
 
     try {
-        // Consultar Base de Datos por límite diario
         let registro = await Preview.findOne({ deviceId: identificadorDestino, date: hoy });
         if (!registro) {
             registro = new Preview({ deviceId: identificadorDestino, date: hoy, count: 0 });
@@ -141,7 +149,6 @@ app.post('/api/preview', async (req, res) => {
             return res.status(429).json({ error: 'Límite diario agotado por hoy.' });
         }
 
-        // Incremento anticipado persistente
         registro.count++;
         await registro.save();
 
@@ -161,7 +168,6 @@ app.post('/api/preview', async (req, res) => {
             const { items } = await client.dataset(run.defaultDatasetId).listItems();
 
             if (!items || items.length === 0) {
-                // Reembolso inmediato si no hay data
                 registro.count--;
                 await registro.save();
                 return res.status(404).json({ error: 'No se encontraron datos en TikTok.' });
@@ -214,7 +220,6 @@ app.post('/api/preview', async (req, res) => {
             });
         }
     } catch (error) {
-        // Reembolso en caso de caída del Scraper o Red
         try {
             let roll = await Preview.findOne({ deviceId: identificadorDestino, date: hoy });
             if (roll && roll.count > 0) {
@@ -371,9 +376,8 @@ app.get('/api/proxy-image', async (req, res) => {
 });
 
 // =================================================================
-// 4. ENDPOINT: PROCESADOR DE PINES (MONGO DB INTERGATED)
+// 4. ENDPOINT: PROCESADOR DE PINES 
 // =================================================================
-// 📑 MÓDULO DE VALIDACIÓN DE PINES CON MONGODB
 app.post('/api/redeem', async (req, res) => {
     const { code } = req.body;
     if (!code) return res.status(400).json({ error: 'El código es estrictamente requerido.' });
@@ -381,7 +385,6 @@ app.post('/api/redeem', async (req, res) => {
     try {
         const pinLimpio = code.trim().toUpperCase();
         
-        // 🔍 Buscamos el pin directamente en la colección de MongoDB Atlas
         const pinEncontrado = await Pin.findOne({ code: pinLimpio });
 
         if (!pinEncontrado) {
@@ -392,7 +395,6 @@ app.post('/api/redeem', async (req, res) => {
             return res.status(400).json({ error: 'Este pin ya fue canjeado. Los códigos son de un único uso.' });
         }
 
-        // 🔒 Cambiamos el estado a usado y guardamos el cambio en la base de datos
         pinEncontrado.used = true;
         await pinEncontrado.save();
 
@@ -407,6 +409,100 @@ app.post('/api/redeem', async (req, res) => {
     }
 });
 
+// =================================================================
+// 5. DICCIONARIO DE EQUIVALENCIAS DE TOKEMS (SHOPIFY)
+// =================================================================
+// ⚠️ RECUERDA: Cambia estos números por los IDs reales de tus variantes
+const TOKENS_POR_VARIANTE = {
+    "47912562720926": 1,   // Plan Base (1 Tokem)
+    "47912562851998": 3,   // Plan Starter (3 Tokems)
+    "47912562884766": 6,   // Plan Pro (6 Tokems)
+    "47912563015838": 12,  // Plan Business (12 Tokems)
+    "47912563114142": 24,  // Plan Influencer (24 Tokems)
+    "47912563245214": 48   // Plan Agencia (48 Tokems)
+};
+
+// =================================================================
+// 6. ENDPOINT: OBTENER EL SALDO DE UN USUARIO (MONGO DB)
+// =================================================================
+app.get('/api/get-balance', async (req, res) => {
+    const { deviceId } = req.query;
+
+    if (!deviceId) {
+        return res.status(400).json({ error: "Falta el parámetro deviceId" });
+    }
+
+    try {
+        // Buscamos el saldo guardado de ese usuario
+        const registro = await Balance.findOne({ deviceId: deviceId });
+        const saldoActual = registro ? registro.tokens : 0;
+        
+        return res.json({ tokens: saldoActual });
+    } catch (error) {
+        console.error('❌ Error al obtener balance en DB:', error);
+        return res.status(500).json({ error: "Error consultando saldo" });
+    }
+});
+
+// =================================================================
+// 7. ENDPOINT: WEBHOOK DE SHOPIFY (PEDIDO PAGADO)
+// =================================================================
+app.post('/api/shopify-webhook', async (req, res) => {
+    try {
+        const order = req.body;
+
+        // 1. Extraer el deviceId que guardamos en los atributos
+        const atributos = order.note_attributes || [];
+        const deviceIdAttr = atributos.find(attr => attr.name === 'deviceId');
+        const deviceId = deviceIdAttr ? deviceIdAttr.value : null;
+
+        if (!deviceId) {
+            console.log("⚠️ Webhook recibido pero el pedido no incluye un 'deviceId'. Ignorando.");
+            return res.status(200).send("Pedido sin deviceId"); 
+        }
+
+        console.log(`🛒 ¡Pedido pagado detectado para el dispositivo: ${deviceId}!`);
+
+        // 2. Analizar las variantes compradas y sumar tokens
+        let tokensAAgregar = 0;
+        const lineItems = order.line_items || [];
+
+        lineItems.forEach(item => {
+            const variantIdString = String(item.variant_id);
+            const cantidadComprada = item.quantity || 1;
+
+            if (TOKENS_POR_VARIANTE[variantIdString]) {
+                const tokensDelPlan = TOKENS_POR_VARIANTE[variantIdString];
+                tokensAAgregar += (tokensDelPlan * cantidadComprada);
+            }
+        });
+
+        if (tokensAAgregar === 0) {
+            console.log("⚠️ El pedido no contenía ninguna variante de Tokems registrada.");
+            return res.status(200).send("No hay tokens que sumar");
+        }
+
+        // 3. Modificar el saldo directamente en MongoDB
+        let registro = await Balance.findOne({ deviceId: deviceId });
+        
+        if (!registro) {
+            // Si el usuario es nuevo y no tiene balance previo, se crea el registro
+            registro = new Balance({ deviceId: deviceId, tokens: 0 });
+        }
+        
+        registro.tokens += tokensAAgregar;
+        await registro.save();
+
+        console.log(`✅ Éxito: Se le sumaron ${tokensAAgregar} Tokems a ${deviceId}. Nuevo saldo: ${registro.tokens}`);
+        return res.status(200).send("Webhook procesado con éxito");
+
+    } catch (error) {
+        console.error("❌ Error procesando el Webhook de Shopify:", error);
+        return res.status(500).send("Error interno del servidor");
+    }
+});
+
+// Levantar el servidor
 app.listen(port, '0.0.0.0', () => {
-    console.log(`🚀 Servidor KemZone corriendo en http://localhost:${port}`);
+    console.log(`🚀 Servidor KemZone corriendo en el puerto ${port}`);
 });
