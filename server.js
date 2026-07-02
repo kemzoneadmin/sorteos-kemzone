@@ -11,7 +11,8 @@ const path = require('path');
 const mongoose = require('mongoose'); // 🚀 Conector oficial para MongoDB
 const bcrypt = require('bcrypt'); // 🔐 Para encriptar contraseñas
 const jwt = require('jsonwebtoken'); // 🔐 Para mantener sesiones activas
-const nodemailer = require('nodemailer'); // 🔐 Para enviar códigos de verificación
+const { Resend } = require('resend'); // 🚀 Activamos el motor de Resend
+const resend = new Resend(process.env.RESEND_API_KEY);
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -168,7 +169,7 @@ function extraerUsuarioDinamicamente(obj) {
 // 🔐 NUEVOS ENDPOINTS: SISTEMA DE AUTENTICACIÓN Y CUENTAS
 // =================================================================
 
-// 1. REGISTRO DE USUARIOS + ENVÍO DE CÓDIGO (RESCATA USUARIOS EN EL LIMBO)
+// 1. REGISTRO DE USUARIOS + ENVÍO DE CÓDIGO
 app.post('/api/register', async (req, res) => {
     const { email, password } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'El correo y la contraseña son obligatorios' });
@@ -181,17 +182,14 @@ app.post('/api/register', async (req, res) => {
         const codigoVerificacion = Math.floor(100000 + Math.random() * 900000).toString();
 
         if (usuario) {
-            // Si el usuario ya existe y ESTÁ verificado, lo bloqueamos
             if (usuario.isVerified) {
                 return res.status(400).json({ error: 'El correo electrónico ya está registrado y verificado. Por favor inicia sesión.' });
             } else {
-                // 🦸‍♂️ RESCATE DEL LIMBO: Si existe pero no está verificado, actualizamos su código y contraseña
                 usuario.password = hashedPassword;
                 usuario.verificationCode = codigoVerificacion;
                 await usuario.save();
             }
         } else {
-            // Si es un usuario completamente nuevo, lo creamos
             usuario = new User({
                 email: correoLimpio,
                 password: hashedPassword,
@@ -200,9 +198,9 @@ app.post('/api/register', async (req, res) => {
             await usuario.save();
         }
 
-        // Enviar correo
-        await transporter.sendMail({
-            from: '"KZ Sorteos" <' + process.env.EMAIL_USER + '>',
+        // 🚀 NUEVO ENVÍO MEDIANTE API DE RESEND (Bypassea cualquier bloqueo de puertos)
+        await resend.emails.send({
+            from: 'KZ Sorteos <registro@kzsorteos.com>', // 🔥 Tu dominio verificado actuando de forma nativa
             to: correoLimpio,
             subject: 'Código de verificación - Panel KZ',
             html: `
