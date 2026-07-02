@@ -516,34 +516,46 @@ app.get('/api/proxy-image', async (req, res) => {
 // =================================================================
 // 4. ENDPOINT: PROCESADOR DE PINES 
 // =================================================================
+// 🎟️ ENDPOINT: PROCESAR CANJE DE PINES PREPAGO (BLINDADO PARA CUENTAS)
 app.post('/api/redeem', async (req, res) => {
-    const { code } = req.body;
-    if (!code) return res.status(400).json({ error: 'El código es estrictamente requerido.' });
+    const { code, deviceId } = req.body;
+    if (!code || !deviceId) return res.status(400).json({ error: 'El código y el identificador son estrictamente requeridos.' });
 
     try {
-        const pinLimpio = code.trim().toUpperCase();
-        
-        const pinEncontrado = await Pin.findOne({ code: pinLimpio });
+        // 1. Validar que el PIN exista y no esté usado (Asumiendo tu modelo de base de datos)
+        const pin = await Pin.findOne({ code: code.toUpperCase(), used: false });
+        if (!pin) return res.status(400).json({ error: 'El pin introducido no es válido o ya fue canjeado anteriormente.' });
 
-        if (!pinEncontrado) {
-            return res.status(404).json({ error: 'El pin prepago introducido no existe en el sistema.' });
+        // 2. Buscar al usuario en la colección central (Ya sea por su correo o por su ID de dispositivo)
+        const identificadorLimpio = deviceId.trim().toLowerCase();
+        let usuario = await User.findOne({ email: identificadorLimpio });
+
+        if (!usuario) {
+            // Si el usuario no existe todavía (es un invitado que no se ha registrado), buscamos su registro por ID de dispositivo
+            usuario = await User.findOne({ email: deviceId });
+            if (!usuario) {
+                // Si es su primera acción, creamos su registro temporal en la base de datos
+                usuario = new User({ email: deviceId, tokems: 0, isVerified: true });
+            }
         }
 
-        if (pinEncontrado.used) {
-            return res.status(400).json({ error: 'Este pin ya fue canjeado. Los códigos son de un único uso.' });
-        }
+        // 3. Acreditar los Tokems del PIN y quemarlo para que no se use dos veces
+        usuario.tokems = (usuario.tokems || 0) + pin.tokens;
+        await usuario.save();
 
-        pinEncontrado.used = true;
-        await pinEncontrado.save();
+        pin.used = true;
+        pin.usedBy = identificadorLimpio;
+        await pin.save();
 
-        return res.json({
-            success: true,
-            tokens: pinEncontrado.tokens
+        return res.status(200).json({ 
+            success: true, 
+            tokens: pin.tokens, 
+            userTokens: usuario.tokems // Le devolvemos al cliente su nuevo saldo real
         });
 
     } catch (error) {
-        console.error('Error en el proceso de canje:', error);
-        return res.status(500).json({ error: 'Error interno del servidor al validar el pin.' });
+        console.error('Error en /api/redeem:', error);
+        return res.status(500).json({ error: 'Error interno del servidor al procesar el pin.' });
     }
 });
 
@@ -604,7 +616,7 @@ app.post('/api/shopify-webhook', async (req, res) => {
             return res.status(200).send("Pedido sin deviceId"); 
         }
 
-        console.log(`🛒 ¡Pedido pagado detectado para el dispositivo: ${deviceId}!`);
+        console.log(`🛒 ¡Pedido pagado detectado para el identificador: ${deviceId}!`);
 
         let tokensAAgregar = 0;
         const lineItems = order.line_items || [];
@@ -624,16 +636,32 @@ app.post('/api/shopify-webhook', async (req, res) => {
             return res.status(200).send("No hay tokens que sumar");
         }
 
-        let registro = await Balance.findOne({ deviceId: deviceId });
+        // =================================================================
+        // 🦸‍♂️ PASO 3: BÚSQUEDA INTELIGENTE (CUENTA VS INVITADO)
+        // =================================================================
+        const identificadorLimpio = deviceId.trim().toLowerCase();
         
-        if (!registro) {
-            registro = new Balance({ deviceId: deviceId, tokens: 0 });
-        }
-        
-        registro.tokens += tokensAAgregar;
-        await registro.save();
+        // Primero intentamos buscar si el deviceId es el correo de un Usuario registrado
+        let usuarioCuenta = await User.findOne({ email: identificadorLimpio });
 
-        console.log(`✅ Éxito: Se le sumaron ${tokensAAgregar} Tokems a ${deviceId}. Nuevo saldo: ${registro.tokens}`);
+        if (usuarioCuenta) {
+            // Si es un usuario con cuenta iniciada, le sumamos los Tokems directamente a su perfil
+            usuarioCuenta.tokems = (usuarioCuenta.tokems || 0) + tokensAAgregar;
+            await usuarioCuenta.save();
+            console.log(`✅ Éxito (Cuenta): Se le sumaron ${tokensAAgregar} Tokems al usuario registrado ${identificadorLimpio}. Nuevo saldo: ${usuarioCuenta.tokems}`);
+        } else {
+            // Si no tiene cuenta, manejamos el saldo de invitado en la colección Balance tradicional
+            let registroInvitado = await Balance.findOne({ deviceId: deviceId });
+            
+            if (!registroInvitado) {
+                registroInvitado = new Balance({ deviceId: deviceId, tokens: 0 });
+            }
+            
+            registroInvitado.tokens += tokensAAgregar;
+            await registroInvitado.save();
+            console.log(`✅ Éxito (Invitado): Se le sumaron ${tokensAAgregar} Tokems al dispositivo anónimo ${deviceId}. Nuevo saldo: ${registroInvitado.tokens}`);
+        }
+
         return res.status(200).send("Webhook procesado con éxito");
 
     } catch (error) {
