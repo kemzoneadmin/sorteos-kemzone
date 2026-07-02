@@ -61,11 +61,11 @@ const client = new ApifyClient({
     token: process.env.APIFY_TOKEN
 });
 
-// 📧 CONFIGURACIÓN DE NODEMAILER PARA ENVIAR CORREOS
 const transporter = nodemailer.createTransport({
     host: 'smtp.gmail.com',
     port: 465,
     secure: true,
+    family: 4, // 🚀 BALA DE PLATA: Fuerza el uso estricto de IPv4 a nivel de socket
     auth: {
         user: process.env.EMAIL_USER, 
         pass: process.env.EMAIL_PASS  
@@ -161,29 +161,43 @@ function extraerUsuarioDinamicamente(obj) {
 // 🔐 NUEVOS ENDPOINTS: SISTEMA DE AUTENTICACIÓN Y CUENTAS
 // =================================================================
 
-// 1. REGISTRO DE USUARIOS + ENVÍO DE CÓDIGO
+// =================================================================
+// 🔐 NUEVOS ENDPOINTS: SISTEMA DE AUTENTICACIÓN Y CUENTAS
+// =================================================================
+
+// 1. REGISTRO DE USUARIOS + ENVÍO DE CÓDIGO (RESCATA USUARIOS EN EL LIMBO)
 app.post('/api/register', async (req, res) => {
     const { email, password } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'El correo y la contraseña son obligatorios' });
 
     try {
         const correoLimpio = email.trim().toLowerCase();
-        const usuarioExiste = await User.findOne({ email: correoLimpio });
+        let usuario = await User.findOne({ email: correoLimpio });
         
-        if (usuarioExiste) {
-            return res.status(400).json({ error: 'El correo electrónico ya está registrado en el sistema.' });
-        }
-
         const hashedPassword = await bcrypt.hash(password, 10);
         const codigoVerificacion = Math.floor(100000 + Math.random() * 900000).toString();
 
-        const nuevoUsuario = new User({
-            email: correoLimpio,
-            password: hashedPassword,
-            verificationCode: codigoVerificacion
-        });
-        await nuevoUsuario.save();
+        if (usuario) {
+            // Si el usuario ya existe y ESTÁ verificado, lo bloqueamos
+            if (usuario.isVerified) {
+                return res.status(400).json({ error: 'El correo electrónico ya está registrado y verificado. Por favor inicia sesión.' });
+            } else {
+                // 🦸‍♂️ RESCATE DEL LIMBO: Si existe pero no está verificado, actualizamos su código y contraseña
+                usuario.password = hashedPassword;
+                usuario.verificationCode = codigoVerificacion;
+                await usuario.save();
+            }
+        } else {
+            // Si es un usuario completamente nuevo, lo creamos
+            usuario = new User({
+                email: correoLimpio,
+                password: hashedPassword,
+                verificationCode: codigoVerificacion
+            });
+            await usuario.save();
+        }
 
+        // Enviar correo
         await transporter.sendMail({
             from: '"KZ Sorteos" <' + process.env.EMAIL_USER + '>',
             to: correoLimpio,
