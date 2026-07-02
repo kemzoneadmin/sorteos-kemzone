@@ -559,45 +559,43 @@ app.get('/api/proxy-image', async (req, res) => {
 });
 
 // =================================================================
-// 4. ENDPOINT: PROCESADOR DE PINES 
+// 4. ENDPOINT: PROCESADOR DE PINES (CORREGIDO ANTI-CRASH)
 // =================================================================
-// 🎟️ ENDPOINT: PROCESAR CANJE DE PINES PREPAGO (BLINDADO PARA CUENTAS)
 app.post('/api/redeem', async (req, res) => {
     const { code, deviceId } = req.body;
     if (!code || !deviceId) return res.status(400).json({ error: 'El código y el identificador son estrictamente requeridos.' });
 
     try {
-        // 1. Validar que el PIN exista y no esté usado (Asumiendo tu modelo de base de datos)
         const pin = await Pin.findOne({ code: code.toUpperCase(), used: false });
-        if (!pin) return res.status(400).json({ error: 'El pin introducido no es válido o ya fue canjeado anteriormente.' });
+        if (!pin) return res.status(400).json({ error: 'El pin introducido no es válido o ya fue canjeado.' });
 
-        // 2. Buscar al usuario en la colección central (Ya sea por su correo o por su ID de dispositivo)
         const identificadorLimpio = deviceId.trim().toLowerCase();
-        let usuario = await User.findOne({ email: identificadorLimpio });
+        let nuevoSaldo = 0;
 
-        if (!usuario) {
-            // Si el usuario no existe todavía (es un invitado que no se ha registrado), buscamos su registro por ID de dispositivo
-            usuario = await User.findOne({ email: deviceId });
-            if (!usuario) {
-                // Si es su primera acción, creamos su registro temporal en la base de datos
-                usuario = new User({ email: deviceId, tokems: 0, isVerified: true });
+        // 🌟 CORRECCIÓN: Separamos la lógica de Invitado y Usuario para no crear cuentas sin contraseña
+        if (identificadorLimpio.includes('@')) {
+            // Es un Usuario Registrado
+            let usuario = await User.findOne({ email: identificadorLimpio });
+            if (!usuario) return res.status(404).json({ error: 'Cuenta no encontrada.' });
+            
+            usuario.tokems = (usuario.tokems || 0) + pin.tokens;
+            await usuario.save();
+            nuevoSaldo = usuario.tokems;
+        } else {
+            // Es un Invitado (Guardamos en la colección Balance)
+            let registroInvitado = await Balance.findOne({ deviceId: identificadorLimpio });
+            if (!registroInvitado) {
+                registroInvitado = new Balance({ deviceId: identificadorLimpio, tokens: 0 });
             }
+            registroInvitado.tokens += pin.tokens;
+            await registroInvitado.save();
+            nuevoSaldo = registroInvitado.tokens;
         }
 
-        // 3. Acreditar los Tokems del PIN y quemarlo para que no se use dos veces
-        usuario.tokems = (usuario.tokems || 0) + pin.tokens;
-        await usuario.save();
-
         pin.used = true;
-        pin.usedBy = identificadorLimpio;
         await pin.save();
 
-        return res.status(200).json({ 
-            success: true, 
-            tokens: pin.tokens, 
-            userTokens: usuario.tokems // Le devolvemos al cliente su nuevo saldo real
-        });
-
+        return res.status(200).json({ success: true, tokens: pin.tokens, userTokens: nuevoSaldo });
     } catch (error) {
         console.error('Error en /api/redeem:', error);
         return res.status(500).json({ error: 'Error interno del servidor al procesar el pin.' });
@@ -608,37 +606,68 @@ app.post('/api/redeem', async (req, res) => {
 // 5. DICCIONARIO DE EQUIVALENCIAS DE TOKEMS (SHOPIFY)
 // =================================================================
 const TOKENS_POR_VARIANTE = {
-    "47912562720926": 1,   // Plan Base (1 Tokem)
-    "47912562851998": 3,   // Plan Starter (3 Tokems)
-    "47912562884766": 6,   // Plan Pro (6 Tokems)
-    "47912563015838": 12,  // Plan Business (12 Tokems)
-    "47912563114142": 24,  // Plan Influencer (24 Tokems)
-    "47912563245214": 48   // Plan Agencia (48 Tokems)
+    "47912562720926": 1,   "47912562851998": 3,   "47912562884766": 6,   
+    "47912563015838": 12,  "47912563114142": 24,  "47912563245214": 48   
 };
 
 // =================================================================
-// 6. ENDPOINT: OBTENER EL SALDO DE UN USUARIO (MONGO DB)
+// 6. ENDPOINT: OBTENER EL SALDO (CORREGIDO PARA LEER AMBAS BD)
 // =================================================================
 app.get('/api/get-balance', async (req, res) => {
     const { deviceId } = req.query;
-
-    if (!deviceId) {
-        return res.status(400).json({ error: "Falta el parámetro deviceId" });
-    }
+    if (!deviceId) return res.status(400).json({ error: "Falta el parámetro deviceId" });
 
     try {
-        const registro = await Balance.findOne({ deviceId: deviceId });
-        const saldoActual = registro ? registro.tokens : 0;
+        const identificadorLimpio = deviceId.trim().toLowerCase();
         
-        return res.json({ tokens: saldoActual });
+        // 🌟 CORRECCIÓN: Si es un correo, buscamos en "users". Si no, en "balances".
+        if (identificadorLimpio.includes('@')) {
+            const usuario = await User.findOne({ email: identificadorLimpio });
+            return res.json({ tokens: usuario ? usuario.tokems : 0 });
+        } else {
+            const registro = await Balance.findOne({ deviceId: identificadorLimpio });
+            return res.json({ tokens: registro ? registro.tokens : 0 });
+        }
     } catch (error) {
         console.error('❌ Error al obtener balance en DB:', error);
-        return res.status(500).json({ error: "Error consulting saldo" });
+        return res.status(500).json({ error: "Error consultando saldo" });
     }
 });
 
 // =================================================================
-// 7. ENDPOINT: WEBHOOK DE SHOPIFY (PEDIDO PAGADO)
+// 🚀 NUEVO ENDPOINT: FUSIONAR SALDO DE INVITADO A CUENTA
+// =================================================================
+app.post('/api/transfer-guest', async (req, res) => {
+    const { email, deviceId } = req.body;
+    if (!email || !deviceId) return res.status(400).json({ error: 'Faltan parámetros.' });
+
+    try {
+        const usuario = await User.findOne({ email: email.trim().toLowerCase() });
+        if (!usuario) return res.status(404).json({ error: 'Cuenta no encontrada.' });
+
+        let saldoATransferir = 0;
+        const registroBalance = await Balance.findOne({ deviceId: deviceId });
+        
+        if (registroBalance && registroBalance.tokens > 0) {
+            saldoATransferir = registroBalance.tokens;
+            registroBalance.tokens = 0; // Le vaciamos los bolsillos al invitado
+            await registroBalance.save();
+        }
+
+        if (saldoATransferir > 0) {
+            usuario.tokems = (usuario.tokems || 0) + saldoATransferir;
+            await usuario.save();
+        }
+
+        return res.status(200).json({ success: true, nuevoSaldo: usuario.tokems });
+    } catch (error) {
+        console.error('Error en transferencia:', error);
+        return res.status(500).json({ error: 'Error interno fusionando los balances.' });
+    }
+});
+
+// =================================================================
+// 7. ENDPOINT: WEBHOOK DE SHOPIFY (MANTENLO IGUAL A COMO LO TIENES)
 // =================================================================
 app.post('/api/shopify-webhook', async (req, res) => {
     try {
