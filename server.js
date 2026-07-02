@@ -5,6 +5,9 @@ const cors = require('cors');
 const axios = require('axios');
 const path = require('path');
 const mongoose = require('mongoose'); // 🚀 Conector oficial para MongoDB
+const bcrypt = require('bcrypt'); // 🔐 Para encriptar contraseñas
+const jwt = require('jsonwebtoken'); // 🔐 Para mantener sesiones activas
+const nodemailer = require('nodemailer'); // 🔐 Para enviar códigos de verificación
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -38,9 +41,29 @@ const BalanceSchema = new mongoose.Schema({
 });
 const Balance = mongoose.model('Balance', BalanceSchema);
 
+// 🔒 NUEVO ESQUEMA: CUENTAS DE USUARIOS REGISTRADOS
+const UserSchema = new mongoose.Schema({
+    email: { type: String, required: true, unique: true, lowercase: true, trim: true },
+    password: { type: String, required: true },
+    isVerified: { type: Boolean, default: false },
+    verificationCode: { type: String },
+    tokems: { type: Number, default: 0 }, // Aquí se guardará su saldo en la nube
+    history: { type: Array, default: [] } // Historial de jugadas o canjes
+});
+const User = mongoose.model('User', UserSchema);
+
 // 🔒 CLIENTE APIFY PROTEGIDO CON VARIABLES DE ENTORNO
 const client = new ApifyClient({
     token: process.env.APIFY_TOKEN
+});
+
+// 📧 CONFIGURACIÓN DE NODEMAILER PARA ENVIAR CORREOS
+const transporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: {
+        user: process.env.EMAIL_USER, // Tu correo en las variables de entorno de Railway
+        pass: process.env.EMAIL_PASS  // Tu contraseña de aplicación de Google en Railway
+    }
 });
 
 app.use(cors());
@@ -127,6 +150,114 @@ function extraerUsuarioDinamicamente(obj) {
     buscarLlave(obj);
     return userEncontrado || "Participante";
 }
+
+// =================================================================
+// 🔐 NUEVOS ENDPOINTS: SISTEMA DE AUTENTICACIÓN Y CUENTAS
+// =================================================================
+
+// 1. REGISTRO DE USUARIOS + ENVÍO DE CÓDIGO
+app.post('/api/register', async (req, res) => {
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ error: 'El correo y la contraseña son obligatorios' });
+
+    try {
+        const correoLimpio = email.trim().toLowerCase();
+        const usuarioExiste = await User.findOne({ email: correoLimpio });
+        
+        if (usuarioExiste) {
+            return res.status(400).json({ error: 'El correo electrónico ya está registrado en el sistema.' });
+        }
+
+        const hashedPassword = await bcrypt.hash(password, 10);
+        const codigoVerificacion = Math.floor(100000 + Math.random() * 900000).toString();
+
+        const nuevoUsuario = new User({
+            email: correoLimpio,
+            password: hashedPassword,
+            verificationCode: codigoVerificacion
+        });
+        await nuevoUsuario.save();
+
+        await transporter.sendMail({
+            from: '"KZ Sorteos" <' + process.env.EMAIL_USER + '>',
+            to: correoLimpio,
+            subject: 'Código de verificación - Panel KZ',
+            html: `
+                <div style="font-family: sans-serif; background-color: #0d0d14; color: #ffffff; padding: 20px; border-radius: 10px; border: 1px solid #66ff33; max-width: 500px;">
+                    <h2 style="color: #66ff33; text-transform: uppercase;">¡Bienvenido al Panel KZ!</h2>
+                    <p style="color: #aaaaaa;">Usa el siguiente código de seguridad de 6 dígitos para verificar tu cuenta y activar tu almacenamiento en la nube:</p>
+                    <div style="background-color: #1a1a20; border: 1px dashed #66ff33; padding: 15px; text-align: center; font-size: 28px; font-weight: bold; color: #66ff33; letter-spacing: 5px; border-radius: 5px; margin: 20px 0;">
+                        ${codigoVerificacion}
+                    </div>
+                    <p style="font-size: 12px; color: #555555;">Si no solicitaste este registro, puedes ignorar este correo de forma segura.</p>
+                </div>
+            `
+        });
+
+        return res.status(200).json({ message: 'Código de verificación enviado al correo de forma exitosa.' });
+    } catch (error) {
+        console.error('Error en /api/register:', error);
+        return res.status(500).json({ error: 'Error interno en el servidor durante el registro.' });
+    }
+});
+
+// 2. VERIFICACIÓN DEL CÓDIGO DE REGISTRO
+app.post('/api/verify', async (req, res) => {
+    const { email, code } = req.body;
+    if (!email || !code) return res.status(400).json({ error: 'El correo y el código son estrictamente requeridos.' });
+
+    try {
+        const correoLimpio = email.trim().toLowerCase();
+        const usuario = await User.findOne({ email: correoLimpio });
+
+        if (!usuario || usuario.verificationCode !== code.trim()) {
+            return res.status(400).json({ error: 'El código de seguridad introducido es incorrecto.' });
+        }
+
+        usuario.isVerified = true;
+        usuario.verificationCode = null; 
+        await usuario.save();
+
+        return res.status(200).json({ success: true, message: 'Tu cuenta ha sido verificada exitosamente.' });
+    } catch (error) {
+        console.error('Error en /api/verify:', error);
+        return res.status(500).json({ error: 'Error interno al procesar la verificación.' });
+    }
+});
+
+// 3. INICIO DE SESIÓN (LOGIN)
+app.post('/api/login', async (req, res) => {
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ error: 'Por favor rellena todos los campos.' });
+
+    try {
+        const correoLimpio = email.trim().toLowerCase();
+        const usuario = await User.findOne({ email: correoLimpio });
+
+        if (!usuario || !(await bcrypt.compare(password, usuario.password))) {
+            return res.status(400).json({ error: 'El correo o la contraseña son totalmente incorrectos.' });
+        }
+
+        if (!usuario.isVerified) {
+            return res.status(401).json({ error: 'Esta cuenta no se encuentra verificada. Revisa tu correo electrónico.' });
+        }
+
+        const token = jwt.sign(
+            { userId: usuario._id, email: usuario.email },
+            process.env.JWT_SECRET,
+            { expiresIn: '30d' }
+        );
+
+        return res.json({
+            success: true,
+            token,
+            tokems: usuario.tokems
+        });
+    } catch (error) {
+        console.error('Error en /api/login:', error);
+        return res.status(500).json({ error: 'Error interno en el servidor al intentar loguear.' });
+    }
+});
 
 // =================================================================
 // 1. ENDPOINT: PREVISUALIZACIÓN (PERSISTENCIA CON MONGO)
@@ -412,7 +543,6 @@ app.post('/api/redeem', async (req, res) => {
 // =================================================================
 // 5. DICCIONARIO DE EQUIVALENCIAS DE TOKEMS (SHOPIFY)
 // =================================================================
-// ⚠️ RECUERDA: Cambia estos números por los IDs reales de tus variantes
 const TOKENS_POR_VARIANTE = {
     "47912562720926": 1,   // Plan Base (1 Tokem)
     "47912562851998": 3,   // Plan Starter (3 Tokems)
@@ -433,14 +563,13 @@ app.get('/api/get-balance', async (req, res) => {
     }
 
     try {
-        // Buscamos el saldo guardado de ese usuario
         const registro = await Balance.findOne({ deviceId: deviceId });
         const saldoActual = registro ? registro.tokens : 0;
         
         return res.json({ tokens: saldoActual });
     } catch (error) {
         console.error('❌ Error al obtener balance en DB:', error);
-        return res.status(500).json({ error: "Error consultando saldo" });
+        return res.status(500).json({ error: "Error consulting saldo" });
     }
 });
 
@@ -451,24 +580,18 @@ app.post('/api/shopify-webhook', async (req, res) => {
     try {
         const order = req.body;
 
-        // 1. Extraer el deviceId (Soportando atributos y propiedades de línea)
         let deviceId = null;
         
-        // Revisar atributos generales de la nota
         const atributos = order.note_attributes || [];
-        // Cambia 'deviceId' por '_deviceId'
-const deviceIdAttr = atributos.find(attr => attr.name === '_deviceId');
+        const deviceIdAttr = atributos.find(attr => attr.name === '_deviceId');
         if (deviceIdAttr) deviceId = deviceIdAttr.value;
 
-        // Revisar propiedades del producto comprado (El método más seguro)
         if (!deviceId && order.line_items && order.line_items.length > 0) {
             const props = order.line_items[0].properties || [];
-            // Cambia 'deviceId' por '_deviceId'
-const propAttr = props.find(p => p.name === '_deviceId');
+            const propAttr = props.find(p => p.name === '_deviceId');
             if (propAttr) deviceId = propAttr.value;
         }
 
-        // 🛡️ Filtro anti-fantasmas: Bloquea si es nulo o si es la palabra "null"
         if (!deviceId || deviceId === 'null' || deviceId === 'undefined') {
             console.log("⚠️ Webhook ignorado: No se detectó un deviceId válido.");
             return res.status(200).send("Pedido sin deviceId"); 
@@ -476,7 +599,6 @@ const propAttr = props.find(p => p.name === '_deviceId');
 
         console.log(`🛒 ¡Pedido pagado detectado para el dispositivo: ${deviceId}!`);
 
-        // 2. Analizar las variantes compradas y sumar tokens
         let tokensAAgregar = 0;
         const lineItems = order.line_items || [];
 
@@ -495,11 +617,9 @@ const propAttr = props.find(p => p.name === '_deviceId');
             return res.status(200).send("No hay tokens que sumar");
         }
 
-        // 3. Modificar el saldo directamente en MongoDB
         let registro = await Balance.findOne({ deviceId: deviceId });
         
         if (!registro) {
-            // Si el usuario es nuevo y no tiene balance previo, se crea el registro
             registro = new Balance({ deviceId: deviceId, tokens: 0 });
         }
         
