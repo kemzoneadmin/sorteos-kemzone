@@ -61,11 +61,14 @@ const client = new ApifyClient({
     token: process.env.APIFY_TOKEN
 });
 
+// 📧 CONFIGURACIÓN DE NODEMAILER (PUERTO 587 + BLINDAJE ANTI-CONGELAMIENTO)
 const transporter = nodemailer.createTransport({
     host: 'smtp.gmail.com',
-    port: 465,
-    secure: true,
-    family: 4, // 🚀 BALA DE PLATA: Fuerza el uso estricto de IPv4 a nivel de socket
+    port: 587,
+    secure: false, // true es solo para el puerto 465, false es obligatorio para el 587
+    requireTLS: true,
+    family: 4, // Mantiene la obligación de usar IPv4
+    connectionTimeout: 10000, // ⏱️ Máximo 10 segundos de espera (evita que se cuelgue 5 minutos)
     auth: {
         user: process.env.EMAIL_USER, 
         pass: process.env.EMAIL_PASS  
