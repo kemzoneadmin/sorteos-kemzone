@@ -151,10 +151,6 @@ function extraerUsuarioDinamicamente(obj) {
 // 🔐 NUEVOS ENDPOINTS: SISTEMA DE AUTENTICACIÓN Y CUENTAS
 // =================================================================
 
-// =================================================================
-// 🔐 NUEVOS ENDPOINTS: SISTEMA DE AUTENTICACIÓN Y CUENTAS
-// =================================================================
-
 // 1. REGISTRO DE USUARIOS + ENVÍO DE CÓDIGO
 app.post('/api/register', async (req, res) => {
     const { email, password } = req.body;
@@ -263,6 +259,55 @@ app.post('/api/login', async (req, res) => {
     } catch (error) {
         console.error('Error en /api/login:', error);
         return res.status(500).json({ error: 'Error interno en el servidor al intentar loguear.' });
+    }
+});
+
+// =================================================================
+// 🔄 ENDPOINT: FUSIONAR SALDO DE INVITADO A CUENTA REGISTRADA
+// =================================================================
+app.post('/api/transfer-guest', async (req, res) => {
+    const { email, deviceId } = req.body;
+    if (!email || !deviceId) return res.status(400).json({ error: 'Faltan parámetros de transferencia.' });
+
+    try {
+        const correoLimpio = email.trim().toLowerCase();
+        // Buscamos la cuenta oficial del usuario
+        const usuario = await User.findOne({ email: correoLimpio });
+        if (!usuario) return res.status(404).json({ error: 'Cuenta no encontrada.' });
+
+        let saldoATransferir = 0;
+
+        // 1. Buscar si el invitado tiene saldo en la colección tradicional (Balance)
+        const registroBalance = await Balance.findOne({ deviceId: deviceId });
+        if (registroBalance && registroBalance.tokens > 0) {
+            saldoATransferir += registroBalance.tokens;
+            registroBalance.tokens = 0; // Vaciamos los bolsillos del invitado
+            await registroBalance.save();
+        }
+
+        // 2. Buscar si el invitado tiene saldo en la colección moderna (User)
+        const registroUserInv = await User.findOne({ email: deviceId });
+        if (registroUserInv && registroUserInv.tokems > 0) {
+            saldoATransferir += registroUserInv.tokems;
+            registroUserInv.tokems = 0; // Vaciamos los bolsillos del invitado
+            await registroUserInv.save();
+        }
+
+        // 3. Le inyectamos todo el dinero encontrado a la cuenta logueada
+        if (saldoATransferir > 0) {
+            usuario.tokems = (usuario.tokems || 0) + saldoATransferir;
+            await usuario.save();
+        }
+
+        return res.status(200).json({ 
+            success: true, 
+            transferidos: saldoATransferir, 
+            nuevoSaldo: usuario.tokems 
+        });
+
+    } catch (error) {
+        console.error('Error en transferencia:', error);
+        return res.status(500).json({ error: 'Error interno fusionando los balances.' });
     }
 });
 
