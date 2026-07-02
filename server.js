@@ -1,6 +1,10 @@
 require('dotenv').config(); 
+const dns = require('dns');
+dns.setDefaultResultOrder('ipv4first'); // 🚀 OBLIGA A USAR IPV4 (Cura el error ENETUNREACH de Railway)
+
 const express = require('express');
 const { ApifyClient } = require('apify-client');
+// ... (el resto de tus imports siguen igual)
 const cors = require('cors');
 const axios = require('axios');
 const path = require('path');
@@ -59,10 +63,12 @@ const client = new ApifyClient({
 
 // 📧 CONFIGURACIÓN DE NODEMAILER PARA ENVIAR CORREOS
 const transporter = nodemailer.createTransport({
-    service: 'gmail',
+    host: 'smtp.gmail.com',
+    port: 465,
+    secure: true,
     auth: {
-        user: process.env.EMAIL_USER, // Tu correo en las variables de entorno de Railway
-        pass: process.env.EMAIL_PASS  // Tu contraseña de aplicación de Google en Railway
+        user: process.env.EMAIL_USER, 
+        pass: process.env.EMAIL_PASS  
     }
 });
 
