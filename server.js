@@ -362,13 +362,14 @@ app.post('/api/preview', async (req, res) => {
             const coverUrl = postData.videoMeta?.coverUrl || postData.videoMeta?.posterUrl || postData.coverUrl || postData.video?.cover || '';
 
             return res.json({
-                author: `@${username}`,
-                rawUsername: username,
-                description: description,
-                commentsCount: postData.commentCount || 0,
-                likesCount: postData.diggCount || 0,
-                displayUrl: coverUrl
-            });
+    author: `@${username}`,
+    rawUsername: username,
+    description: description,
+    commentsCount: postData.commentCount || 0,
+    likesCount: postData.diggCount || 0,
+    displayUrl: coverUrl,
+    currentCount: registro.count // 🚀 Sincronización en caliente con MongoDB
+});
 
         } else {
             const inputInstagram = {
@@ -394,13 +395,14 @@ app.post('/api/preview', async (req, res) => {
             if (coverUrl) coverUrl = coverUrl.replace(/&amp;/g, '&');
 
             return res.json({
-                author: `@${authorUsername}`,
-                rawUsername: authorUsername,
-                description: postData.caption || 'Sin descripción.',
-                commentsCount: postData.commentsCount || 0,
-                likesCount: postData.likesCount || 0,
-                displayUrl: coverUrl
-            });
+    author: `@${authorUsername}`,
+    rawUsername: authorUsername,
+    description: postData.caption || 'Sin descripción.',
+    commentsCount: postData.commentsCount || 0,
+    likesCount: postData.likesCount || 0,
+    displayUrl: coverUrl,
+    currentCount: registro.count // 🚀 Sincronización en caliente con MongoDB
+});
         }
     } catch (error) {
         try {
