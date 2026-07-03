@@ -328,8 +328,12 @@ app.post('/api/preview', async (req, res) => {
             registro = new Preview({ deviceId: identificadorDestino, date: hoy, count: 0 });
         }
 
-        if (registro.count >= 3) {
-            return res.status(429).json({ error: 'Límite diario agotado por hoy.' });
+        // 🚀 CONTROL DINÁMICO: 6 para cuentas autenticadas, 3 para invitados anónimos
+        const esCuenta = identificadorDestino.includes('@');
+        const limiteMaximo = esCuenta ? 6 : 3;
+
+        if (registro.count >= limiteMaximo) {
+            return res.status(429).json({ error: `Límite diario de ${limiteMaximo} previsualizaciones agotado por hoy.` });
         }
 
         registro.count++;
@@ -362,14 +366,14 @@ app.post('/api/preview', async (req, res) => {
             const coverUrl = postData.videoMeta?.coverUrl || postData.videoMeta?.posterUrl || postData.coverUrl || postData.video?.cover || '';
 
             return res.json({
-    author: `@${username}`,
-    rawUsername: username,
-    description: description,
-    commentsCount: postData.commentCount || 0,
-    likesCount: postData.diggCount || 0,
-    displayUrl: coverUrl,
-    currentCount: registro.count // 🚀 Sincronización en caliente con MongoDB
-});
+                author: `@${username}`,
+                rawUsername: username,
+                description: description,
+                commentsCount: postData.commentCount || 0,
+                likesCount: postData.diggCount || 0,
+                displayUrl: coverUrl,
+                currentCount: registro.count // Sincronización en caliente
+            });
 
         } else {
             const inputInstagram = {
@@ -395,14 +399,14 @@ app.post('/api/preview', async (req, res) => {
             if (coverUrl) coverUrl = coverUrl.replace(/&amp;/g, '&');
 
             return res.json({
-    author: `@${authorUsername}`,
-    rawUsername: authorUsername,
-    description: postData.caption || 'Sin descripción.',
-    commentsCount: postData.commentsCount || 0,
-    likesCount: postData.likesCount || 0,
-    displayUrl: coverUrl,
-    currentCount: registro.count // 🚀 Sincronización en caliente con MongoDB
-});
+                author: `@${authorUsername}`,
+                rawUsername: authorUsername,
+                description: postData.caption || 'Sin descripción.',
+                commentsCount: postData.commentsCount || 0,
+                likesCount: postData.likesCount || 0,
+                displayUrl: coverUrl,
+                currentCount: registro.count // Sincronización en caliente
+            });
         }
     } catch (error) {
         try {
