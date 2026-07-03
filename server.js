@@ -416,17 +416,47 @@ app.post('/api/preview', async (req, res) => {
 });
 
 // =================================================================
-// 2. ENDPOINT: EXTRACCIÓN MASIVA
+// 2. ENDPOINT: EXTRACCIÓN MASIVA (CON COBRO INMUNE EN MONGO Atlas)
 // =================================================================
 app.post('/api/comments', async (req, res) => {
-    const { url, maxComments } = req.body;
+    // 🚀 Recibimos el deviceId real y el costo calculado desde el frontend
+    const { url, maxComments, deviceId, costoTokens } = req.body;
     if (!url) return res.status(400).json({ error: 'La URL es obligatoria' });
 
     const esTikTok = url.includes('tiktok.com');
     const limiteSeguro = parseInt(maxComments) || 100;
+    const costoReal = parseInt(costoTokens) || 0;
 
     try {
         console.log(`\n[📥] Extracción masiva en marcha (${esTikTok ? 'TikTok' : 'Instagram'}) para: ${url}`);
+        
+        let nuevoSaldoDefinitivo = 0;
+
+        // 💰 SISTEMA DE DÉBITO EN CALIENTE (ZONA CRÍTICA)
+        if (deviceId && costoReal > 0) {
+            const identificadorLimpio = deviceId.trim().toLowerCase();
+
+            if (identificadorLimpio.includes('@')) {
+                // Es un usuario registrado en la colección "users"
+                let usuario = await User.findOne({ email: identificadorLimpio });
+                if (usuario) {
+                    usuario.tokems = Math.max(0, (usuario.tokems || 0) - costoReal);
+                    await usuario.save();
+                    nuevoSaldoDefinitivo = usuario.tokems;
+                    console.log(`[🪙] Cobrado x${costoReal} Tokems a la Cuenta: ${identificadorLimpio}. Restan: ${nuevoSaldoDefinitivo}`);
+                }
+            } else {
+                // Es un invitado anónimo en la colección "balances"
+                let registroInvitado = await Balance.findOne({ deviceId: identificadorLimpio });
+                if (registroInvitado) {
+                    registroInvitado.tokens = Math.max(0, (registroInvitado.tokens || 0) - costoReal);
+                    await registroInvitado.save();
+                    nuevoSaldoDefinitivo = registroInvitado.tokens;
+                    console.log(`[🪙] Cobrado x${costoReal} Tokems al Dispositivo: ${identificadorLimpio}. Restan: ${nuevoSaldoDefinitivo}`);
+                }
+            }
+        }
+
         let listaComentarios = [];
 
         if (esTikTok) {
@@ -488,7 +518,7 @@ app.post('/api/comments', async (req, res) => {
                     { "domain": ".instagram.com", "expirationDate": 1789598959.169378, "hostOnly": false, "httpOnly": true, "name": "ps_l", "path": "/", "sameSite": "lax", "secure": true, "session": false, "storeId": null, "value": "1" },
                     { "domain": ".instagram.com", "expirationDate": 1781682156, "hostOnly": false, "httpOnly": false, "name": "wd", "path": "/", "sameSite": "lax", "secure": true, "session": false, "storeId": null, "value": "2048x1018" },
                     { "domain": ".instagram.com", "expirationDate": 1789598222.929081, "hostOnly": false, "httpOnly": true, "name": "mid", "path": "/", "sameSite": "no_restriction", "secure": true, "session": false, "storeId": null, "value": "aJvCkAALAAFuTvIGIg0Ozqer1w8C" },
-                    { "domain": ".instagram.com", "expirationDate": 1812613351.403508, "hostOnly": false, "httpOnly": true, "name": "sessionid", "style": "", "value": "27565603979%3ALyOiF1sINhKeH5%3A27%3AAYg_G66zbNllbQVxX1hFvc2pT5HlsrP4fK8QeLTajw" },
+                    { "domain": ".instagram.com", "expirationDate": 1812613351.403508, "hostOnly": false, "httpOnly": true, "name": "sessionid", "value": "27565603979%3ALyOiF1sINhKeH5%3A27%3AAYg_G66zbNllbQVxX1hFvc2pT5HlsrP4fK8QeLTajw" },
                     { "domain": ".instagram.com", "expirationDate": 1781682156, "hostOnly": false, "httpOnly": false, "name": "dpr", "path": "/", "sameSite": "no_restriction", "secure": true, "session": false, "storeId": null, "value": "1.25" },
                     { "domain": ".instagram.com", "expirationDate": 1791433469, "hostOnly": false, "httpOnly": false, "name": "ig_lang", "path": "/", "sameSite": null, "secure": false, "session": false, "storeId": null, "value": "es-la" },
                     { "domain": ".instagram.com", "hostOnly": false, "httpOnly": true, "name": "rur", "path": "/", "sameSite": "lax", "secure": true, "session": true, "storeId": null, "value": "\"MWG\\05427565603979\\0541812613368:01ff035dd4505dbf423e3935e4e05d4f27a8b890269ae06923b7a5287fcd48701949d4b1\"" }
@@ -510,7 +540,12 @@ app.post('/api/comments', async (req, res) => {
         }
 
         console.log(`[✅] Proceso completado. Se enviaron ${listaComentarios.length} comentarios.`);
-        return res.json({ comments: listaComentarios });
+        
+        // 🚀 NUEVO: Enviamos de vuelta el nuevo saldo calculado directamente desde la base de datos
+        return res.json({ 
+            comments: listaComentarios, 
+            nuevoSaldo: nuevoSaldoDefinitivo 
+        });
 
     } catch (error) {
         console.error('❌ Error crítico en /api/comments:', error);
