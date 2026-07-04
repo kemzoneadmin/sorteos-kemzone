@@ -312,7 +312,7 @@ app.post('/api/transfer-guest', async (req, res) => {
 });
 
 // =================================================================
-// 1. ENDPOINT: PREVISUALIZACIÓN (PERSISTENCIA CON MONGO)
+// 1. ENDPOINT: PREVISUALIZACIÓN (CON FUSIÓN DE TIROS ANÓNIMOS)
 // =================================================================
 app.post('/api/preview', async (req, res) => {
     const { url, deviceId } = req.body;
@@ -323,14 +323,43 @@ app.post('/api/preview', async (req, res) => {
     const identificadorDestino = deviceId || `ip_${ipUsuario}`;
 
     try {
-        let registro = await Preview.findOne({ deviceId: identificadorDestino, date: hoy });
-        if (!registro) {
-            registro = new Preview({ deviceId: identificadorDestino, date: hoy, count: 0 });
+        const identificadorLimpio = identificadorDestino.trim().toLowerCase();
+        const esCuenta = identificadorLimpio.includes('@');
+        const limiteMaximo = esCuenta ? 6 : 3;
+
+        // 🚀 HERENCIA DE TIROS ANÓNIMOS: Si es una cuenta, transferimos el conteo de su IP/Invitado
+        if (esCuenta) {
+            let registroUsuario = await Preview.findOne({ deviceId: identificadorLimpio, date: hoy });
+            
+            // Si el usuario aún no tiene consultas registradas bajo su correo en el día de hoy
+            if (!registroUsuario || registroUsuario.count === 0) {
+                // Buscamos si la misma IP tiene un historial como invitado anónimo
+                const filtroInvitado = `ip_${ipUsuario}`;
+                let registroInvitado = await Preview.findOne({ deviceId: filtroInvitado, date: hoy });
+
+                if (registroInvitado && registroInvitado.count > 0) {
+                    if (!registroUsuario) {
+                        registroUsuario = new Preview({ 
+                            deviceId: identificadorLimpio, 
+                            date: hoy, 
+                            count: registroInvitado.count 
+                        });
+                    } else {
+                        registroUsuario.count = registroInvitado.count;
+                    }
+                    
+                    // Vaciamos el contador del invitado para evitar duplicados en la base de datos
+                    registroInvitado.count = 0;
+                    await registroInvitado.save();
+                    await registroUsuario.save();
+                }
+            }
         }
 
-        // 🚀 CONTROL DINÁMICO: 6 para cuentas autenticadas, 3 para invitados anónimos
-        const esCuenta = identificadorDestino.includes('@');
-        const limiteMaximo = esCuenta ? 6 : 3;
+        let registro = await Preview.findOne({ deviceId: identificadorLimpio, date: hoy });
+        if (!registro) {
+            registro = new Preview({ deviceId: identificadorLimpio, date: hoy, count: 0 });
+        }
 
         if (registro.count >= limiteMaximo) {
             return res.status(429).json({ error: `Límite diario de ${limiteMaximo} previsualizaciones agotado por hoy.` });
@@ -372,7 +401,7 @@ app.post('/api/preview', async (req, res) => {
                 commentsCount: postData.commentCount || 0,
                 likesCount: postData.diggCount || 0,
                 displayUrl: coverUrl,
-                currentCount: registro.count // Sincronización en caliente
+                currentCount: registro.count // Sincronización en caliente con MongoDB
             });
 
         } else {
@@ -405,12 +434,12 @@ app.post('/api/preview', async (req, res) => {
                 commentsCount: postData.commentsCount || 0,
                 likesCount: postData.likesCount || 0,
                 displayUrl: coverUrl,
-                currentCount: registro.count // Sincronización en caliente
+                currentCount: registro.count // Sincronización en caliente con MongoDB
             });
         }
     } catch (error) {
         try {
-            let roll = await Preview.findOne({ deviceId: identificadorDestino, date: hoy });
+            let roll = await Preview.findOne({ deviceId: identificadorDestino.trim().toLowerCase(), date: hoy });
             if (roll && roll.count > 0) {
                 roll.count--;
                 await roll.save();
