@@ -312,53 +312,53 @@ app.post('/api/transfer-guest', async (req, res) => {
 });
 
 // =================================================================
-// 1. ENDPOINT: PREVISUALIZACIÓN (CON FUSIÓN DE TIROS ANÓNIMOS)
+// 1. ENDPOINT: PREVISUALIZACIÓN (CON FUSIÓN DE TIROS DE INVITADO)
 // =================================================================
 app.post('/api/preview', async (req, res) => {
-    const { url, deviceId } = req.body;
+    const { url, deviceId, hardwareUUID } = req.body;
     if (!url) return res.status(400).json({ error: 'La URL es obligatoria' });
 
-    const ipUsuario = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
     const hoy = new Date().toLocaleDateString();
-    const identificadorDestino = deviceId || `ip_${ipUsuario}`;
+    const identificadorLimpio = (deviceId || '').trim().toLowerCase();
 
     try {
-        const identificadorLimpio = identificadorDestino.trim().toLowerCase();
         const esCuenta = identificadorLimpio.includes('@');
         const limiteMaximo = esCuenta ? 6 : 3;
 
-        // 🚀 HERENCIA DE TIROS ANÓNIMOS: Si es una cuenta, transferimos el conteo de su IP/Invitado
-        if (esCuenta) {
-            let registroUsuario = await Preview.findOne({ deviceId: identificadorLimpio, date: hoy });
-            
-            // Si el usuario aún no tiene consultas registradas bajo su correo en el día de hoy
-            if (!registroUsuario || registroUsuario.count === 0) {
-                // Buscamos si la misma IP tiene un historial como invitado anónimo
-                const filtroInvitado = `ip_${ipUsuario}`;
-                let registroInvitado = await Preview.findOne({ deviceId: filtroInvitado, date: hoy });
+        // 🚀 FUSIÓN DE INVITADO A CUENTA: Si es una cuenta y viene el UUID, transferimos el conteo diario
+        if (esCuenta && hardwareUUID) {
+            const uuidLimpio = hardwareUUID.trim().toLowerCase();
+            let registroInvitado = await Preview.findOne({ deviceId: uuidLimpio, date: hoy });
 
-                if (registroInvitado && registroInvitado.count > 0) {
-                    if (!registroUsuario) {
-                        registroUsuario = new Preview({ 
-                            deviceId: identificadorLimpio, 
-                            date: hoy, 
-                            count: registroInvitado.count 
-                        });
-                    } else {
-                        registroUsuario.count = registroInvitado.count;
-                    }
-                    
-                    // Vaciamos el contador del invitado para evitar duplicados en la base de datos
-                    registroInvitado.count = 0;
-                    await registroInvitado.save();
-                    await registroUsuario.save();
+            if (registroInvitado && registroInvitado.count > 0) {
+                let registroUsuario = await Preview.findOne({ deviceId: identificadorLimpio, date: hoy });
+
+                if (!registroUsuario) {
+                    registroUsuario = new Preview({ 
+                        deviceId: identificadorLimpio, 
+                        date: hoy, 
+                        count: registroInvitado.count 
+                    });
+                } else {
+                    registroUsuario.count = Math.min(6, registroUsuario.count + registroInvitado.count);
                 }
+                
+                // Reseteamos el contador del invitado para evitar duplicados en próximas llamadas
+                registroInvitado.count = 0;
+                await registroInvitado.save();
+                await registroUsuario.save();
             }
         }
 
         let registro = await Preview.findOne({ deviceId: identificadorLimpio, date: hoy });
         if (!registro) {
             registro = new Preview({ deviceId: identificadorLimpio, date: hoy, count: 0 });
+        }
+
+        // 🧼 LIMPIEZA DE SEGURIDAD: Capar residuos de contadores inflados de pruebas rotas anteriores
+        if (registro.count > limiteMaximo) {
+            registro.count = limiteMaximo;
+            await registro.save();
         }
 
         if (registro.count >= limiteMaximo) {
@@ -439,7 +439,7 @@ app.post('/api/preview', async (req, res) => {
         }
     } catch (error) {
         try {
-            let roll = await Preview.findOne({ deviceId: identificadorDestino.trim().toLowerCase(), date: hoy });
+            let roll = await Preview.findOne({ deviceId: identificadorLimpio, date: hoy });
             if (roll && roll.count > 0) {
                 roll.count--;
                 await roll.save();
