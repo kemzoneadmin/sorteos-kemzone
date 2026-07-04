@@ -261,10 +261,13 @@ app.post('/api/login', async (req, res) => {
                 if (!registroUsuario) {
                     registroUsuario = new Preview({ deviceId: correoLimpio, date: hoy, count: registroInvitado.count });
                 } else {
-                    // Sumamos cuidando de no pasar el límite de 6
-                    registroUsuario.count = Math.min(6, registroUsuario.count + registroInvitado.count);
+                    // Mantenemos el conteo más alto
+                    registroUsuario.count = Math.max(registroUsuario.count, registroInvitado.count);
                 }
-                registroInvitado.count = 0;
+                
+                // Sellamos el contador del invitado en MongoDB
+                registroInvitado.count = registroUsuario.count; 
+                
                 await registroInvitado.save();
                 await registroUsuario.save();
             }
@@ -324,7 +327,8 @@ app.post('/api/transfer-guest', async (req, res) => {
             await usuario.save();
         }
 
-const hoy = new Date().toLocaleDateString();
+// 🚀 MERGE DE PREVISUALIZACIONES
+        const hoy = new Date().toLocaleDateString();
         const uuidLimpio = deviceId.trim().toLowerCase();
         let registroInvitado = await Preview.findOne({ deviceId: uuidLimpio, date: hoy });
         
@@ -333,9 +337,12 @@ const hoy = new Date().toLocaleDateString();
             if (!registroUsuario) {
                 registroUsuario = new Preview({ deviceId: correoLimpio, date: hoy, count: registroInvitado.count });
             } else {
-                registroUsuario.count = Math.min(6, registroUsuario.count + registroInvitado.count);
+                registroUsuario.count = Math.max(registroUsuario.count, registroInvitado.count);
             }
-            registroInvitado.count = 0;
+            
+            // Sellamos el contador del invitado en MongoDB
+            registroInvitado.count = registroUsuario.count; 
+            
             await registroInvitado.save();
             await registroUsuario.save();
         }
@@ -387,16 +394,18 @@ app.post('/api/preview', async (req, res) => {
 
                 if (!registroUsuario) {
                     registroUsuario = new Preview({ 
-                        deviceId: identificadorLimpio, // Asegura que se guarde bajo el esquema correcto
+                        deviceId: identificadorLimpio, 
                         date: hoy,
                         count: registroInvitado.count
                     });
                 } else {
-                    registroUsuario.count = Math.min(6, registroUsuario.count + registroInvitado.count);
+                    // 🛑 Usamos Math.max para mantener el valor más alto y no sumar de más
+                    registroUsuario.count = Math.max(registroUsuario.count, registroInvitado.count);
                 }
                 
-                // Reseteamos el contador del invitado para evitar duplicados en próximas llamadas
-                registroInvitado.count = 0;
+                // 🚀 IGUALAMOS el invitado al usuario para sellar el límite y bloquear la máquina
+                registroInvitado.count = registroUsuario.count;
+                
                 await registroInvitado.save();
                 await registroUsuario.save();
             }
