@@ -230,7 +230,7 @@ app.post('/api/verify', async (req, res) => {
 
 // 3. INICIO DE SESIÓN (LOGIN)
 app.post('/api/login', async (req, res) => {
-    const { email, password, deviceId } = req.body; // 👈 Agregamos deviceId
+    const { email, password } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'Por favor rellena todos los campos.' });
 
     try {
@@ -250,30 +250,8 @@ app.post('/api/login', async (req, res) => {
             { expiresIn: '30d' }
         );
 
-        // 🚀 FUSIÓN DE PREVISUALIZACIONES DEL INVITADO A LA CUENTA
+        // 🚀 OBTENEMOS EL CONTEO DE LA CUENTA (Totalmente independiente)
         const hoy = new Date().toLocaleDateString();
-        if (deviceId) {
-            const uuidLimpio = deviceId.trim().toLowerCase();
-            let registroInvitado = await Preview.findOne({ deviceId: uuidLimpio, date: hoy });
-
-            if (registroInvitado && registroInvitado.count > 0) {
-                let registroUsuario = await Preview.findOne({ deviceId: correoLimpio, date: hoy });
-                if (!registroUsuario) {
-                    registroUsuario = new Preview({ deviceId: correoLimpio, date: hoy, count: registroInvitado.count });
-                } else {
-                    // Mantenemos el conteo más alto
-                    registroUsuario.count = Math.max(registroUsuario.count, registroInvitado.count);
-                }
-                
-                // Sellamos el contador del invitado en MongoDB
-                registroInvitado.count = registroUsuario.count; 
-                
-                await registroInvitado.save();
-                await registroUsuario.save();
-            }
-        }
-
-        // Obtener el conteo definitivo
         let previewCount = 0;
         let finalReg = await Preview.findOne({ deviceId: correoLimpio, date: hoy });
         if (finalReg) previewCount = finalReg.count;
@@ -282,7 +260,7 @@ app.post('/api/login', async (req, res) => {
             success: true,
             token,
             tokems: usuario.tokems,
-            previewCount // 👈 Enviamos la verdad absoluta al frontend
+            previewCount // 👈 Enviamos la cantidad exclusiva de la cuenta
         });
     } catch (error) {
         console.error('Error en /api/login:', error);
@@ -291,79 +269,42 @@ app.post('/api/login', async (req, res) => {
 });
 
 // =================================================================
-// 🔄 ENDPOINT: FUSIONAR SALDO DE INVITADO A CUENTA REGISTRADA
+// 🔄 ENDPOINT: FUSIONAR SALDO DE TOKEMS (PREVISUALIZACIONES INDEPENDIENTES)
 // =================================================================
 app.post('/api/transfer-guest', async (req, res) => {
     const { email, deviceId } = req.body;
-    if (!email || !deviceId) return res.status(400).json({ error: 'Faltan parámetros de transferencia.' });
+    if (!email || !deviceId) return res.status(400).json({ error: 'Faltan parámetros.' });
 
     try {
         const correoLimpio = email.trim().toLowerCase();
-        // Buscamos la cuenta oficial del usuario
         const usuario = await User.findOne({ email: correoLimpio });
         if (!usuario) return res.status(404).json({ error: 'Cuenta no encontrada.' });
 
         let saldoATransferir = 0;
-
-        // 1. Buscar si el invitado tiene saldo en la colección tradicional (Balance)
         const registroBalance = await Balance.findOne({ deviceId: deviceId });
+        
         if (registroBalance && registroBalance.tokens > 0) {
-            saldoATransferir += registroBalance.tokens;
-            registroBalance.tokens = 0; // Vaciamos los bolsillos del invitado
+            saldoATransferir = registroBalance.tokens;
+            registroBalance.tokens = 0; // Vaciamos los bolsillos de Tokems del invitado
             await registroBalance.save();
         }
 
-        // 2. Buscar si el invitado tiene saldo en la colección moderna (User)
-        const registroUserInv = await User.findOne({ email: deviceId });
-        if (registroUserInv && registroUserInv.tokems > 0) {
-            saldoATransferir += registroUserInv.tokems;
-            registroUserInv.tokems = 0; // Vaciamos los bolsillos del invitado
-            await registroUserInv.save();
-        }
-
-        // 3. Le inyectamos todo el dinero encontrado a la cuenta logueada
         if (saldoATransferir > 0) {
             usuario.tokems = (usuario.tokems || 0) + saldoATransferir;
             await usuario.save();
         }
 
-// 🚀 MERGE DE PREVISUALIZACIONES
+        // 🚀 OBTENEMOS EL CONTEO INDEPENDIENTE DE LA CUENTA (Sin tocar el del invitado)
         const hoy = new Date().toLocaleDateString();
-        const uuidLimpio = deviceId.trim().toLowerCase();
-        let registroInvitado = await Preview.findOne({ deviceId: uuidLimpio, date: hoy });
-        
-        if (registroInvitado && registroInvitado.count > 0) {
-            let registroUsuario = await Preview.findOne({ deviceId: correoLimpio, date: hoy });
-            if (!registroUsuario) {
-                registroUsuario = new Preview({ deviceId: correoLimpio, date: hoy, count: registroInvitado.count });
-            } else {
-                registroUsuario.count = Math.max(registroUsuario.count, registroInvitado.count);
-            }
-            
-            // Sellamos el contador del invitado en MongoDB
-            registroInvitado.count = registroUsuario.count; 
-            
-            await registroInvitado.save();
-            await registroUsuario.save();
-        }
-
         let previewCount = 0;
         let userPreview = await Preview.findOne({ deviceId: correoLimpio, date: hoy });
         if (userPreview) previewCount = userPreview.count;
 
         return res.status(200).json({ 
             success: true, 
-            transferidos: saldoATransferir, 
             nuevoSaldo: usuario.tokems,
-            previewCount // 👈 Lo mandamos de vuelta
+            previewCount 
         });
-
-        return res.status(200).json({ 
-            success: true, 
-            transferidos: saldoATransferir, 
-            nuevoSaldo: usuario.tokems 
-        });
-
     } catch (error) {
         console.error('Error en transferencia:', error);
         return res.status(500).json({ error: 'Error interno fusionando los balances.' });
@@ -371,10 +312,11 @@ app.post('/api/transfer-guest', async (req, res) => {
 });
 
 // =================================================================
-// 1. ENDPOINT: PREVISUALIZACIÓN (CON FUSIÓN DE TIROS DE INVITADO)
+// 1. ENDPOINT: PREVISUALIZACIÓN (TOTALMENTE INDEPENDIENTE)
 // =================================================================
 app.post('/api/preview', async (req, res) => {
-    const { url, deviceId, hardwareUUID } = req.body;
+    const { url, deviceId } = req.body; 
+    // Ya no requerimos hardwareUUID porque no habrá espejo
     if (!url || !deviceId) return res.status(400).json({ error: 'La URL y el deviceId son obligatorios' });
 
     const hoy = new Date().toLocaleDateString();
@@ -384,39 +326,13 @@ app.post('/api/preview', async (req, res) => {
         const esCuenta = identificadorLimpio.includes('@');
         const limiteMaximo = esCuenta ? 6 : 3;
 
-        // 🚀 FUSIÓN DE INVITADO A CUENTA: Si es una cuenta y viene el UUID, transferimos el conteo diario
-        if (esCuenta && hardwareUUID) {
-            const uuidLimpio = hardwareUUID.trim().toLowerCase();
-            let registroInvitado = await Preview.findOne({ deviceId: uuidLimpio, date: hoy });
-
-            if (registroInvitado && registroInvitado.count > 0) {
-                let registroUsuario = await Preview.findOne({ deviceId: identificadorLimpio, date: hoy });
-
-                if (!registroUsuario) {
-                    registroUsuario = new Preview({ 
-                        deviceId: identificadorLimpio, 
-                        date: hoy,
-                        count: registroInvitado.count
-                    });
-                } else {
-                    // 🛑 Usamos Math.max para mantener el valor más alto y no sumar de más
-                    registroUsuario.count = Math.max(registroUsuario.count, registroInvitado.count);
-                }
-                
-                // 🚀 IGUALAMOS el invitado al usuario para sellar el límite y bloquear la máquina
-                registroInvitado.count = registroUsuario.count;
-                
-                await registroInvitado.save();
-                await registroUsuario.save();
-            }
-        }
-
+        // Buscamos el registro independiente directamente en MongoDB
         let registro = await Preview.findOne({ deviceId: identificadorLimpio, date: hoy });
         if (!registro) {
             registro = new Preview({ deviceId: identificadorLimpio, date: hoy, count: 0 });
         }
 
-        // 🧼 LIMPIEZA DE SEGURIDAD: Capar residuos de contadores inflados
+        // 🧼 LIMPIEZA DE SEGURIDAD
         if (registro.count > limiteMaximo) {
             registro.count = limiteMaximo;
             await registro.save();
@@ -431,6 +347,8 @@ app.post('/api/preview', async (req, res) => {
 
         const esTikTok = url.includes('tiktok.com');
         console.log(`\n[🔍] Procesando previsualización (${esTikTok ? 'TikTok' : 'Instagram'}): ${url}`);
+        
+        // ... (De aquí hacia abajo, deja intacto el código de Apify)
 
         if (esTikTok) {
             const inputTikTok = {
@@ -770,37 +688,7 @@ app.get('/api/get-balance', async (req, res) => {
     }
 });
 
-// =================================================================
-// 🚀 NUEVO ENDPOINT: FUSIONAR SALDO DE INVITADO A CUENTA
-// =================================================================
-app.post('/api/transfer-guest', async (req, res) => {
-    const { email, deviceId } = req.body;
-    if (!email || !deviceId) return res.status(400).json({ error: 'Faltan parámetros.' });
 
-    try {
-        const usuario = await User.findOne({ email: email.trim().toLowerCase() });
-        if (!usuario) return res.status(404).json({ error: 'Cuenta no encontrada.' });
-
-        let saldoATransferir = 0;
-        const registroBalance = await Balance.findOne({ deviceId: deviceId });
-        
-        if (registroBalance && registroBalance.tokens > 0) {
-            saldoATransferir = registroBalance.tokens;
-            registroBalance.tokens = 0; // Le vaciamos los bolsillos al invitado
-            await registroBalance.save();
-        }
-
-        if (saldoATransferir > 0) {
-            usuario.tokems = (usuario.tokems || 0) + saldoATransferir;
-            await usuario.save();
-        }
-
-        return res.status(200).json({ success: true, nuevoSaldo: usuario.tokems });
-    } catch (error) {
-        console.error('Error en transferencia:', error);
-        return res.status(500).json({ error: 'Error interno fusionando los balances.' });
-    }
-});
 
 // =================================================================
 // 7. ENDPOINT: WEBHOOK DE SHOPIFY (MANTENLO IGUAL A COMO LO TIENES)
