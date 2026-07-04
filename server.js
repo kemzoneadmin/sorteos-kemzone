@@ -230,7 +230,7 @@ app.post('/api/verify', async (req, res) => {
 
 // 3. INICIO DE SESIÓN (LOGIN)
 app.post('/api/login', async (req, res) => {
-    const { email, password } = req.body;
+    const { email, password, deviceId } = req.body; // 👈 Agregamos deviceId
     if (!email || !password) return res.status(400).json({ error: 'Por favor rellena todos los campos.' });
 
     try {
@@ -240,7 +240,6 @@ app.post('/api/login', async (req, res) => {
         if (!usuario || !(await bcrypt.compare(password, usuario.password))) {
             return res.status(400).json({ error: 'El correo o la contraseña son totalmente incorrectos.' });
         }
-
         if (!usuario.isVerified) {
             return res.status(401).json({ error: 'Esta cuenta no se encuentra verificada. Revisa tu correo electrónico.' });
         }
@@ -251,10 +250,36 @@ app.post('/api/login', async (req, res) => {
             { expiresIn: '30d' }
         );
 
+        // 🚀 FUSIÓN DE PREVISUALIZACIONES DEL INVITADO A LA CUENTA
+        const hoy = new Date().toLocaleDateString();
+        if (deviceId) {
+            const uuidLimpio = deviceId.trim().toLowerCase();
+            let registroInvitado = await Preview.findOne({ deviceId: uuidLimpio, date: hoy });
+
+            if (registroInvitado && registroInvitado.count > 0) {
+                let registroUsuario = await Preview.findOne({ deviceId: correoLimpio, date: hoy });
+                if (!registroUsuario) {
+                    registroUsuario = new Preview({ deviceId: correoLimpio, date: hoy, count: registroInvitado.count });
+                } else {
+                    // Sumamos cuidando de no pasar el límite de 6
+                    registroUsuario.count = Math.min(6, registroUsuario.count + registroInvitado.count);
+                }
+                registroInvitado.count = 0;
+                await registroInvitado.save();
+                await registroUsuario.save();
+            }
+        }
+
+        // Obtener el conteo definitivo
+        let previewCount = 0;
+        let finalReg = await Preview.findOne({ deviceId: correoLimpio, date: hoy });
+        if (finalReg) previewCount = finalReg.count;
+
         return res.json({
             success: true,
             token,
-            tokems: usuario.tokems
+            tokems: usuario.tokems,
+            previewCount // 👈 Enviamos la verdad absoluta al frontend
         });
     } catch (error) {
         console.error('Error en /api/login:', error);
@@ -298,6 +323,33 @@ app.post('/api/transfer-guest', async (req, res) => {
             usuario.tokems = (usuario.tokems || 0) + saldoATransferir;
             await usuario.save();
         }
+
+const hoy = new Date().toLocaleDateString();
+        const uuidLimpio = deviceId.trim().toLowerCase();
+        let registroInvitado = await Preview.findOne({ deviceId: uuidLimpio, date: hoy });
+        
+        if (registroInvitado && registroInvitado.count > 0) {
+            let registroUsuario = await Preview.findOne({ deviceId: correoLimpio, date: hoy });
+            if (!registroUsuario) {
+                registroUsuario = new Preview({ deviceId: correoLimpio, date: hoy, count: registroInvitado.count });
+            } else {
+                registroUsuario.count = Math.min(6, registroUsuario.count + registroInvitado.count);
+            }
+            registroInvitado.count = 0;
+            await registroInvitado.save();
+            await registroUsuario.save();
+        }
+
+        let previewCount = 0;
+        let userPreview = await Preview.findOne({ deviceId: correoLimpio, date: hoy });
+        if (userPreview) previewCount = userPreview.count;
+
+        return res.status(200).json({ 
+            success: true, 
+            transferidos: saldoATransferir, 
+            nuevoSaldo: usuario.tokems,
+            previewCount // 👈 Lo mandamos de vuelta
+        });
 
         return res.status(200).json({ 
             success: true, 
@@ -681,7 +733,7 @@ const TOKENS_POR_VARIANTE = {
 };
 
 // =================================================================
-// 6. ENDPOINT: OBTENER EL SALDO (CORREGIDO PARA LEER AMBAS BD)
+// 6. ENDPOINT: OBTENER EL SALDO (Y CONTEO DE PREVISUALIZACIONES)
 // =================================================================
 app.get('/api/get-balance', async (req, res) => {
     const { deviceId } = req.query;
@@ -689,14 +741,19 @@ app.get('/api/get-balance', async (req, res) => {
 
     try {
         const identificadorLimpio = deviceId.trim().toLowerCase();
+        const hoy = new Date().toLocaleDateString();
         
-        // 🌟 CORRECCIÓN: Si es un correo, buscamos en "users". Si no, en "balances".
+        // 🚀 Consultar conteo real en MongoDB (Inmune al LocalStorage)
+        let previewCount = 0;
+        const previewReg = await Preview.findOne({ deviceId: identificadorLimpio, date: hoy });
+        if (previewReg) previewCount = previewReg.count;
+
         if (identificadorLimpio.includes('@')) {
             const usuario = await User.findOne({ email: identificadorLimpio });
-            return res.json({ tokens: usuario ? usuario.tokems : 0 });
+            return res.json({ tokens: usuario ? usuario.tokems : 0, previewCount });
         } else {
             const registro = await Balance.findOne({ deviceId: identificadorLimpio });
-            return res.json({ tokens: registro ? registro.tokens : 0 });
+            return res.json({ tokens: registro ? registro.tokens : 0, previewCount });
         }
     } catch (error) {
         console.error('❌ Error al obtener balance en DB:', error);
