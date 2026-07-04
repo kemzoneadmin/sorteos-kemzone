@@ -316,10 +316,10 @@ app.post('/api/transfer-guest', async (req, res) => {
 // =================================================================
 app.post('/api/preview', async (req, res) => {
     const { url, deviceId, hardwareUUID } = req.body;
-    if (!url) return res.status(400).json({ error: 'La URL es obligatoria' });
+    if (!url || !deviceId) return res.status(400).json({ error: 'La URL y el deviceId son obligatorios' });
 
     const hoy = new Date().toLocaleDateString();
-    const identificadorLimpio = (deviceId || '').trim().toLowerCase();
+    const identificadorLimpio = deviceId.trim().toLowerCase();
 
     try {
         const esCuenta = identificadorLimpio.includes('@');
@@ -335,9 +335,9 @@ app.post('/api/preview', async (req, res) => {
 
                 if (!registroUsuario) {
                     registroUsuario = new Preview({ 
-                        deviceId: identificadorLimpio, 
-                        date: hoy, 
-                        count: registroInvitado.count 
+                        deviceId: identificadorLimpio, // Asegura que se guarde bajo el esquema correcto
+                        date: hoy,
+                        count: registroInvitado.count
                     });
                 } else {
                     registroUsuario.count = Math.min(6, registroUsuario.count + registroInvitado.count);
@@ -355,7 +355,7 @@ app.post('/api/preview', async (req, res) => {
             registro = new Preview({ deviceId: identificadorLimpio, date: hoy, count: 0 });
         }
 
-        // 🧼 LIMPIEZA DE SEGURIDAD: Capar residuos de contadores inflados de pruebas rotas anteriores
+        // 🧼 LIMPIEZA DE SEGURIDAD: Capar residuos de contadores inflados
         if (registro.count > limiteMaximo) {
             registro.count = limiteMaximo;
             await registro.save();
@@ -401,7 +401,7 @@ app.post('/api/preview', async (req, res) => {
                 commentsCount: postData.commentCount || 0,
                 likesCount: postData.diggCount || 0,
                 displayUrl: coverUrl,
-                currentCount: registro.count // Sincronización en caliente con MongoDB
+                currentCount: registro.count
             });
 
         } else {
@@ -434,7 +434,7 @@ app.post('/api/preview', async (req, res) => {
                 commentsCount: postData.commentsCount || 0,
                 likesCount: postData.likesCount || 0,
                 displayUrl: coverUrl,
-                currentCount: registro.count // Sincronización en caliente con MongoDB
+                currentCount: registro.count
             });
         }
     } catch (error) {
