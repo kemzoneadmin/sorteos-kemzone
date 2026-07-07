@@ -772,3 +772,38 @@ app.post('/api/shopify-webhook', async (req, res) => {
 app.listen(port, '0.0.0.0', () => {
     console.log(`🚀 Servidor KemZone corriendo en el puerto ${port}`);
 });
+
+// =================================================================
+// ENDPOINTS DE SEGURIDAD: CONTROL DE HISTORIAL DE SORTEOS
+// =================================================================
+const dbHistorialSorteos = {}; // Base de datos temporal (Se puede migrar a Mongo/JSON)
+
+// Endpoint para guardar un nuevo sorteo
+app.post('/api/historial/guardar', (req, res) => {
+    const emailUsuario = req.session && req.session.user ? req.session.user.email : "invitado";
+    
+    if (emailUsuario === "invitado") {
+        return res.status(401).json({ error: "Inicio de sesión requerido" });
+    }
+
+    const { tipo, titulo, ganadores, fecha } = req.body;
+    
+    if (!dbHistorialSorteos[emailUsuario]) {
+        dbHistorialSorteos[emailUsuario] = [];
+    }
+
+    // Inserta el sorteo al principio del arreglo para mostrar primero el más reciente
+    dbHistorialSorteos[emailUsuario].unshift({ tipo, titulo, ganadores, fecha });
+    res.json({ success: true });
+});
+
+// Endpoint para recuperar el historial
+app.get('/api/historial', (req, res) => {
+    const emailUsuario = req.session && req.session.user ? req.session.user.email : "invitado";
+    
+    if (emailUsuario === "invitado") {
+        return res.status(401).json({ error: "No autorizado" });
+    }
+
+    res.json(dbHistorialSorteos[emailUsuario] || []);
+});
