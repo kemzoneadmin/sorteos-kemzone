@@ -741,6 +741,39 @@ app.get('/api/get-history', async (req, res) => {
     }
 });
 
+// --- RUTA 1: ELIMINAR UN SOLO SORTEO POR ID ---
+app.post('/api/delete-history-item', async (req, res) => {
+    try {
+        const { id, deviceId } = req.body;
+        if (!id || !deviceId) return res.status(400).json({ error: "Faltan parámetros" });
+
+        await History.findOneAndDelete({ _id: id, deviceId });
+        res.status(200).json({ success: true });
+    } catch (error) {
+        console.error("Error eliminando registro:", error);
+        res.status(500).json({ error: "Error al eliminar registro" });
+    }
+});
+
+// --- RUTA 2: VACIAR HISTORIAL (COMPLETO O POR MÁQUINA) ---
+app.post('/api/clear-history', async (req, res) => {
+    try {
+        const { deviceId, maquina } = req.body;
+        if (!deviceId) return res.status(400).json({ error: "Falta el identificador" });
+
+        const filtroDB = { deviceId };
+        if (maquina && maquina !== 'Todas') {
+            filtroDB.maquina = maquina;
+        }
+
+        await History.deleteMany(filtroDB);
+        res.status(200).json({ success: true });
+    } catch (error) {
+        console.error("Error vaciando historial:", error);
+        res.status(500).json({ error: "Error al vaciar historial" });
+    }
+});
+
 // =================================================================
 // 7. ENDPOINT: WEBHOOK DE SHOPIFY (MANTENLO IGUAL A COMO LO TIENES)
 // =================================================================
