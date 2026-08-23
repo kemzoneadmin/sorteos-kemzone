@@ -52,8 +52,9 @@ const UserSchema = new mongoose.Schema({
     password: { type: String, required: true },
     isVerified: { type: Boolean, default: false },
     verificationCode: { type: String },
-    tokems: { type: Number, default: 0 }, // Aquí se guardará su saldo en la nube
-    history: { type: Array, default: [] } // Historial de jugadas o canjes
+    tokems: { type: Number, default: 0 },
+    history: { type: Array, default: [] },
+    customConfig: { type: Object, default: null } // 👈 Agregado para guardar el diseño en la nube
 });
 const User = mongoose.model('User', UserSchema);
 
@@ -79,7 +80,8 @@ const client = new ApifyClient({
 });
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '15mb' }));
+app.use(express.urlencoded({ extended: true, limit: '15mb' }));
 
 app.get('/', (req, res) => {
     res.send('Base del servidor de KemZone activa y corriendo.');
@@ -272,11 +274,12 @@ app.post('/api/login', async (req, res) => {
         let finalReg = await Preview.findOne({ deviceId: correoLimpio, date: hoy });
         if (finalReg) previewCount = finalReg.count;
 
-        return res.json({
+       return res.json({
             success: true,
             token,
             tokems: usuario.tokems,
-            previewCount // 👈 Enviamos la cantidad exclusiva de la cuenta
+            previewCount,
+            customConfig: usuario.customConfig // 👈 Envía el diseño guardado al loguearse
         });
     } catch (error) {
         console.error('Error en /api/login:', error);
@@ -693,10 +696,18 @@ app.get('/api/get-balance', async (req, res) => {
 
         if (identificadorLimpio.includes('@')) {
             const usuario = await User.findOne({ email: identificadorLimpio });
-            return res.json({ tokens: usuario ? usuario.tokems : 0, previewCount });
+            return res.json({ 
+                tokens: usuario ? usuario.tokems : 0, 
+                previewCount,
+                customConfig: usuario ? usuario.customConfig : null 
+            });
         } else {
             const registro = await Balance.findOne({ deviceId: identificadorLimpio });
-            return res.json({ tokens: registro ? registro.tokens : 0, previewCount });
+            return res.json({ 
+                tokens: registro ? registro.tokens : 0, 
+                previewCount,
+                customConfig: null 
+            });
         }
     } catch (error) {
         console.error('❌ Error al obtener balance en DB:', error);
@@ -771,6 +782,42 @@ app.post('/api/clear-history', async (req, res) => {
     } catch (error) {
         console.error("Error vaciando historial:", error);
         res.status(500).json({ error: "Error al vaciar historial" });
+    }
+});
+
+// =================================================================
+// 🎨 ENDPOINTS: GUARDAR Y REINICIAR DISEÑO EN LA NUBE (MONGO ATLAS)
+// =================================================================
+
+// 1. Guarda el diseño personalizado en la cuenta del usuario
+app.post('/api/save-custom-config', async (req, res) => {
+    try {
+        const { email, customConfig } = req.body;
+        if (!email || !customConfig) return res.status(400).json({ error: "Faltan parámetros" });
+
+        const correoLimpio = email.trim().toLowerCase();
+        await User.findOneAndUpdate({ email: correoLimpio }, { customConfig: customConfig });
+
+        res.status(200).json({ success: true, message: "Diseño guardado en la cuenta" });
+    } catch (error) {
+        console.error("Error guardando diseño en MongoDB:", error);
+        res.status(500).json({ error: "Error interno del servidor" });
+    }
+});
+
+// 2. Borra el diseño personalizado de la cuenta (vuelve a estado de fábrica)
+app.post('/api/reset-custom-config', async (req, res) => {
+    try {
+        const { email } = req.body;
+        if (!email) return res.status(400).json({ error: "Falta el correo" });
+
+        const correoLimpio = email.trim().toLowerCase();
+        await User.findOneAndUpdate({ email: correoLimpio }, { customConfig: null });
+
+        res.status(200).json({ success: true, message: "Diseño reiniciado de fábrica" });
+    } catch (error) {
+        console.error("Error reiniciando diseño en MongoDB:", error);
+        res.status(500).json({ error: "Error interno del servidor" });
     }
 });
 
