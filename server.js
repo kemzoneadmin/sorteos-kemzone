@@ -57,6 +57,22 @@ const UserSchema = new mongoose.Schema({
 });
 const User = mongoose.model('User', UserSchema);
 
+// =================================================================
+// 📜 NUEVO ESQUEMA: HISTORIAL DE SORTEOS
+// =================================================================
+const historySchema = new mongoose.Schema({
+    deviceId: { type: String, required: true }, // Guarda el correo o UUID
+    maquina: { type: String, required: true },  // Ruleta, Slots, Vasos, etc.
+    url: { type: String },                      // El enlace del post de TikTok/Ig
+    fecha: { type: Date, default: Date.now },   // Fecha exacta automática
+    ganadores: [{
+        nombre: String,
+        texto: String,
+        avatarUrl: String
+    }]
+});
+const History = mongoose.model('History', historySchema);
+
 // 🔒 CLIENTE APIFY PROTEGIDO CON VARIABLES DE ENTORNO
 const client = new ApifyClient({
     token: process.env.APIFY_TOKEN
@@ -688,7 +704,42 @@ app.get('/api/get-balance', async (req, res) => {
     }
 });
 
+// =================================================================
+// 📜 ENDPOINTS: GUARDAR Y LEER HISTORIAL EN LA NUBE
+// =================================================================
 
+// PUERTA 1: Recibe los ganadores y los guarda en MongoDB
+app.post('/api/save-history', async (req, res) => {
+    try {
+        const { deviceId, maquina, url, ganadores } = req.body;
+        
+        const nuevoSorteo = new History({ deviceId, maquina, url, ganadores });
+        await nuevoSorteo.save(); // ¡Guardado en la base de datos!
+        
+        res.status(200).json({ success: true });
+    } catch (error) {
+        console.error("Error guardando historial:", error);
+        res.status(500).json({ error: "Error interno" });
+    }
+});
+
+// PUERTA 2: Busca el historial en MongoDB y se lo envía a la página web
+app.get('/api/get-history', async (req, res) => {
+    try {
+        const { deviceId } = req.query;
+        if (!deviceId) return res.status(400).json({ error: "Falta el identificador" });
+
+        // Busca los últimos 20 sorteos de este usuario, ordenados por fecha
+        const historial = await History.find({ deviceId })
+                                       .sort({ fecha: -1 })
+                                       .limit(20);
+
+        res.status(200).json({ historial });
+    } catch (error) {
+        console.error("Error obteniendo historial:", error);
+        res.status(500).json({ error: "Error interno" });
+    }
+});
 
 // =================================================================
 // 7. ENDPOINT: WEBHOOK DE SHOPIFY (MANTENLO IGUAL A COMO LO TIENES)
