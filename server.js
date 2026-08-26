@@ -563,18 +563,21 @@ app.post('/api/comments', async (req, res) => {
 
             if (items && items.length > 0) {
                 listaComentarios = items
-                    .filter(c => c.ownerUsername || c.username)
-                    .map(c => ({
-                        username: c.ownerUsername || c.username,
-                        text: c.text || "",
-                        profilePicUrl: c.ownerProfilePicUrl || c.profilePicUrl || ""
-                    }));
+                    .filter(c => c.ownerUsername || c.username || c.author)
+                    .map(c => {
+                        const user = c.ownerUsername || c.username || c.author || "Participante";
+                        const avatar = extraerAvatarDinamicamente(c) || c.ownerProfilePicUrl || c.profilePicUrl || c.authorProfilePicUrl || "";
+                        return {
+                            username: user,
+                            text: c.text || c.caption || "",
+                            profilePicUrl: avatar
+                        };
+                    });
             }
         }
 
         console.log(`[✅] Proceso completado. Se enviaron ${listaComentarios.length} comentarios.`);
         
-        // 🚀 NUEVO: Enviamos de vuelta el nuevo saldo calculado directamente desde la base de datos
         return res.json({ 
             comments: listaComentarios, 
             nuevoSaldo: nuevoSaldoDefinitivo 
@@ -602,18 +605,29 @@ app.get('/api/proxy-image', async (req, res) => {
         return res.sendFile(path.join(__dirname, imageUrl));
     }
 
+    // 🎯 Detectar de qué red social viene la imagen para colocar el camuflaje correcto
+    const esInstagram = imageUrl.includes('cdninstagram.com') || imageUrl.includes('fbcdn.net') || imageUrl.includes('instagram.com');
+    
+    const customHeaders = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8'
+    };
+
+    if (esInstagram) {
+        customHeaders['Referer'] = 'https://www.instagram.com/';
+        customHeaders['Origin'] = 'https://www.instagram.com/';
+    } else {
+        customHeaders['Referer'] = 'https://www.tiktok.com/';
+        customHeaders['Origin'] = 'https://www.tiktok.com/';
+    }
+
     try {
         const response = await axios({
             url: imageUrl,
             method: 'GET',
             responseType: 'arraybuffer',
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, Gecko) Chrome/124.0.0.0 Safari/537.36',
-                'Referer': 'https://www.tiktok.com/', 
-                'Origin': 'https://www.tiktok.com/',
-                'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8'
-            },
-            timeout: 10000
+            headers: customHeaders,
+            timeout: 12000
         });
 
         res.set('Content-Type', response.headers['content-type'] || 'image/jpeg');
@@ -622,7 +636,7 @@ app.get('/api/proxy-image', async (req, res) => {
         return res.send(response.data);
     } catch (error) {
         console.error('Error cargando la imagen remota mediante Proxy:', error.message);
-        return res.redirect(`https://ui-avatars.com/api/?name=K+Z&background=00ffcc&color=0d0d14&size=128`);
+        return res.redirect(`https://cdn.shopify.com/s/files/1/0780/8444/0222/files/blank-profile-picture-973460_640.webp?v=1787703095`);
     }
 });
 
