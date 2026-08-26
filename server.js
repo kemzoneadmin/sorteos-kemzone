@@ -1049,7 +1049,7 @@ app.post('/api/shopify-webhook', async (req, res) => {
         // Primero intentamos buscar si el deviceId es el correo de un Usuario registrado
         let usuarioCuenta = await User.findOne({ email: identificadorLimpio });
 
-        if (usuarioCuenta) {
+if (usuarioCuenta) {
             // Si es un usuario con cuenta iniciada, le sumamos los Tokems directamente a su perfil
             usuarioCuenta.tokems = (usuarioCuenta.tokems || 0) + tokensAAgregar;
             await usuarioCuenta.save();
@@ -1066,6 +1066,16 @@ app.post('/api/shopify-webhook', async (req, res) => {
             await registroInvitado.save();
             console.log(`✅ Éxito (Invitado): Se le sumaron ${tokensAAgregar} Tokems al dispositivo anónimo ${deviceId}. Nuevo saldo: ${registroInvitado.tokens}`);
         }
+
+        // 📝 Registrar la compra en el historial de transacciones
+        const nuevaTx = new Transaction({
+            deviceId: identificadorLimpio,
+            tipo: 'Compra',
+            tokens: tokensAAgregar,
+            precio: order.total_price ? `$${order.total_price}` : '',
+            detalles: `Compra Shopify #${order.order_number || order.id || ''}`
+        });
+        await nuevaTx.save();
 
         return res.status(200).send("Webhook procesado con éxito");
 
