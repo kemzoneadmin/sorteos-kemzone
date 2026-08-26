@@ -74,6 +74,21 @@ const historySchema = new mongoose.Schema({
 });
 const History = mongoose.model('History', historySchema);
 
+// =================================================================
+// 💳 NUEVO ESQUEMA: HISTORIAL DE TRANSACCIONES (COMPRAS Y CANJES)
+// =================================================================
+const TransactionSchema = new mongoose.Schema({
+    deviceId: { type: String, required: true, index: true },
+    tipo: { type: String, enum: ['Compra', 'Canje'], required: true },
+    tokens: { type: Number, required: true },
+    plan: { type: String, default: '' },
+    precio: { type: String, default: '' },
+    codigoPin: { type: String, default: '' },
+    detalles: { type: String, default: '' },
+    fecha: { type: Date, default: Date.now }
+});
+const Transaction = mongoose.model('Transaction', TransactionSchema);
+
 // 🔒 CLIENTE APIFY PROTEGIDO CON VARIABLES DE ENTORNO
 const client = new ApifyClient({
     token: process.env.APIFY_TOKEN
@@ -883,6 +898,102 @@ app.post('/api/reset-custom-config', async (req, res) => {
     } catch (error) {
         console.error("Error reiniciando diseño en MongoDB:", error);
         res.status(500).json({ error: "Error interno del servidor" });
+    }
+});
+
+// =================================================================
+// 💳 ENDPOINTS: HISTORIAL DE COMPRAS Y CANJES DE TOKEMS
+// =================================================================
+
+// 1. Guardar nueva transacción (Compra o Canje)
+app.post('/api/save-transaction', async (req, res) => {
+    try {
+        const { deviceId, tipo, tokens, plan, precio, codigoPin, detalles } = req.body;
+        if (!deviceId || !tokens) {
+            return res.status(400).json({ error: 'Datos insuficientes para guardar la transacción.' });
+        }
+
+        const nuevaTx = new Transaction({
+            deviceId: deviceId.trim().toLowerCase(),
+            tipo: tipo || 'Canje',
+            tokens: Number(tokens),
+            plan: plan || '',
+            precio: precio || '',
+            codigoPin: codigoPin || '',
+            detalles: detalles || ''
+        });
+
+        await nuevaTx.save();
+        res.json({ success: true, transaction: nuevaTx });
+    } catch (error) {
+        console.error('Error guardando transacción:', error);
+        res.status(500).json({ error: 'Error interno del servidor.' });
+    }
+});
+
+// 2. Obtener transacciones del usuario / dispositivo
+app.get('/api/get-transactions', async (req, res) => {
+    try {
+        const { deviceId, uuid } = req.query;
+        if (!deviceId && !uuid) return res.status(400).json({ error: 'Falta identificador.' });
+
+        const idQuery = [];
+        if (deviceId) {
+            idQuery.push({ deviceId: deviceId });
+            idQuery.push({ deviceId: deviceId.trim().toLowerCase() });
+        }
+        if (uuid && uuid !== deviceId) {
+            idQuery.push({ deviceId: uuid });
+            idQuery.push({ deviceId: uuid.trim().toLowerCase() });
+        }
+
+        const transacciones = await Transaction.find({ $or: idQuery })
+            .sort({ fecha: -1 })
+            .limit(50)
+            .lean();
+
+        res.json({ success: true, transacciones });
+    } catch (error) {
+        console.error('Error obteniendo transacciones:', error);
+        res.status(500).json({ error: 'Error al consultar historial de transacciones.' });
+    }
+});
+
+// 3. Eliminar transacción individual
+app.post('/api/delete-transaction-item', async (req, res) => {
+    try {
+        const { id, deviceId } = req.body;
+        if (!id || !deviceId) return res.status(400).json({ error: 'Faltan parámetros.' });
+
+        await Transaction.deleteOne({ _id: id });
+        res.json({ success: true });
+    } catch (error) {
+        res.status(500).json({ error: 'Error al eliminar la transacción.' });
+    }
+});
+
+// 4. Vaciar transacciones por tipo o todas
+app.post('/api/clear-transactions', async (req, res) => {
+    try {
+        const { deviceId, tipo } = req.body;
+        if (!deviceId) return res.status(400).json({ error: 'Falta el identificador.' });
+
+        const identificadorLimpio = deviceId.trim().toLowerCase();
+        const filtroDB = { 
+            $or: [
+                { deviceId: deviceId },
+                { deviceId: identificadorLimpio }
+            ] 
+        };
+
+        if (tipo && tipo !== 'Todas') {
+            filtroDB.tipo = tipo;
+        }
+
+        await Transaction.deleteMany(filtroDB);
+        res.json({ success: true });
+    } catch (error) {
+        res.status(500).json({ error: 'Error al vaciar transacciones.' });
     }
 });
 
