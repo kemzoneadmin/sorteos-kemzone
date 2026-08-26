@@ -794,13 +794,21 @@ app.post('/api/save-history', async (req, res) => {
 // PUERTA 2: Busca el historial en MongoDB y se lo envía a la página web
 app.get('/api/get-history', async (req, res) => {
     try {
-        const { deviceId } = req.query;
-        if (!deviceId) return res.status(400).json({ error: "Falta el identificador" });
+        const { deviceId, uuid } = req.query;
+        if (!deviceId && !uuid) return res.status(400).json({ error: "Falta el identificador" });
 
-        // Busca los últimos 20 sorteos de este usuario, ordenados por fecha
-        const historial = await History.find({ deviceId })
+        const idQuery = [];
+        if (deviceId) {
+            idQuery.push({ deviceId: deviceId });
+            idQuery.push({ deviceId: deviceId.trim().toLowerCase() });
+        }
+        if (uuid && uuid !== deviceId) {
+            idQuery.push({ deviceId: uuid });
+        }
+
+        const historial = await History.find({ $or: idQuery })
                                        .sort({ fecha: -1 })
-                                       .limit(20);
+                                       .limit(30);
 
         res.status(200).json({ historial });
     } catch (error) {
