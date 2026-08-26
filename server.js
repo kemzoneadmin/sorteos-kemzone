@@ -449,15 +449,32 @@ app.post('/api/preview', async (req, res) => {
 });
 
 // =================================================================
-// 2. ENDPOINT: EXTRACCIÓN MASIVA (CON COBRO INMUNE EN MONGO Atlas)
+// 2. ENDPOINT: EXTRACCIÓN MASIVA (CON REEMBOLSO AUTOMÁTICO Y TOPE SEGURO)
 // =================================================================
+
+// 🧮 Función oficial de cálculo de Tokems según la tabla de precios
+function calcularCostoTokemsServidor(total) {
+    const c = parseInt(total) || 0;
+    if (c <= 300) return 1;
+    if (c <= 600) return 2;
+    if (c <= 1000) return 3;
+    if (c <= 2000) return 6;
+    if (c <= 4000) return 12;
+    if (c <= 10000) return 24;
+    if (c <= 12500) return 30;
+    if (c <= 15000) return 36;
+    if (c <= 17500) return 42;
+    if (c <= 20000) return 48;
+    const bloquesExtras = Math.ceil((c - 20000) / 500);
+    return 48 + bloquesExtras;
+}
+
 app.post('/api/comments', async (req, res) => {
-    // 🚀 Recibimos el deviceId real y el costo calculado desde el frontend
     const { url, maxComments, deviceId, costoTokens } = req.body;
     if (!url) return res.status(400).json({ error: 'La URL es obligatoria' });
 
     const esTikTok = url.includes('tiktok.com');
-    const limiteSeguro = parseInt(maxComments) || 100;
+    const limiteSeguro = parseInt(maxComments) || 300;
     const costoReal = parseInt(costoTokens) || 0;
 
     try {
@@ -465,12 +482,11 @@ app.post('/api/comments', async (req, res) => {
         
         let nuevoSaldoDefinitivo = 0;
 
-        // 💰 SISTEMA DE DÉBITO EN CALIENTE (ZONA CRÍTICA)
+        // 💰 1. DÉBITO INICIAL DE TOKEMS
         if (deviceId && costoReal > 0) {
             const identificadorLimpio = deviceId.trim().toLowerCase();
 
             if (identificadorLimpio.includes('@')) {
-                // Es un usuario registrado en la colección "users"
                 let usuario = await User.findOne({ email: identificadorLimpio });
                 if (usuario) {
                     usuario.tokems = Math.max(0, (usuario.tokems || 0) - costoReal);
@@ -479,7 +495,6 @@ app.post('/api/comments', async (req, res) => {
                     console.log(`[🪙] Cobrado x${costoReal} Tokems a la Cuenta: ${identificadorLimpio}. Restan: ${nuevoSaldoDefinitivo}`);
                 }
             } else {
-                // Es un invitado anónimo en la colección "balances"
                 let registroInvitado = await Balance.findOne({ deviceId: identificadorLimpio });
                 if (registroInvitado) {
                     registroInvitado.tokens = Math.max(0, (registroInvitado.tokens || 0) - costoReal);
@@ -492,6 +507,7 @@ app.post('/api/comments', async (req, res) => {
 
         let listaComentarios = [];
 
+        // 🤖 2. EXTRACCIÓN CON FRENO EN APIFY
         if (esTikTok) {
             const inputTikTok = {
                 "postURLs": [url],
@@ -576,11 +592,38 @@ app.post('/api/comments', async (req, res) => {
             }
         }
 
-        console.log(`[✅] Proceso completado. Se enviaron ${listaComentarios.length} comentarios.`);
+        // 🔄 3. LÓGICA DE REEMBOLSO AUTOMÁTICO TRAS LA LIMPIEZA
+        const costoFinalCalculado = calcularCostoTokemsServidor(listaComentarios.length);
+        let tokemsReembolsados = 0;
+
+        if (costoReal > costoFinalCalculado && deviceId) {
+            tokemsReembolsados = costoReal - costoFinalCalculado;
+            const identificadorLimpio = deviceId.trim().toLowerCase();
+
+            if (identificadorLimpio.includes('@')) {
+                let usuario = await User.findOne({ email: identificadorLimpio });
+                if (usuario) {
+                    usuario.tokems = (usuario.tokems || 0) + tokemsReembolsados;
+                    await usuario.save();
+                    nuevoSaldoDefinitivo = usuario.tokems;
+                }
+            } else {
+                let registroInvitado = await Balance.findOne({ deviceId: identificadorLimpio });
+                if (registroInvitado) {
+                    registroInvitado.tokens = (registroInvitado.tokens || 0) + tokemsReembolsados;
+                    await registroInvitado.save();
+                    nuevoSaldoDefinitivo = registroInvitado.tokens;
+                }
+            }
+            console.log(`[🔄 REEMBOLSO] Se devolvieron ${tokemsReembolsados} Tokems a ${deviceId}. Saldo final: ${nuevoSaldoDefinitivo}`);
+        }
+
+        console.log(`[✅] Proceso completado. Se enviaron ${listaComentarios.length} comentarios válidos.`);
         
         return res.json({ 
             comments: listaComentarios, 
-            nuevoSaldo: nuevoSaldoDefinitivo 
+            nuevoSaldo: nuevoSaldoDefinitivo,
+            reembolso: tokemsReembolsados
         });
 
     } catch (error) {
