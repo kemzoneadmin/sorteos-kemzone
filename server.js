@@ -205,18 +205,19 @@ app.get('/', (req, res) => {
 });
 
 // EL GUARDIA DE SEGURIDAD
-const verificarToken = (req, res, next) => {
-    const token = req.headers['authorization'];
-    
-    // Si no trae pulsera (token), lo rebotamos
-    if (!token) return res.status(403).json({ error: 'Acceso denegado. Falta la pulsera VIP.' });
+const verificarTokenOpcional = (req, res, next) => {
+    const authHeader = req.headers['authorization'];
+    if (!authHeader) {
+        // Es un usuario invitado, lo dejamos pasar con su deviceId
+        return next();
+    }
 
-    // Leemos la pulsera
-    const tokenLimpio = token.split(" ")[1]; 
+    const tokenLimpio = authHeader.split(" ")[1];
     jwt.verify(tokenLimpio, process.env.JWT_SECRET, (err, decoded) => {
-        if (err) return res.status(401).json({ error: 'Pulsera inválida o caducada.' });
-        req.user = decoded; // Identificamos quién es
-        next(); // Lo dejamos pasar
+        if (!err && decoded) {
+            req.user = decoded;
+        }
+        next();
     });
 };
 
@@ -602,7 +603,7 @@ function calcularCostoTokemsServidor(total) {
     return 48 + bloquesExtras;
 }
 
-app.post('/api/comments', verificarToken, async (req, res) => {
+app.post('/api/comments', verificarTokenOpcional, async (req, res) => {
     const { url, maxComments, deviceId, costoTokens } = req.body;
     if (!url) return res.status(400).json({ error: 'La URL es obligatoria' });
 
@@ -969,7 +970,7 @@ app.get('/api/get-history', async (req, res) => {
 });
 
 // --- RUTA 1: ELIMINAR UN SOLO SORTEO POR ID ---
-app.post('/api/delete-history-item', verificarToken, async (req, res) => {
+app.post('/api/delete-history-item', verificarTokenOpcional, async (req, res) => {
     try {
         const { id, deviceId } = req.body;
         if (!id || !deviceId) return res.status(400).json({ error: "Faltan parámetros" });
@@ -983,7 +984,7 @@ app.post('/api/delete-history-item', verificarToken, async (req, res) => {
 });
 
 // --- RUTA 2: VACIAR HISTORIAL (COMPLETO O POR MÁQUINA) ---
-app.post('/api/clear-history', verificarToken, async (req, res) => {
+app.post('/api/clear-history', verificarTokenOpcional, async (req, res) => {
     try {
         const { deviceId, maquina } = req.body;
         if (!deviceId) return res.status(400).json({ error: "Falta el identificador" });
