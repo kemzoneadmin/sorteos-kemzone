@@ -5,6 +5,7 @@ dns.setDefaultResultOrder('ipv4first'); // 🚀 OBLIGA A USAR IPV4 (Cura el erro
 const express = require('express');
 const { ApifyClient } = require('apify-client');
 // ... (el resto de tus imports siguen igual)
+const crypto = require('crypto');
 const cors = require('cors');
 const axios = require('axios');
 const path = require('path');
@@ -101,6 +102,22 @@ app.use(express.urlencoded({ extended: true, limit: '15mb' }));
 app.get('/', (req, res) => {
     res.send('Base del servidor de KemZone activa y corriendo.');
 });
+
+// EL GUARDIA DE SEGURIDAD
+const verificarToken = (req, res, next) => {
+    const token = req.headers['authorization'];
+    
+    // Si no trae pulsera (token), lo rebotamos
+    if (!token) return res.status(403).json({ error: 'Acceso denegado. Falta la pulsera VIP.' });
+
+    // Leemos la pulsera
+    const tokenLimpio = token.split(" ")[1]; 
+    jwt.verify(tokenLimpio, process.env.JWT_SECRET, (err, decoded) => {
+        if (err) return res.status(401).json({ error: 'Pulsera inválida o caducada.' });
+        req.user = decoded; // Identificamos quién es
+        next(); // Lo dejamos pasar
+    });
+};
 
 // 🎛️ FUNCIONES DE MINERÍA PROFUNDA PARA EVITAR LLAVES VACÍAS EN TIKTOK
 function extraerAvatarDinamicamente(obj) {
@@ -484,7 +501,7 @@ function calcularCostoTokemsServidor(total) {
     return 48 + bloquesExtras;
 }
 
-app.post('/api/comments', async (req, res) => {
+app.post('/api/comments', verificarToken, async (req, res) => {
     const { url, maxComments, deviceId, costoTokens } = req.body;
     if (!url) return res.status(400).json({ error: 'La URL es obligatoria' });
 
@@ -492,10 +509,12 @@ app.post('/api/comments', async (req, res) => {
     const limiteSeguro = parseInt(maxComments) || 300;
     const costoReal = parseInt(costoTokens) || 0;
 
-    try {
+try {
         console.log(`\n[📥] Extracción masiva en marcha (${esTikTok ? 'TikTok' : 'Instagram'}) para: ${url}`);
         
         let nuevoSaldoDefinitivo = 0;
+        let tokensCobrados = 0; // 👈 NUEVO: Memoria de cuánto cobramos
+        let usuarioAfectado = null; // 👈 NUEVO: Memoria de a quién le cobramos
 
         // 💰 1. DÉBITO INICIAL DE TOKEMS
         if (deviceId && costoReal > 0) {
@@ -507,6 +526,8 @@ app.post('/api/comments', async (req, res) => {
                     usuario.tokems = Math.max(0, (usuario.tokems || 0) - costoReal);
                     await usuario.save();
                     nuevoSaldoDefinitivo = usuario.tokems;
+                    tokensCobrados = costoReal; // 👈 Guardamos el monto
+                    usuarioAfectado = { tipo: 'user', doc: usuario }; // 👈 Guardamos el usuario
                     console.log(`[🪙] Cobrado x${costoReal} Tokems a la Cuenta: ${identificadorLimpio}. Restan: ${nuevoSaldoDefinitivo}`);
                 }
             } else {
@@ -515,6 +536,8 @@ app.post('/api/comments', async (req, res) => {
                     registroInvitado.tokens = Math.max(0, (registroInvitado.tokens || 0) - costoReal);
                     await registroInvitado.save();
                     nuevoSaldoDefinitivo = registroInvitado.tokens;
+                    tokensCobrados = costoReal; // 👈 Guardamos el monto
+                    usuarioAfectado = { tipo: 'guest', doc: registroInvitado }; // 👈 Guardamos el usuario
                     console.log(`[🪙] Cobrado x${costoReal} Tokems al Dispositivo: ${identificadorLimpio}. Restan: ${nuevoSaldoDefinitivo}`);
                 }
             }
@@ -641,7 +664,19 @@ app.post('/api/comments', async (req, res) => {
             reembolso: tokemsReembolsados
         });
 
-    } catch (error) {
+} catch (error) {
+        // 🔥 ROLLBACK DE EMERGENCIA SI APIFY EXPLOTA
+        if (typeof tokensCobrados !== 'undefined' && tokensCobrados > 0 && typeof usuarioAfectado !== 'undefined' && usuarioAfectado) {
+            if (usuarioAfectado.tipo === 'user') {
+                usuarioAfectado.doc.tokems += tokensCobrados;
+                await usuarioAfectado.doc.save();
+            } else {
+                usuarioAfectado.doc.tokens += tokensCobrados;
+                await usuarioAfectado.doc.save();
+            }
+            console.log(`[🔄 DEVOLUCIÓN] Devueltos ${tokensCobrados} Tokems por caída de API.`);
+        }
+        
         console.error('❌ Error crítico en /api/comments:', error);
         return res.status(500).json({ error: 'Error en Apify: ' + error.message });
     }
@@ -833,7 +868,7 @@ app.get('/api/get-history', async (req, res) => {
 });
 
 // --- RUTA 1: ELIMINAR UN SOLO SORTEO POR ID ---
-app.post('/api/delete-history-item', async (req, res) => {
+app.post('/api/delete-history-item', verificarToken, async (req, res) => {
     try {
         const { id, deviceId } = req.body;
         if (!id || !deviceId) return res.status(400).json({ error: "Faltan parámetros" });
@@ -847,7 +882,7 @@ app.post('/api/delete-history-item', async (req, res) => {
 });
 
 // --- RUTA 2: VACIAR HISTORIAL (COMPLETO O POR MÁQUINA) ---
-app.post('/api/clear-history', async (req, res) => {
+app.post('/api/clear-history', verificarToken, async (req, res) => {
     try {
         const { deviceId, maquina } = req.body;
         if (!deviceId) return res.status(400).json({ error: "Falta el identificador" });
@@ -994,94 +1029,6 @@ app.post('/api/clear-transactions', async (req, res) => {
         res.json({ success: true });
     } catch (error) {
         res.status(500).json({ error: 'Error al vaciar transacciones.' });
-    }
-});
-
-// =================================================================
-// 7. ENDPOINT: WEBHOOK DE SHOPIFY (MANTENLO IGUAL A COMO LO TIENES)
-// =================================================================
-app.post('/api/shopify-webhook', async (req, res) => {
-    try {
-        const order = req.body;
-
-        let deviceId = null;
-        
-        const atributos = order.note_attributes || [];
-        const deviceIdAttr = atributos.find(attr => attr.name === '_deviceId');
-        if (deviceIdAttr) deviceId = deviceIdAttr.value;
-
-        if (!deviceId && order.line_items && order.line_items.length > 0) {
-            const props = order.line_items[0].properties || [];
-            const propAttr = props.find(p => p.name === '_deviceId');
-            if (propAttr) deviceId = propAttr.value;
-        }
-
-        if (!deviceId || deviceId === 'null' || deviceId === 'undefined') {
-            console.log("⚠️ Webhook ignorado: No se detectó un deviceId válido.");
-            return res.status(200).send("Pedido sin deviceId"); 
-        }
-
-        console.log(`🛒 ¡Pedido pagado detectado para el identificador: ${deviceId}!`);
-
-        let tokensAAgregar = 0;
-        const lineItems = order.line_items || [];
-
-        lineItems.forEach(item => {
-            const variantIdString = String(item.variant_id);
-            const cantidadComprada = item.quantity || 1;
-
-            if (TOKENS_POR_VARIANTE[variantIdString]) {
-                const tokensDelPlan = TOKENS_POR_VARIANTE[variantIdString];
-                tokensAAgregar += (tokensDelPlan * cantidadComprada);
-            }
-        });
-
-        if (tokensAAgregar === 0) {
-            console.log("⚠️ El pedido no contenía ninguna variante de Tokems registrada.");
-            return res.status(200).send("No hay tokens que sumar");
-        }
-
-        // =================================================================
-        // 🦸‍♂️ PASO 3: BÚSQUEDA INTELIGENTE (CUENTA VS INVITADO)
-        // =================================================================
-        const identificadorLimpio = deviceId.trim().toLowerCase();
-        
-        // Primero intentamos buscar si el deviceId es el correo de un Usuario registrado
-        let usuarioCuenta = await User.findOne({ email: identificadorLimpio });
-
-if (usuarioCuenta) {
-            // Si es un usuario con cuenta iniciada, le sumamos los Tokems directamente a su perfil
-            usuarioCuenta.tokems = (usuarioCuenta.tokems || 0) + tokensAAgregar;
-            await usuarioCuenta.save();
-            console.log(`✅ Éxito (Cuenta): Se le sumaron ${tokensAAgregar} Tokems al usuario registrado ${identificadorLimpio}. Nuevo saldo: ${usuarioCuenta.tokems}`);
-        } else {
-            // Si no tiene cuenta, manejamos el saldo de invitado en la colección Balance tradicional
-            let registroInvitado = await Balance.findOne({ deviceId: deviceId });
-            
-            if (!registroInvitado) {
-                registroInvitado = new Balance({ deviceId: deviceId, tokens: 0 });
-            }
-            
-            registroInvitado.tokens += tokensAAgregar;
-            await registroInvitado.save();
-            console.log(`✅ Éxito (Invitado): Se le sumaron ${tokensAAgregar} Tokems al dispositivo anónimo ${deviceId}. Nuevo saldo: ${registroInvitado.tokens}`);
-        }
-
-        // 📝 Registrar la compra en el historial de transacciones
-        const nuevaTx = new Transaction({
-            deviceId: identificadorLimpio,
-            tipo: 'Compra',
-            tokens: tokensAAgregar,
-            precio: order.total_price ? `$${order.total_price}` : '',
-            detalles: `Compra Shopify #${order.order_number || order.id || ''}`
-        });
-        await nuevaTx.save();
-
-        return res.status(200).send("Webhook procesado con éxito");
-
-    } catch (error) {
-        console.error("❌ Error procesando el Webhook de Shopify:", error);
-        return res.status(500).send("Error interno del servidor");
     }
 });
 
