@@ -95,6 +95,107 @@ const client = new ApifyClient({
     token: process.env.APIFY_TOKEN
 });
 
+// =================================================================
+// 7. ENDPOINT: WEBHOOK DE SHOPIFY (BLINDADO CON HMAC)
+// =================================================================
+// IMPORTANTE: Esta ruta debe ir ANTES de los app.use(express.json())
+app.post('/api/shopify-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+    try {
+        const hmac = req.header('X-Shopify-Hmac-Sha256');
+        const secret = process.env.SHOPIFY_SECRET; 
+
+        // 1. Calculamos el sello matemático con el mensaje intacto
+        const hash = crypto
+            .createHmac('sha256', secret)
+            .update(req.body, 'utf8', 'hex')
+            .digest('base64');
+
+        // 2. Si los sellos no coinciden, rebotamos al atacante
+        if (hash !== hmac) {
+            console.log('⚠️ Intento de recarga de Tokems FALSA detectado.');
+            return res.status(401).send('Firma de Shopify inválida');
+        }
+
+        // 3. Si el sello es real, convertimos el mensaje a formato entendible
+        const order = JSON.parse(req.body.toString());
+
+        // --- A PARTIR DE AQUÍ ES TU LÓGICA ORIGINAL ---
+        let deviceId = null;
+        
+        const atributos = order.note_attributes || [];
+        const deviceIdAttr = atributos.find(attr => attr.name === '_deviceId');
+        if (deviceIdAttr) deviceId = deviceIdAttr.value;
+
+        if (!deviceId && order.line_items && order.line_items.length > 0) {
+            const props = order.line_items[0].properties || [];
+            const propAttr = props.find(p => p.name === '_deviceId');
+            if (propAttr) deviceId = propAttr.value;
+        }
+
+        if (!deviceId || deviceId === 'null' || deviceId === 'undefined') {
+            console.log("⚠️ Webhook ignorado: No se detectó un deviceId válido.");
+            return res.status(200).send("Pedido sin deviceId"); 
+        }
+
+        console.log(`🛒 ¡Pedido pagado detectado para el identificador: ${deviceId}!`);
+
+        let tokensAAgregar = 0;
+        const lineItems = order.line_items || [];
+
+        lineItems.forEach(item => {
+            const variantIdString = String(item.variant_id);
+            const cantidadComprada = item.quantity || 1;
+
+            if (TOKENS_POR_VARIANTE[variantIdString]) {
+                const tokensDelPlan = TOKENS_POR_VARIANTE[variantIdString];
+                tokensAAgregar += (tokensDelPlan * cantidadComprada);
+            }
+        });
+
+        if (tokensAAgregar === 0) {
+            console.log("⚠️ El pedido no contenía ninguna variante de Tokems registrada.");
+            return res.status(200).send("No hay tokens que sumar");
+        }
+
+        const identificadorLimpio = deviceId.trim().toLowerCase();
+        
+        // Buscamos si es cuenta registrada o invitado
+        let usuarioCuenta = await User.findOne({ email: identificadorLimpio });
+
+        if (usuarioCuenta) {
+            usuarioCuenta.tokems = (usuarioCuenta.tokems || 0) + tokensAAgregar;
+            await usuarioCuenta.save();
+            console.log(`✅ Éxito (Cuenta): Se le sumaron ${tokensAAgregar} Tokems al usuario registrado ${identificadorLimpio}. Nuevo saldo: ${usuarioCuenta.tokems}`);
+        } else {
+            let registroInvitado = await Balance.findOne({ deviceId: deviceId });
+            
+            if (!registroInvitado) {
+                registroInvitado = new Balance({ deviceId: deviceId, tokens: 0 });
+            }
+            
+            registroInvitado.tokens += tokensAAgregar;
+            await registroInvitado.save();
+            console.log(`✅ Éxito (Invitado): Se le sumaron ${tokensAAgregar} Tokems al dispositivo anónimo ${deviceId}. Nuevo saldo: ${registroInvitado.tokens}`);
+        }
+
+        // Registramos la transacción
+        const nuevaTx = new Transaction({
+            deviceId: identificadorLimpio,
+            tipo: 'Compra',
+            tokens: tokensAAgregar,
+            precio: order.total_price ? `$${order.total_price}` : '',
+            detalles: `Compra Shopify #${order.order_number || order.id || ''}`
+        });
+        await nuevaTx.save();
+
+        return res.status(200).send("Webhook procesado con éxito");
+
+    } catch (error) {
+        console.error("❌ Error procesando el Webhook de Shopify:", error);
+        return res.status(500).send("Error interno del servidor");
+    }
+});
+
 app.use(cors());
 app.use(express.json({ limit: '15mb' }));
 app.use(express.urlencoded({ extended: true, limit: '15mb' }));
