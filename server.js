@@ -865,7 +865,7 @@ const limiteSeguro = techoSeguro;
 });
 
 // =================================================================
-// 3. PROXY DE IMÁGENES CENTRALIZADO CON CAMUFLAJE ANTI-BLOQUEO 403
+// 3. PROXY DE IMÁGENES CENTRALIZADO (AMPLIADO Y ANTI-403)
 // =================================================================
 app.get('/api/proxy-image', async (req, res) => {
     let imageUrl = req.query.url;
@@ -880,10 +880,11 @@ app.get('/api/proxy-image', async (req, res) => {
         return res.sendFile(path.join(__dirname, imageUrl));
     }
 
-    // 🔒 Lista blanca de dominios oficiales permitidos (Instagram, TikTok, CDN de Shopify)
+    // 🔒 Lista blanca ampliada con todos los CDNs conocidos de Instagram, TikTok y Shopify
     const dominiosPermitidos = [
-        'cdninstagram.com', 'fbcdn.net', 'instagram.com',
-        'tiktokcdn.com', 'tiktokcdn-us.com', 'byteoversea.com', 'ibytedtos.com',
+        'cdninstagram.com', 'fbcdn.net', 'instagram.com', 'akamaized.net', 'akamaihd.net',
+        'tiktokcdn.com', 'tiktokcdn-us.com', 'tiktokcdn-eu.com', 'tiktokv.com', 'byteoversea.com', 
+        'ibytedtos.com', 'bytedance.com', 'ttwstatic.com', 'musical.ly',
         'shopify.com', 'shopifycdn.com'
     ];
 
@@ -892,12 +893,15 @@ app.get('/api/proxy-image', async (req, res) => {
         return res.redirect('https://cdn.shopify.com/s/files/1/0780/8444/0222/files/blank-profile-picture-973460_640.webp?v=1787703095');
     }
 
-    // 🎯 Detectar de qué red social viene la imagen para colocar el camuflaje correcto
     const esInstagram = imageUrl.includes('cdninstagram.com') || imageUrl.includes('fbcdn.net') || imageUrl.includes('instagram.com');
     
     const customHeaders = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, Gecko) Chrome/126.0.0.0 Safari/537.36',
+        'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+        'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
+        'Sec-Fetch-Dest': 'image',
+        'Sec-Fetch-Mode': 'no-cors',
+        'Sec-Fetch-Site': 'cross-site'
     };
 
     if (esInstagram) {
@@ -914,7 +918,7 @@ app.get('/api/proxy-image', async (req, res) => {
             method: 'GET',
             responseType: 'arraybuffer',
             headers: customHeaders,
-            timeout: 12000
+            timeout: 10000
         });
 
         res.set('Content-Type', response.headers['content-type'] || 'image/jpeg');
@@ -922,7 +926,6 @@ app.get('/api/proxy-image', async (req, res) => {
         res.set('Cache-Control', 'public, max-age=86400');
         return res.send(response.data);
     } catch (error) {
-        console.error('Error cargando la imagen remota mediante Proxy:', error.message);
         return res.redirect(`https://cdn.shopify.com/s/files/1/0780/8444/0222/files/blank-profile-picture-973460_640.webp?v=1787703095`);
     }
 });
