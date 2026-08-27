@@ -446,7 +446,7 @@ app.post('/api/login', authLimiter, async (req, res) => {
 });
 
 // =================================================================
-// 🔄 ENDPOINT: FUSIONAR SALDO DE TOKEMS (PREVISUALIZACIONES INDEPENDIENTES)
+// 🔄 ENDPOINT: FUSIONAR SALDO, HISTORIALES Y MOVIMIENTOS A LA CUENTA
 // =================================================================
 app.post('/api/transfer-guest', async (req, res) => {
     const { email, deviceId } = req.body;
@@ -457,7 +457,7 @@ app.post('/api/transfer-guest', async (req, res) => {
         const usuario = await User.findOne({ email: correoLimpio });
         if (!usuario) return res.status(404).json({ error: 'Cuenta no encontrada.' });
 
-        // 🔒 Vaciado atómico: Si dos peticiones entran juntas, solo una se lleva los tokens
+        // 1. 🪙 Transferir Saldo de Tokems de Balance a la Cuenta
         const registroBalance = await Balance.findOneAndUpdate(
             { deviceId: deviceId, tokens: { $gt: 0 } },
             { $set: { tokens: 0 } },
@@ -469,6 +469,19 @@ app.post('/api/transfer-guest', async (req, res) => {
             await usuario.save();
         }
 
+        // 2. 🎟️ Migrar Historial de Sorteos realizados como invitado a la Cuenta
+        await History.updateMany(
+            { deviceId: deviceId },
+            { $set: { deviceId: correoLimpio } }
+        );
+
+        // 3. 💳 Migrar Historial de Transacciones (Compras/Canjes) a la Cuenta
+        await Transaction.updateMany(
+            { deviceId: deviceId },
+            { $set: { deviceId: correoLimpio } }
+        );
+
+        // 4. Conteo de previsualizaciones
         const hoy = new Date().toLocaleDateString();
         let previewCount = 0;
         let userPreview = await Preview.findOne({ deviceId: correoLimpio, date: hoy });
@@ -480,8 +493,8 @@ app.post('/api/transfer-guest', async (req, res) => {
             previewCount 
         });
     } catch (error) {
-        console.error('Error en transferencia:', error);
-        return res.status(500).json({ error: 'Error interno fusionando los balances.' });
+        console.error('Error en transferencia integral:', error);
+        return res.status(500).json({ error: 'Error interno fusionando los balances e historiales.' });
     }
 });
 
