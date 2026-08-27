@@ -464,16 +464,25 @@ app.post('/api/transfer-guest', async (req, res) => {
             { new: false }
         );
 
+        let tokensSumados = 0;
         if (registroBalance && registroBalance.tokens > 0) {
-            usuario.tokems = (usuario.tokems || 0) + registroBalance.tokens;
+            tokensSumados = registroBalance.tokens;
         }
 
-        // 2. 🎨 Transferir y respaldar el Diseño Personalizado si viene de invitado
+        // 2. 🎨 Preparar actualización atómica de cuenta y diseño
+        const updateDoc = {
+            $inc: { tokems: tokensSumados }
+        };
+
         if (customConfig && typeof customConfig === 'object') {
-            usuario.customConfig = customConfig;
+            updateDoc.$set = { customConfig: customConfig };
         }
 
-        await usuario.save();
+        const usuarioActualizado = await User.findOneAndUpdate(
+            { email: correoLimpio },
+            updateDoc,
+            { new: true }
+        );
 
         // 3. 🎟️ Migrar Historial de Sorteos realizados como invitado a la Cuenta
         await History.updateMany(
@@ -481,7 +490,7 @@ app.post('/api/transfer-guest', async (req, res) => {
             { $set: { deviceId: correoLimpio } }
         );
 
-        // 4. 💳 Migrar Historial de Transacciones (Compras/Canjes) a la Cuenta
+        // 4. 💳 Migrar Historial de Transacciones a la Cuenta
         await Transaction.updateMany(
             { deviceId: deviceId },
             { $set: { deviceId: correoLimpio } }
@@ -495,9 +504,9 @@ app.post('/api/transfer-guest', async (req, res) => {
 
         return res.status(200).json({ 
             success: true, 
-            nuevoSaldo: usuario.tokems,
+            nuevoSaldo: usuarioActualizado ? usuarioActualizado.tokems : usuario.tokems,
             previewCount,
-            customConfig: usuario.customConfig 
+            customConfig: usuarioActualizado ? usuarioActualizado.customConfig : usuario.customConfig 
         });
     } catch (error) {
         console.error('Error en transferencia integral:', error);
