@@ -625,8 +625,9 @@ app.post('/api/comments', verificarTokenOpcional, async (req, res) => {
         return 20000 + ((tokens - 48) * 500);
     }
 
-    const techoSeguro = obtenerTechoServidor(costoReal);
-    const limiteSeguro = Math.max(parseInt(maxComments) || 300, techoSeguro);
+// ✅ CÓDIGO CORREGIDO Y SEGURO
+const techoSeguro = obtenerTechoServidor(costoReal);
+const limiteSeguro = techoSeguro;
 
     try {
         console.log(`\n[📥] Extracción masiva en marcha (${esTikTok ? 'TikTok' : 'Instagram'}) para: ${url}`);
