@@ -132,9 +132,19 @@ app.post('/api/shopify-webhook', express.raw({ type: 'application/json' }), asyn
             if (propAttr) deviceId = propAttr.value;
         }
 
-        if (!deviceId || deviceId === 'null' || deviceId === 'undefined') {
+if (!deviceId || deviceId === 'null' || deviceId === 'undefined') {
             console.log("⚠️ Webhook ignorado: No se detectó un deviceId válido.");
             return res.status(200).send("Pedido sin deviceId"); 
+        }
+
+        // 🔒 Evitar duplicación por reintentos automáticos de Shopify
+        const ordenId = String(order.id || order.order_number || '');
+        if (ordenId) {
+            const yaProcesada = await Transaction.findOne({ detalles: new RegExp(ordenId, 'i') });
+            if (yaProcesada) {
+                console.log(`⚠️ Webhook ignorado: La orden #${ordenId} ya fue acreditada anteriormente.`);
+                return res.status(200).send("Orden ya procesada");
+            }
         }
 
         console.log(`🛒 ¡Pedido pagado detectado para el identificador: ${deviceId}!`);
@@ -636,11 +646,16 @@ const limiteSeguro = techoSeguro;
         let tokensCobrados = 0;
         let usuarioAfectado = null;
 
-        // 💰 1. DÉBITO INICIAL DE TOKEMS
+// 💰 1. DÉBITO INICIAL DE TOKEMS (CON VALIDACIÓN DE AUTENTICIDAD)
         if (deviceId && costoReal > 0) {
             const identificadorLimpio = deviceId.trim().toLowerCase();
 
             if (identificadorLimpio.includes('@')) {
+                // 🔒 Seguridad: Si envían un email, debe coincidir con el token de sesión activo
+                if (!req.user || req.user.email.toLowerCase() !== identificadorLimpio) {
+                    return res.status(403).json({ error: 'No tienes autorización para debitar saldo de esta cuenta.' });
+                }
+
                 let usuario = await User.findOne({ email: identificadorLimpio });
                 if (usuario) {
                     usuario.tokems = Math.max(0, (usuario.tokems || 0) - costoReal);
@@ -745,8 +760,8 @@ const limiteSeguro = techoSeguro;
             }
         }
 
-        // 🔄 3. LÓGICA DE REEMBOLSO AUTOMÁTICO TRAS LA LIMPIEZA
-        const costoFinalCalculado = calcularCostoTokemsServidor(listaComentarios.length);
+// 🔄 3. LÓGICA DE REEMBOLSO AUTOMÁTICO TRAS LA LIMPIEZA (0 COMENTARIOS = 0 TOKEMS)
+        const costoFinalCalculado = listaComentarios.length === 0 ? 0 : calcularCostoTokemsServidor(listaComentarios.length);
         let tokemsReembolsados = 0;
 
         if (costoReal > costoFinalCalculado && deviceId) {
@@ -812,6 +827,18 @@ app.get('/api/proxy-image', async (req, res) => {
         return res.sendFile(path.join(__dirname, imageUrl));
     }
 
+    // 🔒 Lista blanca de dominios oficiales permitidos (Instagram, TikTok, CDN de Shopify)
+    const dominiosPermitidos = [
+        'cdninstagram.com', 'fbcdn.net', 'instagram.com',
+        'tiktokcdn.com', 'tiktokcdn-us.com', 'byteoversea.com', 'ibytedtos.com',
+        'shopify.com', 'shopifycdn.com'
+    ];
+
+    const esDominioValido = dominiosPermitidos.some(d => imageUrl.includes(d));
+    if (!esDominioValido) {
+        return res.redirect('https://cdn.shopify.com/s/files/1/0780/8444/0222/files/blank-profile-picture-973460_640.webp?v=1787703095');
+    }
+
     // 🎯 Detectar de qué red social viene la imagen para colocar el camuflaje correcto
     const esInstagram = imageUrl.includes('cdninstagram.com') || imageUrl.includes('fbcdn.net') || imageUrl.includes('instagram.com');
     
@@ -855,23 +882,33 @@ app.post('/api/redeem', async (req, res) => {
     if (!code || !deviceId) return res.status(400).json({ error: 'El código y el identificador son estrictamente requeridos.' });
 
     try {
-        const pin = await Pin.findOne({ code: code.toUpperCase(), used: false });
-        if (!pin) return res.status(400).json({ error: 'El pin introducido no es válido o ya fue canjeado.' });
+        // 🔒 Operación atómica directa en MongoDB: bloquea el pin al instante en el mismo milisegundo
+        const pin = await Pin.findOneAndUpdate(
+            { code: code.trim().toUpperCase(), used: false },
+            { $set: { used: true } },
+            { new: true }
+        );
+
+        if (!pin) {
+            return res.status(400).json({ error: 'El pin introducido no es válido o ya fue canjeado.' });
+        }
 
         const identificadorLimpio = deviceId.trim().toLowerCase();
         let nuevoSaldo = 0;
 
-        // 🌟 CORRECCIÓN: Separamos la lógica de Invitado y Usuario para no crear cuentas sin contraseña
         if (identificadorLimpio.includes('@')) {
-            // Es un Usuario Registrado
             let usuario = await User.findOne({ email: identificadorLimpio });
-            if (!usuario) return res.status(404).json({ error: 'Cuenta no encontrada.' });
+            if (!usuario) {
+                // Si la cuenta no existe, revertimos el pin para no perderlo
+                pin.used = false;
+                await pin.save();
+                return res.status(404).json({ error: 'Cuenta no encontrada.' });
+            }
             
             usuario.tokems = (usuario.tokems || 0) + pin.tokens;
             await usuario.save();
             nuevoSaldo = usuario.tokems;
         } else {
-            // Es un Invitado (Guardamos en la colección Balance)
             let registroInvitado = await Balance.findOne({ deviceId: identificadorLimpio });
             if (!registroInvitado) {
                 registroInvitado = new Balance({ deviceId: identificadorLimpio, tokens: 0 });
@@ -880,9 +917,6 @@ app.post('/api/redeem', async (req, res) => {
             await registroInvitado.save();
             nuevoSaldo = registroInvitado.tokens;
         }
-
-        pin.used = true;
-        await pin.save();
 
         return res.status(200).json({ success: true, tokens: pin.tokens, userTokens: nuevoSaldo });
     } catch (error) {
