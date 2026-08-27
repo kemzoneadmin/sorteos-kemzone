@@ -1004,13 +1004,19 @@ app.post('/api/delete-history-item', verificarTokenOpcional, async (req, res) =>
     }
 });
 
-// --- RUTA 2: VACIAR HISTORIAL (COMPLETO O POR MÁQUINA) ---
 app.post('/api/clear-history', verificarTokenOpcional, async (req, res) => {
     try {
         const { deviceId, maquina } = req.body;
         if (!deviceId) return res.status(400).json({ error: "Falta el identificador" });
 
-        const filtroDB = { deviceId };
+        const identificadorLimpio = deviceId.trim().toLowerCase();
+        const filtroDB = { 
+            $or: [
+                { deviceId: deviceId },
+                { deviceId: identificadorLimpio }
+            ] 
+        };
+
         if (maquina && maquina !== 'Todas') {
             filtroDB.maquina = maquina;
         }
@@ -1117,13 +1123,20 @@ app.get('/api/get-transactions', async (req, res) => {
     }
 });
 
-// 3. Eliminar transacción individual
+// ✅ CÓDIGO CORREGIDO Y SEGURO
 app.post('/api/delete-transaction-item', async (req, res) => {
     try {
         const { id, deviceId } = req.body;
         if (!id || !deviceId) return res.status(400).json({ error: 'Faltan parámetros.' });
 
-        await Transaction.deleteOne({ _id: id });
+        const identificadorLimpio = deviceId.trim().toLowerCase();
+        await Transaction.deleteOne({ 
+            _id: id,
+            $or: [
+                { deviceId: deviceId },
+                { deviceId: identificadorLimpio }
+            ]
+        });
         res.json({ success: true });
     } catch (error) {
         res.status(500).json({ error: 'Error al eliminar la transacción.' });
