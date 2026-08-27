@@ -14,6 +14,19 @@ const bcrypt = require('bcrypt'); // 🔐 Para encriptar contraseñas
 const jwt = require('jsonwebtoken'); // 🔐 Para mantener sesiones activas
 const { Resend } = require('resend'); // 🚀 Activamos el motor de Resend
 const resend = new Resend(process.env.RESEND_API_KEY);
+const rateLimit = require('express-rate-limit');
+
+const previewLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000, // 1 hora
+    max: 20, // Máximo 20 previsualizaciones por IP cada hora
+    message: { error: 'Demasiadas consultas desde esta conexión. Intenta más tarde.' }
+});
+
+const authLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutos
+    max: 10, // Máximo 10 intentos de registro/login
+    message: { error: 'Has superado el límite de intentos. Espera 15 minutos.' }
+});
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -314,7 +327,7 @@ function extraerUsuarioDinamicamente(obj) {
 // =================================================================
 
 // 1. REGISTRO DE USUARIOS + ENVÍO DE CÓDIGO
-app.post('/api/register', async (req, res) => {
+app.post('/api/register', authLimiter, async (req, res) => {
     const { email, password } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'El correo y la contraseña son obligatorios' });
 
@@ -391,7 +404,7 @@ app.post('/api/verify', async (req, res) => {
 });
 
 // 3. INICIO DE SESIÓN (LOGIN)
-app.post('/api/login', async (req, res) => {
+app.post('/api/login', authLimiter, async (req, res) => {
     const { email, password } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'Por favor rellena todos los campos.' });
 
@@ -443,21 +456,18 @@ app.post('/api/transfer-guest', async (req, res) => {
         const usuario = await User.findOne({ email: correoLimpio });
         if (!usuario) return res.status(404).json({ error: 'Cuenta no encontrada.' });
 
-        let saldoATransferir = 0;
-        const registroBalance = await Balance.findOne({ deviceId: deviceId });
-        
-        if (registroBalance && registroBalance.tokens > 0) {
-            saldoATransferir = registroBalance.tokens;
-            registroBalance.tokens = 0; // Vaciamos los bolsillos de Tokems del invitado
-            await registroBalance.save();
-        }
+        // 🔒 Vaciado atómico: Si dos peticiones entran juntas, solo una se lleva los tokens
+        const registroBalance = await Balance.findOneAndUpdate(
+            { deviceId: deviceId, tokens: { $gt: 0 } },
+            { $set: { tokens: 0 } },
+            { new: false }
+        );
 
-        if (saldoATransferir > 0) {
-            usuario.tokems = (usuario.tokems || 0) + saldoATransferir;
+        if (registroBalance && registroBalance.tokens > 0) {
+            usuario.tokems = (usuario.tokems || 0) + registroBalance.tokens;
             await usuario.save();
         }
 
-        // 🚀 OBTENEMOS EL CONTEO INDEPENDIENTE DE LA CUENTA (Sin tocar el del invitado)
         const hoy = new Date().toLocaleDateString();
         let previewCount = 0;
         let userPreview = await Preview.findOne({ deviceId: correoLimpio, date: hoy });
@@ -477,7 +487,7 @@ app.post('/api/transfer-guest', async (req, res) => {
 // =================================================================
 // 1. ENDPOINT: PREVISUALIZACIÓN (TOTALMENTE INDEPENDIENTE)
 // =================================================================
-app.post('/api/preview', async (req, res) => {
+app.post('/api/preview', previewLimiter, async (req, res) => {
     const { url, deviceId } = req.body; 
     // Ya no requerimos hardwareUUID porque no habrá espejo
     if (!url || !deviceId) return res.status(400).json({ error: 'La URL y el deviceId son obligatorios' });
@@ -646,36 +656,41 @@ const limiteSeguro = techoSeguro;
         let tokensCobrados = 0;
         let usuarioAfectado = null;
 
-// 💰 1. DÉBITO INICIAL DE TOKEMS (CON VALIDACIÓN DE AUTENTICIDAD)
-        if (deviceId && costoReal > 0) {
-            const identificadorLimpio = deviceId.trim().toLowerCase();
+// 💰 1. DÉBITO INICIAL DE TOKEMS (BLINDADO CON VALIDACIÓN DE FONDOS)
+        if (!deviceId || costoReal <= 0) {
+            return res.status(400).json({ error: 'Parámetros de cobro inválidos.' });
+        }
 
-            if (identificadorLimpio.includes('@')) {
-                // 🔒 Seguridad: Si envían un email, debe coincidir con el token de sesión activo
-                if (!req.user || req.user.email.toLowerCase() !== identificadorLimpio) {
-                    return res.status(403).json({ error: 'No tienes autorización para debitar saldo de esta cuenta.' });
-                }
+        const identificadorLimpio = deviceId.trim().toLowerCase();
 
-                let usuario = await User.findOne({ email: identificadorLimpio });
-                if (usuario) {
-                    usuario.tokems = Math.max(0, (usuario.tokems || 0) - costoReal);
-                    await usuario.save();
-                    nuevoSaldoDefinitivo = usuario.tokems;
-                    tokensCobrados = costoReal;
-                    usuarioAfectado = { tipo: 'user', doc: usuario };
-                    console.log(`[🪙] Cobrado x${costoReal} Tokems a la Cuenta: ${identificadorLimpio}. Restan: ${nuevoSaldoDefinitivo}`);
-                }
-            } else {
-                let registroInvitado = await Balance.findOne({ deviceId: identificadorLimpio });
-                if (registroInvitado) {
-                    registroInvitado.tokens = Math.max(0, (registroInvitado.tokens || 0) - costoReal);
-                    await registroInvitado.save();
-                    nuevoSaldoDefinitivo = registroInvitado.tokens;
-                    tokensCobrados = costoReal;
-                    usuarioAfectado = { tipo: 'guest', doc: registroInvitado };
-                    console.log(`[🪙] Cobrado x${costoReal} Tokems al Dispositivo: ${identificadorLimpio}. Restan: ${nuevoSaldoDefinitivo}`);
-                }
+        if (identificadorLimpio.includes('@')) {
+            if (!req.user || req.user.email.toLowerCase() !== identificadorLimpio) {
+                return res.status(403).json({ error: 'No tienes autorización para debitar saldo de esta cuenta.' });
             }
+
+            let usuario = await User.findOne({ email: identificadorLimpio });
+            if (!usuario || (usuario.tokems || 0) < costoReal) {
+                return res.status(402).json({ error: 'Saldo insuficiente de Tokems para realizar esta extracción.' });
+            }
+
+            usuario.tokems -= costoReal;
+            await usuario.save();
+            nuevoSaldoDefinitivo = usuario.tokems;
+            tokensCobrados = costoReal;
+            usuarioAfectado = { tipo: 'user', doc: usuario };
+            console.log(`[🪙] Cobrado x${costoReal} Tokems a la Cuenta: ${identificadorLimpio}. Restan: ${nuevoSaldoDefinitivo}`);
+        } else {
+            let registroInvitado = await Balance.findOne({ deviceId: identificadorLimpio });
+            if (!registroInvitado || (registroInvitado.tokens || 0) < costoReal) {
+                return res.status(402).json({ error: 'Saldo insuficiente de Tokems en este dispositivo.' });
+            }
+
+            registroInvitado.tokens -= costoReal;
+            await registroInvitado.save();
+            nuevoSaldoDefinitivo = registroInvitado.tokens;
+            tokensCobrados = costoReal;
+            usuarioAfectado = { tipo: 'guest', doc: registroInvitado };
+            console.log(`[🪙] Cobrado x${costoReal} Tokems al Dispositivo: ${identificadorLimpio}. Restan: ${nuevoSaldoDefinitivo}`);
         }
 
         let listaComentarios = [];
