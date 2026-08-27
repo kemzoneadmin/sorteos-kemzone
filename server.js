@@ -446,10 +446,10 @@ app.post('/api/login', authLimiter, async (req, res) => {
 });
 
 // =================================================================
-// 🔄 ENDPOINT: FUSIONAR SALDO, HISTORIALES Y MOVIMIENTOS A LA CUENTA
+// 🔄 ENDPOINT: FUSIONAR SALDO, HISTORIALES Y DISEÑO A LA CUENTA
 // =================================================================
 app.post('/api/transfer-guest', async (req, res) => {
-    const { email, deviceId } = req.body;
+    const { email, deviceId, customConfig } = req.body;
     if (!email || !deviceId) return res.status(400).json({ error: 'Faltan parámetros.' });
 
     try {
@@ -466,22 +466,28 @@ app.post('/api/transfer-guest', async (req, res) => {
 
         if (registroBalance && registroBalance.tokens > 0) {
             usuario.tokems = (usuario.tokems || 0) + registroBalance.tokens;
-            await usuario.save();
         }
 
-        // 2. 🎟️ Migrar Historial de Sorteos realizados como invitado a la Cuenta
+        // 2. 🎨 Transferir y respaldar el Diseño Personalizado si viene de invitado
+        if (customConfig && typeof customConfig === 'object') {
+            usuario.customConfig = customConfig;
+        }
+
+        await usuario.save();
+
+        // 3. 🎟️ Migrar Historial de Sorteos realizados como invitado a la Cuenta
         await History.updateMany(
             { deviceId: deviceId },
             { $set: { deviceId: correoLimpio } }
         );
 
-        // 3. 💳 Migrar Historial de Transacciones (Compras/Canjes) a la Cuenta
+        // 4. 💳 Migrar Historial de Transacciones (Compras/Canjes) a la Cuenta
         await Transaction.updateMany(
             { deviceId: deviceId },
             { $set: { deviceId: correoLimpio } }
         );
 
-        // 4. Conteo de previsualizaciones
+        // 5. Conteo de previsualizaciones
         const hoy = new Date().toLocaleDateString();
         let previewCount = 0;
         let userPreview = await Preview.findOne({ deviceId: correoLimpio, date: hoy });
@@ -490,11 +496,12 @@ app.post('/api/transfer-guest', async (req, res) => {
         return res.status(200).json({ 
             success: true, 
             nuevoSaldo: usuario.tokems,
-            previewCount 
+            previewCount,
+            customConfig: usuario.customConfig 
         });
     } catch (error) {
         console.error('Error en transferencia integral:', error);
-        return res.status(500).json({ error: 'Error interno fusionando los balances e historiales.' });
+        return res.status(500).json({ error: 'Error interno fusionando los balances, historiales y diseño.' });
     }
 });
 
