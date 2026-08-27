@@ -608,15 +608,32 @@ app.post('/api/comments', verificarTokenOpcional, async (req, res) => {
     if (!url) return res.status(400).json({ error: 'La URL es obligatoria' });
 
     const esTikTok = url.includes('tiktok.com');
-    const limiteSeguro = parseInt(maxComments) || 300;
     const costoReal = parseInt(costoTokens) || 0;
+    
+    // 🔒 Techo máximo calculado de forma segura en servidor
+    function obtenerTechoServidor(tokens) {
+        if (tokens <= 1) return 300;
+        if (tokens === 2) return 600;
+        if (tokens === 3) return 1000;
+        if (tokens === 6) return 2000;
+        if (tokens === 12) return 4000;
+        if (tokens === 24) return 10000;
+        if (tokens === 30) return 12500;
+        if (tokens === 36) return 15000;
+        if (tokens === 42) return 17500;
+        if (tokens === 48) return 20000;
+        return 20000 + ((tokens - 48) * 500);
+    }
 
-try {
+    const techoSeguro = obtenerTechoServidor(costoReal);
+    const limiteSeguro = Math.max(parseInt(maxComments) || 300, techoSeguro);
+
+    try {
         console.log(`\n[📥] Extracción masiva en marcha (${esTikTok ? 'TikTok' : 'Instagram'}) para: ${url}`);
         
         let nuevoSaldoDefinitivo = 0;
-        let tokensCobrados = 0; // 👈 NUEVO: Memoria de cuánto cobramos
-        let usuarioAfectado = null; // 👈 NUEVO: Memoria de a quién le cobramos
+        let tokensCobrados = 0;
+        let usuarioAfectado = null;
 
         // 💰 1. DÉBITO INICIAL DE TOKEMS
         if (deviceId && costoReal > 0) {
@@ -628,8 +645,8 @@ try {
                     usuario.tokems = Math.max(0, (usuario.tokems || 0) - costoReal);
                     await usuario.save();
                     nuevoSaldoDefinitivo = usuario.tokems;
-                    tokensCobrados = costoReal; // 👈 Guardamos el monto
-                    usuarioAfectado = { tipo: 'user', doc: usuario }; // 👈 Guardamos el usuario
+                    tokensCobrados = costoReal;
+                    usuarioAfectado = { tipo: 'user', doc: usuario };
                     console.log(`[🪙] Cobrado x${costoReal} Tokems a la Cuenta: ${identificadorLimpio}. Restan: ${nuevoSaldoDefinitivo}`);
                 }
             } else {
@@ -638,8 +655,8 @@ try {
                     registroInvitado.tokens = Math.max(0, (registroInvitado.tokens || 0) - costoReal);
                     await registroInvitado.save();
                     nuevoSaldoDefinitivo = registroInvitado.tokens;
-                    tokensCobrados = costoReal; // 👈 Guardamos el monto
-                    usuarioAfectado = { tipo: 'guest', doc: registroInvitado }; // 👈 Guardamos el usuario
+                    tokensCobrados = costoReal;
+                    usuarioAfectado = { tipo: 'guest', doc: registroInvitado };
                     console.log(`[🪙] Cobrado x${costoReal} Tokems al Dispositivo: ${identificadorLimpio}. Restan: ${nuevoSaldoDefinitivo}`);
                 }
             }
@@ -689,6 +706,15 @@ try {
             }
 
         } else {
+            let cookiesInstagram = [];
+            try {
+                if (process.env.INSTAGRAM_COOKIES) {
+                    cookiesInstagram = JSON.parse(process.env.INSTAGRAM_COOKIES);
+                }
+            } catch (e) {
+                console.error("Error parseando INSTAGRAM_COOKIES:", e);
+            }
+
             const inputInstagram = {
                 "addParentData": false,
                 "directUrls": [url],
@@ -697,21 +723,7 @@ try {
                 "searchLimit": 10,
                 "searchType": "hashtag",
                 "proxyConfiguration": { "useApifyProxy": true },
-                "loginCookies": [
-                    { "domain": ".instagram.com", "expirationDate": 1789598959.16949, "hostOnly": false, "httpOnly": true, "name": "ps_n", "path": "/", "sameSite": "no_restriction", "secure": true, "session": false, "storeId": null, "value": "1" },
-                    { "domain": ".instagram.com", "expirationDate": 1789450890.42235, "hostOnly": false, "httpOnly": true, "name": "datr", "path": "/", "sameSite": "no_restriction", "secure": true, "session": false, "storeId": null, "value": "CYOZaOgNY_Hhcp-MIwRia-8J" },
-                    { "domain": ".instagram.com", "expirationDate": 1786574960.309325, "hostOnly": false, "httpOnly": false, "name": "ig_nrcb", "path": "/", "sameSite": null, "secure": true, "session": false, "storeId": null, "value": "1" },
-                    { "domain": ".instagram.com", "expirationDate": 1788853357.812318, "hostOnly": false, "httpOnly": false, "name": "ds_user_id", "path": "/", "sameSite": "no_restriction", "secure": true, "session": false, "storeId": null, "value": "27565603979" },
-                    { "domain": ".instagram.com", "expirationDate": 1815637357.812134, "hostOnly": false, "httpOnly": false, "name": "csrftoken", "path": "/", "sameSite": null, "secure": true, "session": false, "storeId": null, "value": "hygekoBl2ZmKzCViih1RZVHUQ5WIjXlw" },
-                    { "domain": ".instagram.com", "expirationDate": 1786426890.422378, "hostOnly": false, "httpOnly": true, "name": "ig_did", "path": "/", "sameSite": "no_restriction", "secure": true, "session": false, "storeId": null, "value": "0A159DEB-E490-40E8-BD4C-868B6A21E403" },
-                    { "domain": ".instagram.com", "expirationDate": 1789598959.169378, "hostOnly": false, "httpOnly": true, "name": "ps_l", "path": "/", "sameSite": "lax", "secure": true, "session": false, "storeId": null, "value": "1" },
-                    { "domain": ".instagram.com", "expirationDate": 1781682156, "hostOnly": false, "httpOnly": false, "name": "wd", "path": "/", "sameSite": "lax", "secure": true, "session": false, "storeId": null, "value": "2048x1018" },
-                    { "domain": ".instagram.com", "expirationDate": 1789598222.929081, "hostOnly": false, "httpOnly": true, "name": "mid", "path": "/", "sameSite": "no_restriction", "secure": true, "session": false, "storeId": null, "value": "aJvCkAALAAFuTvIGIg0Ozqer1w8C" },
-                    { "domain": ".instagram.com", "expirationDate": 1812613351.403508, "hostOnly": false, "httpOnly": true, "name": "sessionid", "value": "27565603979%3ALyOiF1sINhKeH5%3A27%3AAYg_G66zbNllbQVxX1hFvc2pT5HlsrP4fK8QeLTajw" },
-                    { "domain": ".instagram.com", "expirationDate": 1781682156, "hostOnly": false, "httpOnly": false, "name": "dpr", "path": "/", "sameSite": "no_restriction", "secure": true, "session": false, "storeId": null, "value": "1.25" },
-                    { "domain": ".instagram.com", "expirationDate": 1791433469, "hostOnly": false, "httpOnly": false, "name": "ig_lang", "path": "/", "sameSite": null, "secure": false, "session": false, "storeId": null, "value": "es-la" },
-                    { "domain": ".instagram.com", "hostOnly": false, "httpOnly": true, "name": "rur", "path": "/", "sameSite": "lax", "secure": true, "session": true, "storeId": null, "value": "\"MWG\\05427565603979\\0541812613368:01ff035dd4505dbf423e3935e4e05d4f27a8b890269ae06923b7a5287fcd48701949d4b1\"" }
-                ]
+                ...(cookiesInstagram.length > 0 && { "loginCookies": cookiesInstagram })
             };
 
             const run = await client.actor("shu8hvrXbJbY3Eb9W").call(inputInstagram);
@@ -766,8 +778,7 @@ try {
             reembolso: tokemsReembolsados
         });
 
-} catch (error) {
-        // 🔥 ROLLBACK DE EMERGENCIA SI APIFY EXPLOTA
+    } catch (error) {
         if (typeof tokensCobrados !== 'undefined' && tokensCobrados > 0 && typeof usuarioAfectado !== 'undefined' && usuarioAfectado) {
             if (usuarioAfectado.tipo === 'user') {
                 usuarioAfectado.doc.tokems += tokensCobrados;
@@ -975,7 +986,16 @@ app.post('/api/delete-history-item', verificarTokenOpcional, async (req, res) =>
         const { id, deviceId } = req.body;
         if (!id || !deviceId) return res.status(400).json({ error: "Faltan parámetros" });
 
-        await History.findOneAndDelete({ _id: id, deviceId });
+        const identificadorLimpio = deviceId.trim().toLowerCase();
+        
+        await History.findOneAndDelete({
+            _id: id,
+            $or: [
+                { deviceId: deviceId },
+                { deviceId: identificadorLimpio }
+            ]
+        });
+
         res.status(200).json({ success: true });
     } catch (error) {
         console.error("Error eliminando registro:", error);
