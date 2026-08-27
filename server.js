@@ -1098,7 +1098,11 @@ app.post('/api/save-custom-config', async (req, res) => {
         if (!email || !customConfig) return res.status(400).json({ error: "Faltan parámetros" });
 
         const correoLimpio = email.trim().toLowerCase();
-        await User.findOneAndUpdate({ email: correoLimpio }, { customConfig: customConfig });
+        await User.findOneAndUpdate(
+            { email: correoLimpio }, 
+            { $set: { customConfig: customConfig } },
+            { new: true }
+        );
 
         res.status(200).json({ success: true, message: "Diseño guardado en la cuenta" });
     } catch (error) {
