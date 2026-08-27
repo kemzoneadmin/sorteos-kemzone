@@ -515,31 +515,57 @@ app.post('/api/transfer-guest', async (req, res) => {
 });
 
 // =================================================================
-// 1. ENDPOINT: PREVISUALIZACIÓN (TOTALMENTE INDEPENDIENTE)
+// 1. ENDPOINT: PREVISUALIZACIÓN (ABORTABLE EN TIEMPO REAL EN APIFY)
 // =================================================================
 app.post('/api/preview', previewLimiter, async (req, res) => {
     const { url, deviceId } = req.body; 
     if (!url || !deviceId) return res.status(400).json({ error: 'La URL y el deviceId son obligatorios' });
 
-    // 🔒 Freno previo: Si no es TikTok ni Instagram, no gastamos saldo de Apify
     if (!url.includes('tiktok.com') && !url.includes('instagram.com')) {
         return res.status(400).json({ error: 'El enlace debe pertenecer a una publicación de Instagram o TikTok.' });
     }
 
     const hoy = new Date().toLocaleDateString();
     const identificadorLimpio = deviceId.trim().toLowerCase();
+    let apifyRunId = null;
+    let canceladoPorCliente = false;
+
+    // 🛑 Listener: Si el usuario presiona "Volver" o "X", cancela el Actor de Apify al instante
+    req.on('close', async () => {
+        if (!res.writableEnded) {
+            canceladoPorCliente = true;
+            console.log(`[🛑] Previsualización cancelada por el usuario: ${url}`);
+            
+            // Revertir el conteo diario
+            try {
+                let roll = await Preview.findOne({ deviceId: identificadorLimpio, date: hoy });
+                if (roll && roll.count > 0) {
+                    roll.count--;
+                    await roll.save();
+                }
+            } catch(e) {}
+
+            // Abortar la ejecución en Apify para frenar el gasto
+            if (apifyRunId) {
+                try {
+                    await client.run(apifyRunId).abort();
+                    console.log(`[🛑] Ejecución de Apify ${apifyRunId} detenida con éxito.`);
+                } catch(e) {
+                    console.log("Aviso al abortar en Apify:", e.message);
+                }
+            }
+        }
+    });
 
     try {
         const esCuenta = identificadorLimpio.includes('@');
         const limiteMaximo = esCuenta ? 6 : 3;
 
-        // Buscamos el registro independiente directamente en MongoDB
         let registro = await Preview.findOne({ deviceId: identificadorLimpio, date: hoy });
         if (!registro) {
             registro = new Preview({ deviceId: identificadorLimpio, date: hoy, count: 0 });
         }
 
-        // 🧼 LIMPIEZA DE SEGURIDAD
         if (registro.count > limiteMaximo) {
             registro.count = limiteMaximo;
             await registro.save();
@@ -554,8 +580,6 @@ app.post('/api/preview', previewLimiter, async (req, res) => {
 
         const esTikTok = url.includes('tiktok.com');
         console.log(`\n[🔍] Procesando previsualización (${esTikTok ? 'TikTok' : 'Instagram'}): ${url}`);
-        
-        // ... (De aquí hacia abajo, deja intacto el código de Apify)
 
         if (esTikTok) {
             const inputTikTok = {
@@ -566,7 +590,13 @@ app.post('/api/preview', previewLimiter, async (req, res) => {
                 "extractTranscripts": false
             };
 
-            const run = await client.actor("clockworks/tiktok-scraper").call(inputTikTok);
+            // Inicia el actor guardando su ID para permitir abortos
+            const run = await client.actor("clockworks/tiktok-scraper").start(inputTikTok);
+            apifyRunId = run.id;
+
+            await client.run(run.id).waitForFinish();
+            if (canceladoPorCliente) return;
+
             const { items } = await client.dataset(run.defaultDatasetId).listItems();
 
             if (!items || items.length === 0) {
@@ -598,7 +628,12 @@ app.post('/api/preview', previewLimiter, async (req, res) => {
                 "addParentData": false
             };
 
-            const run = await client.actor("shu8hvrXbJbY3Eb9W").call(inputInstagram);
+            const run = await client.actor("shu8hvrXbJbY3Eb9W").start(inputInstagram);
+            apifyRunId = run.id;
+
+            await client.run(run.id).waitForFinish();
+            if (canceladoPorCliente) return;
+
             const { items } = await client.dataset(run.defaultDatasetId).listItems();
 
             if (!items || items.length === 0) {
@@ -624,15 +659,17 @@ app.post('/api/preview', previewLimiter, async (req, res) => {
             });
         }
     } catch (error) {
-        try {
-            let roll = await Preview.findOne({ deviceId: identificadorLimpio, date: hoy });
-            if (roll && roll.count > 0) {
-                roll.count--;
-                await roll.save();
-            }
-        } catch(e) {}
-        console.error('❌ Error en /api/preview:', error.message);
-        return res.status(500).json({ error: error.message });
+        if (!canceladoPorCliente) {
+            try {
+                let roll = await Preview.findOne({ deviceId: identificadorLimpio, date: hoy });
+                if (roll && roll.count > 0) {
+                    roll.count--;
+                    await roll.save();
+                }
+            } catch(e) {}
+            console.error('❌ Error en /api/preview:', error.message);
+            return res.status(500).json({ error: error.message });
+        }
     }
 });
 
