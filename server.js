@@ -29,6 +29,7 @@ const authLimiter = rateLimit({
 });
 
 const app = express();
+app.set('trust proxy', 1); // 🚀 Permite a express-rate-limit leer la IP real del cliente en Railway
 const port = process.env.PORT || 3000;
 
 // 🔗 CONEXIÓN CENTRAL A BASE DE DATOS
@@ -150,10 +151,10 @@ if (!deviceId || deviceId === 'null' || deviceId === 'undefined') {
             return res.status(200).send("Pedido sin deviceId"); 
         }
 
-        // 🔒 Evitar duplicación por reintentos automáticos de Shopify
-        const ordenId = String(order.id || order.order_number || '');
+// 🔒 Evitar duplicación por reintentos automáticos de Shopify (Coincidencia exacta)
+        const ordenId = String(order.order_number || order.id || '');
         if (ordenId) {
-            const yaProcesada = await Transaction.findOne({ detalles: new RegExp(ordenId, 'i') });
+            const yaProcesada = await Transaction.findOne({ detalles: `Compra Shopify #${ordenId}` });
             if (yaProcesada) {
                 console.log(`⚠️ Webhook ignorado: La orden #${ordenId} ya fue acreditada anteriormente.`);
                 return res.status(200).send("Orden ya procesada");
@@ -380,7 +381,7 @@ app.post('/api/register', authLimiter, async (req, res) => {
 });
 
 // 2. VERIFICACIÓN DEL CÓDIGO DE REGISTRO
-app.post('/api/verify', async (req, res) => {
+app.post('/api/verify', authLimiter, async (req, res) => {
     const { email, code } = req.body;
     if (!email || !code) return res.status(400).json({ error: 'El correo y el código son estrictamente requeridos.' });
 
@@ -489,8 +490,12 @@ app.post('/api/transfer-guest', async (req, res) => {
 // =================================================================
 app.post('/api/preview', previewLimiter, async (req, res) => {
     const { url, deviceId } = req.body; 
-    // Ya no requerimos hardwareUUID porque no habrá espejo
     if (!url || !deviceId) return res.status(400).json({ error: 'La URL y el deviceId son obligatorios' });
+
+    // 🔒 Freno previo: Si no es TikTok ni Instagram, no gastamos saldo de Apify
+    if (!url.includes('tiktok.com') && !url.includes('instagram.com')) {
+        return res.status(400).json({ error: 'El enlace debe pertenecer a una publicación de Instagram o TikTok.' });
+    }
 
     const hoy = new Date().toLocaleDateString();
     const identificadorLimpio = deviceId.trim().toLowerCase();
@@ -626,6 +631,10 @@ function calcularCostoTokemsServidor(total) {
 app.post('/api/comments', verificarTokenOpcional, async (req, res) => {
     const { url, maxComments, deviceId, costoTokens } = req.body;
     if (!url) return res.status(400).json({ error: 'La URL es obligatoria' });
+
+    if (!url.includes('tiktok.com') && !url.includes('instagram.com')) {
+        return res.status(400).json({ error: 'El enlace debe pertenecer a una publicación de Instagram o TikTok.' });
+    }
 
     const esTikTok = url.includes('tiktok.com');
     const costoReal = parseInt(costoTokens) || 0;
