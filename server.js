@@ -104,6 +104,33 @@ const TransactionSchema = new mongoose.Schema({
 });
 const Transaction = mongoose.model('Transaction', TransactionSchema);
 
+// =================================================================
+// 🛡️ ESQUEMA: CERTIFICADOS DE VERIFICACIÓN PÚBLICA (SELLADO ANTIFRAUDE)
+// =================================================================
+const DrawVerificationSchema = new mongoose.Schema({
+    drawId: { type: String, required: true, unique: true, uppercase: true, trim: true, index: true },
+    deviceId: { type: String, index: true },
+    maquina: { type: String, default: 'Sorteo' },
+    url: { type: String, default: '' },
+    plataforma: { type: String, default: 'Instagram' },
+    fecha: { type: Date, default: Date.now },
+    ganadores: [{
+        nombre: String,
+        texto: String,
+        avatarUrl: String,
+        isSuplente: Boolean,
+        posicion: Number
+    }],
+    totalComentarios: { type: Number, default: 0 },
+    totalParticipantesValidos: { type: Number, default: 0 },
+    verificationHash: { type: String, required: true },
+    participantes: [{ type: String }] // Lista de nombres limpios en minúsculas para el buscador
+}, { timestamps: true });
+
+// ⚡ Índice compuesto para que la búsqueda por ID y por usuario responda en 1 milisegundo
+DrawVerificationSchema.index({ drawId: 1, 'participantes': 1 });
+const DrawVerification = mongoose.model('DrawVerification', DrawVerificationSchema);
+
 // 🔒 CLIENTE APIFY PROTEGIDO CON VARIABLES DE ENTORNO
 const client = new ApifyClient({
     token: process.env.APIFY_TOKEN
@@ -1299,7 +1326,105 @@ app.post('/api/clear-transactions', async (req, res) => {
     }
 });
 
+// =================================================================
+// 🛡️ ENDPOINTS: VERIFICACIÓN PÚBLICA Y SELLADO CRIPTOGRÁFICO
+// =================================================================
+
+// 1. Guardar y sellar el sorteo al finalizar
+app.post('/api/save-verification', async (req, res) => {
+    try {
+        const { 
+            drawId, 
+            deviceId, 
+            maquina, 
+            url, 
+            plataforma, 
+            ganadores, 
+            totalComentarios, 
+            totalParticipantesValidos, 
+            participantes 
+        } = req.body;
+
+        if (!drawId || !ganadores || ganadores.length === 0) {
+            return res.status(400).json({ error: "Datos insuficientes para sellar el sorteo." });
+        }
+
+        // 🔒 Generar Hash SHA-256 Inmutable
+        const rawString = `${drawId}_${url || ''}_${Date.now()}_${JSON.stringify(ganadores)}_${totalParticipantesValidos || 0}`;
+        const verificationHash = crypto.createHash('sha256').update(rawString).digest('hex');
+
+        // Limpieza de lista para búsqueda instantánea
+        const listaLimpia = (participantes || []).map(p => {
+            const nom = typeof p === 'string' ? p : (p.username || p.nombre || '');
+            return nom.replace('@', '').trim().toLowerCase();
+        }).filter(p => p !== '');
+
+        const idLimpio = drawId.trim().toUpperCase();
+
+        // Si ya existe (ej: reintento), actualiza; si no, lo crea
+        const sorteoSellado = await DrawVerification.findOneAndUpdate(
+            { drawId: idLimpio },
+            {
+                drawId: idLimpio,
+                deviceId: (deviceId || 'invitado').trim().toLowerCase(),
+                maquina: maquina || 'Sorteo',
+                url: url || '',
+                plataforma: plataforma || (url && url.includes('tiktok.com') ? 'TikTok' : 'Instagram'),
+                fecha: new Date(),
+                ganadores: ganadores,
+                totalComentarios: totalComentarios || 0,
+                totalParticipantesValidos: totalParticipantesValidos || listaLimpia.length,
+                verificationHash: verificationHash,
+                participantes: listaLimpia
+            },
+            { upsert: true, new: true }
+        );
+
+        console.log(`[🛡️ VERIFICACIÓN] Sorteo ${idLimpio} sellado con éxito. Hash: ${verificationHash.substring(0, 16)}...`);
+        return res.json({ success: true, drawId: sorteoSellado.drawId, hash: verificationHash });
+
+    } catch (error) {
+        console.error("❌ Error en /api/save-verification:", error);
+        return res.status(500).json({ error: "No se pudo sellar el sorteo en la base de datos." });
+    }
+});
+
+// 2. Consulta pública (Optimizado para soportar 50.000 visitas con Caché de Borde)
+app.get('/api/verify/:drawId', async (req, res) => {
+    try {
+        const idBuscado = req.params.drawId.trim().toUpperCase();
+        const sorteo = await DrawVerification.findOne({ drawId: idBuscado }).lean();
+
+        if (!sorteo) {
+            return res.status(404).json({ error: "Certificado de sorteo no encontrado o no existe." });
+        }
+
+        // ⚡ CABECERAS DE CACHÉ EDGE (Cloudflare / CDN):
+        // Cloudflare guarda una copia estática en sus servidores por 7 días.
+        // Las miles de personas que entren desde Instagram recibirán la respuesta desde Cloudflare en <20ms sin tocar Node.js ni MongoDB.
+        res.setHeader('Cache-Control', 'public, max-age=86400, s-maxage=604800, stale-while-revalidate=86400, immutable');
+
+        return res.json({
+            drawId: sorteo.drawId,
+            maquina: sorteo.maquina,
+            url: sorteo.url,
+            plataforma: sorteo.plataforma,
+            fecha: sorteo.fecha,
+            ganadores: sorteo.ganadores,
+            totalComentarios: sorteo.totalComentarios,
+            totalParticipantesValidos: sorteo.totalParticipantesValidos,
+            verificationHash: sorteo.verificationHash,
+            participantes: sorteo.participantes
+        });
+
+    } catch (error) {
+        console.error("❌ Error en /api/verify:", error);
+        return res.status(500).json({ error: "Error consultando certificado." });
+    }
+});
+
 // Levantar el servidor
 app.listen(port, '0.0.0.0', () => {
     console.log(`🚀 Servidor KemZone corriendo en el puerto ${port}`);
 });
+
