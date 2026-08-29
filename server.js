@@ -1104,7 +1104,9 @@ app.post('/api/save-history', async (req, res) => {
     try {
         const { deviceId, drawId, maquina, url, ganadores } = req.body;
         
-        const nuevoSorteo = new History({ deviceId, maquina, url, ganadores });
+        const nuevoSorteo = new History({ 
+            deviceId, 
+            drawId: drawId ? drawId.trim().toUpperCase() : '',maquina, url, ganadores });
         await nuevoSorteo.save(); // ¡Guardado en la base de datos!
         
         res.status(200).json({ success: true });
