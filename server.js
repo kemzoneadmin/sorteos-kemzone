@@ -78,6 +78,7 @@ const User = mongoose.model('User', UserSchema);
 // =================================================================
 const historySchema = new mongoose.Schema({
     deviceId: { type: String, required: true }, // Guarda el correo o UUID
+    drawId: { type: String, uppercase: true, trim: true },
     maquina: { type: String, required: true },  // Ruleta, Slots, Vasos, etc.
     url: { type: String },                      // El enlace del post de TikTok/Ig
     fecha: { type: Date, default: Date.now },   // Fecha exacta automática
@@ -1101,7 +1102,7 @@ app.get('/api/get-balance', async (req, res) => {
 // PUERTA 1: Recibe los ganadores y los guarda en MongoDB
 app.post('/api/save-history', async (req, res) => {
     try {
-        const { deviceId, maquina, url, ganadores } = req.body;
+        const { deviceId, drawId, maquina, url, ganadores } = req.body;
         
         const nuevoSorteo = new History({ deviceId, maquina, url, ganadores });
         await nuevoSorteo.save(); // ¡Guardado en la base de datos!
