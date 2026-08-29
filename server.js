@@ -111,6 +111,7 @@ const Transaction = mongoose.model('Transaction', TransactionSchema);
 const DrawVerificationSchema = new mongoose.Schema({
     drawId: { type: String, required: true, unique: true, uppercase: true, trim: true, index: true },
     deviceId: { type: String, index: true },
+    customLogo: { type: String, default: '' },
     maquina: { type: String, default: 'Sorteo' },
     url: { type: String, default: '' },
     plataforma: { type: String, default: 'Instagram' },
@@ -1106,8 +1107,12 @@ app.post('/api/save-history', async (req, res) => {
         
         const nuevoSorteo = new History({ 
             deviceId, 
-            drawId: drawId ? drawId.trim().toUpperCase() : '',maquina, url, ganadores });
-        await nuevoSorteo.save(); // ¡Guardado en la base de datos!
+            drawId: drawId ? drawId.trim().toUpperCase() : '', // 👈 AQUÍ FALTABA GUARDAR EL DRAWID
+            maquina, 
+            url, 
+            ganadores 
+        });
+        await nuevoSorteo.save();
         
         res.status(200).json({ success: true });
     } catch (error) {
@@ -1343,6 +1348,7 @@ app.post('/api/save-verification', async (req, res) => {
         const { 
             drawId, 
             deviceId, 
+            customLogo,
             maquina, 
             url, 
             plataforma, 
@@ -1374,6 +1380,7 @@ app.post('/api/save-verification', async (req, res) => {
             {
                 drawId: idLimpio,
                 deviceId: (deviceId || 'invitado').trim().toLowerCase(),
+                customLogo: customLogo || '',
                 maquina: maquina || 'Sorteo',
                 url: url || '',
                 plataforma: plataforma || (url && url.includes('tiktok.com') ? 'TikTok' : 'Instagram'),
@@ -1413,6 +1420,7 @@ app.get('/api/verify/:drawId', async (req, res) => {
 
         return res.json({
             drawId: sorteo.drawId,
+            customLogo: sorteo.customLogo || '',
             maquina: sorteo.maquina,
             url: sorteo.url,
             plataforma: sorteo.plataforma,
