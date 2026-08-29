@@ -79,6 +79,7 @@ const User = mongoose.model('User', UserSchema);
 const historySchema = new mongoose.Schema({
     deviceId: { type: String, required: true }, // Guarda el correo o UUID
     drawId: { type: String, uppercase: true, trim: true },
+    customLogo: { type: String, default: '' },
     maquina: { type: String, required: true },  // Ruleta, Slots, Vasos, etc.
     url: { type: String },                      // El enlace del post de TikTok/Ig
     fecha: { type: Date, default: Date.now },   // Fecha exacta automática
@@ -1108,6 +1109,7 @@ app.post('/api/save-history', async (req, res) => {
         const nuevoSorteo = new History({ 
             deviceId, 
             drawId: drawId ? drawId.trim().toUpperCase() : '', // 👈 AQUÍ FALTABA GUARDAR EL DRAWID
+            customLogo: customLogo || '',
             maquina, 
             url, 
             ganadores 
