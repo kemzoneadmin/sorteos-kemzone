@@ -1104,11 +1104,11 @@ app.get('/api/get-balance', async (req, res) => {
 // PUERTA 1: Recibe los ganadores y los guarda en MongoDB
 app.post('/api/save-history', async (req, res) => {
     try {
-        const { deviceId, drawId, maquina, url, ganadores } = req.body;
+        const { deviceId, drawId, customLogo, maquina, url, ganadores } = req.body; // ✅ customLogo añadido
         
         const nuevoSorteo = new History({ 
             deviceId, 
-            drawId: drawId ? drawId.trim().toUpperCase() : '', // 👈 AQUÍ FALTABA GUARDAR EL DRAWID
+            drawId: drawId ? drawId.trim().toUpperCase() : '',
             customLogo: customLogo || '',
             maquina, 
             url, 
