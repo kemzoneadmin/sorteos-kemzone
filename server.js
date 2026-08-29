@@ -129,6 +129,10 @@ const DrawVerificationSchema = new mongoose.Schema({
 
 // ⚡ Índice compuesto para que la búsqueda por ID y por usuario responda en 1 milisegundo
 DrawVerificationSchema.index({ drawId: 1, 'participantes': 1 });
+
+// ⚡ Auto-eliminación tras 7 días (604.800 segundos) para no acumular datos viejos
+DrawVerificationSchema.index({ createdAt: 1 }, { expireAfterSeconds: 604800 });
+
 const DrawVerification = mongoose.model('DrawVerification', DrawVerificationSchema);
 
 // 🔒 CLIENTE APIFY PROTEGIDO CON VARIABLES DE ENTORNO
