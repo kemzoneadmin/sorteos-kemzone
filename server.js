@@ -67,9 +67,11 @@ const UserSchema = new mongoose.Schema({
     password: { type: String, required: true },
     isVerified: { type: Boolean, default: false },
     verificationCode: { type: String },
+    resetPasswordCode: { type: String, default: null }, // 👈 Código de 6 dígitos temporal
+    resetPasswordExpires: { type: Date, default: null }, // 👈 Tiempo de expiración (15 min)
     tokems: { type: Number, default: 0 },
     history: { type: Array, default: [] },
-    customConfig: { type: Object, default: null } // 👈 Agregado para guardar el diseño en la nube
+    customConfig: { type: Object, default: null }
 });
 const User = mongoose.model('User', UserSchema);
 
@@ -476,6 +478,91 @@ app.post('/api/login', authLimiter, async (req, res) => {
     } catch (error) {
         console.error('Error en /api/login:', error);
         return res.status(500).json({ error: 'Error interno en el servidor al intentar loguear.' });
+    }
+});
+
+// =================================================================
+// 📩 ENDPOINTS DE RECUPERACIÓN AUTOMÁTICA DE CONTRASEÑA
+// =================================================================
+
+// 4. SOLICITAR CÓDIGO DE RECUPERACIÓN (ENVÍA CORREO CON RESEND)
+app.post('/api/forgot-password', authLimiter, async (req, res) => {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'El correo electrónico es obligatorio.' });
+
+    try {
+        const correoLimpio = email.trim().toLowerCase();
+        const usuario = await User.findOne({ email: correoLimpio });
+
+        if (!usuario) {
+            return res.status(404).json({ error: 'No existe ninguna cuenta registrada con este correo.' });
+        }
+
+        // Generamos código de 6 dígitos válido por 15 minutos
+        const codigoReset = Math.floor(100000 + Math.random() * 900000).toString();
+        usuario.resetPasswordCode = codigoReset;
+        usuario.resetPasswordExpires = new Date(Date.now() + 15 * 60 * 1000);
+        await usuario.save();
+
+        // Envío seguro mediante Resend
+        await resend.emails.send({
+            from: 'KZ Sorteos <registro@kzsorteos.com>',
+            to: correoLimpio,
+            subject: 'Código para restablecer tu contraseña - Panel KZ',
+            html: `
+                <div style="font-family: sans-serif; background-color: #0d0d14; color: #ffffff; padding: 25px; border-radius: 10px; border: 1px solid #66ff33; max-width: 500px; margin: 0 auto;">
+                    <h2 style="color: #66ff33; text-transform: uppercase; text-align: center;">Recuperación de Contraseña</h2>
+                    <p style="color: #aaaaaa; text-align: center;">Has solicitado restablecer tu contraseña en KZ Sorteos. Usa el siguiente código de seguridad:</p>
+                    <div style="background-color: #1a1a20; border: 1px dashed #66ff33; padding: 15px; text-align: center; font-size: 28px; font-weight: bold; color: #66ff33; letter-spacing: 5px; border-radius: 5px; margin: 20px 0;">
+                        ${codigoReset}
+                    </div>
+                    <p style="font-size: 12px; color: #777777; text-align: center;">Este código expirará en 15 minutos. Si no realizaste esta solicitud, puedes ignorar este mensaje con seguridad.</p>
+                </div>
+            `
+        });
+
+        return res.status(200).json({ success: true, message: 'Código enviado exitosamente a tu correo.' });
+    } catch (error) {
+        console.error('Error en /api/forgot-password:', error);
+        return res.status(500).json({ error: 'Error interno en el servidor al enviar el correo.' });
+    }
+});
+
+// 5. VALIDAR CÓDIGO Y ESTABLECER LA NUEVA CONTRASEÑA
+app.post('/api/reset-password', authLimiter, async (req, res) => {
+    const { email, code, newPassword } = req.body;
+    if (!email || !code || !newPassword) {
+        return res.status(400).json({ error: 'Todos los campos son estrictamente obligatorios.' });
+    }
+
+    try {
+        const correoLimpio = email.trim().toLowerCase();
+        const usuario = await User.findOne({ email: correoLimpio });
+
+        if (!usuario) {
+            return res.status(404).json({ error: 'Usuario no encontrado.' });
+        }
+
+        // Validamos que el código coincida
+        if (!usuario.resetPasswordCode || usuario.resetPasswordCode !== code.trim()) {
+            return res.status(400).json({ error: 'El código de seguridad introducido es incorrecto.' });
+        }
+
+        // Validamos expiración
+        if (!usuario.resetPasswordExpires || new Date(usuario.resetPasswordExpires) < new Date()) {
+            return res.status(400).json({ error: 'El código ha expirado. Por favor solicita uno nuevo.' });
+        }
+
+        // Hasheamos la nueva contraseña y limpiamos los campos temporales
+        usuario.password = await bcrypt.hash(newPassword, 10);
+        usuario.resetPasswordCode = null;
+        usuario.resetPasswordExpires = null;
+        await usuario.save();
+
+        return res.status(200).json({ success: true, message: 'Contraseña actualizada con éxito.' });
+    } catch (error) {
+        console.error('Error en /api/reset-password:', error);
+        return res.status(500).json({ error: 'Error interno al actualizar la contraseña.' });
     }
 });
 
