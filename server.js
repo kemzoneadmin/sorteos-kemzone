@@ -572,12 +572,18 @@ app.post('/api/reset-password', authLimiter, async (req, res) => {
 // =================================================================
 // 🔄 ENDPOINT: FUSIONAR SALDO, HISTORIALES Y DISEÑO A LA CUENTA
 // =================================================================
-app.post('/api/transfer-guest', async (req, res) => {
+app.post('/api/transfer-guest', verificarTokenOpcional, async (req, res) => {
     const { email, deviceId, customConfig } = req.body;
     if (!email || !deviceId) return res.status(400).json({ error: 'Faltan parámetros.' });
 
     try {
         const correoLimpio = email.trim().toLowerCase();
+        
+        // 🔒 Validar que el usuario que transfiere es el verdadero dueño del correo
+        if (!req.user || req.user.email.toLowerCase() !== correoLimpio) {
+            return res.status(403).json({ error: 'No tienes autorización para transferir datos a esta cuenta.' });
+        }
+
         const usuario = await User.findOne({ email: correoLimpio });
         if (!usuario) return res.status(404).json({ error: 'Cuenta no encontrada.' });
 
@@ -990,19 +996,19 @@ const limiteSeguro = techoSeguro;
             const identificadorLimpio = deviceId.trim().toLowerCase();
 
             if (identificadorLimpio.includes('@')) {
-                let usuario = await User.findOne({ email: identificadorLimpio });
-                if (usuario) {
-                    usuario.tokems = (usuario.tokems || 0) + tokemsReembolsados;
-                    await usuario.save();
-                    nuevoSaldoDefinitivo = usuario.tokems;
-                }
+                const usuario = await User.findOneAndUpdate(
+                    { email: identificadorLimpio },
+                    { $inc: { tokems: tokemsReembolsados } },
+                    { new: true }
+                );
+                if (usuario) nuevoSaldoDefinitivo = usuario.tokems;
             } else {
-                let registroInvitado = await Balance.findOne({ deviceId: identificadorLimpio });
-                if (registroInvitado) {
-                    registroInvitado.tokens = (registroInvitado.tokens || 0) + tokemsReembolsados;
-                    await registroInvitado.save();
-                    nuevoSaldoDefinitivo = registroInvitado.tokens;
-                }
+                const registroInvitado = await Balance.findOneAndUpdate(
+                    { deviceId: identificadorLimpio },
+                    { $inc: { tokens: tokemsReembolsados } },
+                    { new: true }
+                );
+                if (registroInvitado) nuevoSaldoDefinitivo = registroInvitado.tokens;
             }
             console.log(`[🔄 REEMBOLSO] Se devolvieron ${tokemsReembolsados} Tokems a ${deviceId}. Saldo final: ${nuevoSaldoDefinitivo}`);
         }
@@ -1255,26 +1261,29 @@ app.get('/api/get-history', async (req, res) => {
     }
 });
 
-// --- RUTA 1: ELIMINAR UN SOLO SORTEO POR ID ---
-app.post('/api/delete-history-item', verificarTokenOpcional, async (req, res) => {
+// ✅ CÓDIGO CORREGIDO Y SEGURO
+app.post('/api/delete-transaction-item', verificarTokenOpcional, async (req, res) => {
     try {
         const { id, deviceId } = req.body;
-        if (!id || !deviceId) return res.status(400).json({ error: "Faltan parámetros" });
+        if (!id || !deviceId) return res.status(400).json({ error: 'Faltan parámetros.' });
 
         const identificadorLimpio = deviceId.trim().toLowerCase();
         
-        await History.findOneAndDelete({
+        // 🔒 Validación de propiedad
+        if (identificadorLimpio.includes('@') && (!req.user || req.user.email.toLowerCase() !== identificadorLimpio)) {
+            return res.status(403).json({ error: 'No tienes autorización para alterar esta cuenta.' });
+        }
+
+        await Transaction.deleteOne({ 
             _id: id,
             $or: [
                 { deviceId: deviceId },
                 { deviceId: identificadorLimpio }
             ]
         });
-
-        res.status(200).json({ success: true });
+        res.json({ success: true });
     } catch (error) {
-        console.error("Error eliminando registro:", error);
-        res.status(500).json({ error: "Error al eliminar registro" });
+        res.status(500).json({ error: 'Error al eliminar la transacción.' });
     }
 });
 
@@ -1284,6 +1293,12 @@ app.post('/api/clear-history', verificarTokenOpcional, async (req, res) => {
         if (!deviceId) return res.status(400).json({ error: "Falta el identificador" });
 
         const identificadorLimpio = deviceId.trim().toLowerCase();
+        
+        // 🔒 Validación de propiedad
+        if (identificadorLimpio.includes('@') && (!req.user || req.user.email.toLowerCase() !== identificadorLimpio)) {
+            return res.status(403).json({ error: 'No tienes autorización para alterar esta cuenta.' });
+        }
+
         const filtroDB = { 
             $or: [
                 { deviceId: deviceId },
@@ -1428,12 +1443,18 @@ app.post('/api/delete-transaction-item', async (req, res) => {
 });
 
 // 4. Vaciar transacciones por tipo o todas
-app.post('/api/clear-transactions', async (req, res) => {
+app.post('/api/clear-transactions', verificarTokenOpcional, async (req, res) => {
     try {
         const { deviceId, tipo } = req.body;
         if (!deviceId) return res.status(400).json({ error: 'Falta el identificador.' });
 
         const identificadorLimpio = deviceId.trim().toLowerCase();
+        
+        // 🔒 Validación de propiedad
+        if (identificadorLimpio.includes('@') && (!req.user || req.user.email.toLowerCase() !== identificadorLimpio)) {
+            return res.status(403).json({ error: 'No tienes autorización para alterar esta cuenta.' });
+        }
+
         const filtroDB = { 
             $or: [
                 { deviceId: deviceId },
