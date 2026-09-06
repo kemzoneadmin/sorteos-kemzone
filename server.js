@@ -205,15 +205,8 @@ if (!deviceId || deviceId === 'null' || deviceId === 'undefined') {
             return res.status(200).send("Pedido sin deviceId"); 
         }
 
-// 🔒 Evitar duplicación por reintentos automáticos de Shopify (Coincidencia exacta)
+// 🔒 (Se elimina el findOne() previo aquí para evitar Race Conditions. La protección anti-duplicados ahora recae al 100% en el índice único 'shopifyOrderId' al final del webhook)
         const ordenId = String(order.order_number || order.id || '');
-        if (ordenId) {
-            const yaProcesada = await Transaction.findOne({ detalles: `Compra Shopify #${ordenId}` });
-            if (yaProcesada) {
-                console.log(`⚠️ Webhook ignorado: La orden #${ordenId} ya fue acreditada anteriormente.`);
-                return res.status(200).send("Orden ya procesada");
-            }
-        }
 
         console.log(`🛒 ¡Pedido pagado detectado para el identificador: ${deviceId}!`);
 
