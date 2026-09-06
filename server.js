@@ -1354,12 +1354,18 @@ app.post('/api/save-custom-config', verificarTokenOpcional, async (req, res) => 
 });
 
 // 2. Borra el diseño personalizado de la cuenta (vuelve a estado de fábrica)
-app.post('/api/reset-custom-config', async (req, res) => {
+app.post('/api/reset-custom-config', verificarTokenOpcional, async (req, res) => {
     try {
         const { email } = req.body;
         if (!email) return res.status(400).json({ error: "Falta el correo" });
 
         const correoLimpio = email.trim().toLowerCase();
+        
+        // 🔒 Validar que el usuario que reinicia es el verdadero dueño del correo
+        if (!req.user || req.user.email.toLowerCase() !== correoLimpio) {
+            return res.status(403).json({ error: 'No tienes autorización para alterar esta cuenta.' });
+        }
+
         await User.findOneAndUpdate({ email: correoLimpio }, { customConfig: null });
 
         res.status(200).json({ success: true, message: "Diseño reiniciado de fábrica" });
