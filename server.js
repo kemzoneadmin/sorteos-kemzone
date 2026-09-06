@@ -98,7 +98,7 @@ const historySchema = new mongoose.Schema({
     }]
 });
 
-// ⚡ Índice compuesto: permite buscar entre 50.000 sorteos en menos de 2ms sin saturar CPU
+// ⚡ Índice ultra rápido para consultas instantáneas
 historySchema.index({ deviceId: 1, fecha: -1 });
 
 const History = mongoose.model('History', historySchema);
@@ -1258,10 +1258,10 @@ app.post('/api/save-history', verificarTokenOpcional, async (req, res) => {
     }
 });
 
-// PUERTA 2: Busca el historial en MongoDB y se lo envía a la web (Paginado de 30 en 30)
+// PUERTA 2: Entrega el historial completo del usuario indexado para navegación fluida
 app.get('/api/get-history', async (req, res) => {
     try {
-        const { deviceId, uuid, skip = 0, limit = 30 } = req.query;
+        const { deviceId, uuid } = req.query;
         
         // 🔒 Validar que sean strings puros para evitar inyecciones NoSQL
         if ((deviceId && typeof deviceId !== 'string') || (uuid && typeof uuid !== 'string')) {
@@ -1279,27 +1279,13 @@ app.get('/api/get-history', async (req, res) => {
             idQuery.push({ deviceId: uuid.trim().toLowerCase() });
         }
 
-        const salto = parseInt(skip) || 0;
-        const limite = parseInt(limit) || 30;
-
-        // Consulta únicamente el bloque requerido
         const historial = await History.find({ $or: idQuery })
                                        .sort({ fecha: -1 })
-                                       .skip(salto)
-                                       .limit(limite)
                                        .lean();
 
-        // Conteo total para determinar si existen registros anteriores
-        const totalRegistros = await History.countDocuments({ $or: idQuery });
-        const hayMas = (salto + historial.length) < totalRegistros;
-
-        res.status(200).json({ 
-            historial, 
-            hayMas,
-            totalRegistros 
-        });
+        res.status(200).json({ historial });
     } catch (error) {
-        console.error("Error obteniendo historial paginado:", error);
+        console.error("Error obteniendo historial:", error);
         res.status(500).json({ error: "Error interno" });
     }
 });
