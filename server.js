@@ -229,8 +229,28 @@ if (!deviceId || deviceId === 'null' || deviceId === 'undefined') {
         }
 
         const identificadorLimpio = deviceId.trim().toLowerCase();
-        
-        // Buscamos si es cuenta registrada o invitado
+
+        // 🔒 1. REGISTRAMOS PRIMERO LA TRANSACCIÓN (El índice único 'shopifyOrderId' frena duplicados antes de tocar saldos)
+        try {
+            const nuevaTx = new Transaction({
+                deviceId: identificadorLimpio,
+                tipo: 'Compra',
+                tokens: tokensAAgregar,
+                precio: order.total_price ? `$${order.total_price}` : '',
+                shopifyOrderId: ordenId, // 🔒 Clave única obligatoria
+                detalles: `Compra Shopify #${ordenId}`
+            });
+            await nuevaTx.save();
+        } catch (err) {
+            // Error 11000 = Llave duplicada detectada en el mismo milisegundo
+            if (err.code === 11000) {
+                console.log(`⚠️ Webhook ignorado: La orden #${ordenId} ya fue registrada previamente.`);
+                return res.status(200).send("Orden ya procesada");
+            }
+            throw err;
+        }
+
+        // 💰 2. SI LA TRANSACCIÓN FUE REGISTRADA CON ÉXITO, RECIÉN AQUÍ SE ACREDITAN LOS TOKEMS
         let usuarioCuenta = await User.findOne({ email: identificadorLimpio });
 
         if (usuarioCuenta) {
@@ -249,26 +269,7 @@ if (!deviceId || deviceId === 'null' || deviceId === 'undefined') {
             console.log(`✅ Éxito (Invitado): Se le sumaron ${tokensAAgregar} Tokems al dispositivo anónimo ${deviceId}. Nuevo saldo: ${registroInvitado.tokens}`);
         }
 
-        // Registramos la transacción con control anti-duplicados a nivel DB
-        try {
-            const nuevaTx = new Transaction({
-                deviceId: identificadorLimpio,
-                tipo: 'Compra',
-                tokens: tokensAAgregar,
-                precio: order.total_price ? `$${order.total_price}` : '',
-                shopifyOrderId: ordenId, // 🔒 Referencia única obligatoria
-                detalles: `Compra Shopify #${ordenId}`
-            });
-            await nuevaTx.save();
-            return res.status(200).send("Webhook procesado con éxito");
-        } catch (err) {
-            // Error 11000 = Llave duplicada (intento de escritura simultánea)
-            if (err.code === 11000) {
-                console.log(`⚠️ Webhook ignorado por MongoDB: La orden #${ordenId} ya existe (Intento concurrente).`);
-                return res.status(200).send("Orden duplicada detectada a nivel de base de datos");
-            }
-            throw err;
-        }
+        return res.status(200).send("Webhook procesado con éxito");
 
     } catch (error) {
         console.error("❌ Error procesando el Webhook de Shopify:", error);
