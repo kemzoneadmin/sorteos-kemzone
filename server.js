@@ -580,18 +580,12 @@ app.post('/api/reset-password', authLimiter, async (req, res) => {
 // =================================================================
 // 🔄 ENDPOINT: FUSIONAR SALDO, HISTORIALES Y DISEÑO A LA CUENTA
 // =================================================================
-app.post('/api/transfer-guest', verificarTokenOpcional, async (req, res) => {
+app.post('/api/transfer-guest', async (req, res) => {
     const { email, deviceId, customConfig } = req.body;
     if (!email || !deviceId) return res.status(400).json({ error: 'Faltan parámetros.' });
 
     try {
         const correoLimpio = email.trim().toLowerCase();
-        
-        // 🔒 Validar que el usuario que transfiere es el verdadero dueño del correo
-        if (!req.user || req.user.email.toLowerCase() !== correoLimpio) {
-            return res.status(403).json({ error: 'No tienes autorización para transferir datos a esta cuenta.' });
-        }
-
         const usuario = await User.findOne({ email: correoLimpio });
         if (!usuario) return res.status(404).json({ error: 'Cuenta no encontrada.' });
 
@@ -1266,11 +1260,11 @@ app.get('/api/get-history', async (req, res) => {
     }
 });
 
-// ✅ CÓDIGO CORREGIDO Y SEGURO
-app.post('/api/delete-transaction-item', verificarTokenOpcional, async (req, res) => {
+// --- RUTA 1: ELIMINAR UN SOLO SORTEO POR ID ---
+app.post('/api/delete-history-item', verificarTokenOpcional, async (req, res) => {
     try {
         const { id, deviceId } = req.body;
-        if (!id || !deviceId) return res.status(400).json({ error: 'Faltan parámetros.' });
+        if (!id || !deviceId) return res.status(400).json({ error: "Faltan parámetros" });
 
         const identificadorLimpio = deviceId.trim().toLowerCase();
         
@@ -1278,17 +1272,19 @@ app.post('/api/delete-transaction-item', verificarTokenOpcional, async (req, res
         if (identificadorLimpio.includes('@') && (!req.user || req.user.email.toLowerCase() !== identificadorLimpio)) {
             return res.status(403).json({ error: 'No tienes autorización para alterar esta cuenta.' });
         }
-
-        await Transaction.deleteOne({ 
+        
+        await History.findOneAndDelete({
             _id: id,
             $or: [
                 { deviceId: deviceId },
                 { deviceId: identificadorLimpio }
             ]
         });
-        res.json({ success: true });
+
+        res.status(200).json({ success: true });
     } catch (error) {
-        res.status(500).json({ error: 'Error al eliminar la transacción.' });
+        console.error("Error eliminando registro:", error);
+        res.status(500).json({ error: "Error al eliminar registro" });
     }
 });
 
