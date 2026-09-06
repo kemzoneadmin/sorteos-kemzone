@@ -600,51 +600,62 @@ app.post('/api/transfer-guest', verificarTokenOpcional, async (req, res) => {
 
     try {
         const correoLimpio = email.trim().toLowerCase();
+        const deviceIdLimpio = deviceId.trim();
         
-        // 🔒 Validación de propiedad: solo el dueño de la sesión puede transferir a esta cuenta
+        // 🔒 Validación de propiedad: req.user debe coincidir con el correo
         if (!req.user || req.user.email.toLowerCase() !== correoLimpio) {
+            console.error(`[❌] Intento no autorizado en transfer-guest para: ${correoLimpio}`);
             return res.status(403).json({ error: 'No autorizado para alterar esta cuenta.' });
         }
 
         const usuario = await User.findOne({ email: correoLimpio });
         if (!usuario) return res.status(404).json({ error: 'Cuenta no encontrada.' });
 
-        // 1. 🪙 Transferir Saldo de Tokems de Balance a la Cuenta
-        const registroBalance = await Balance.findOneAndUpdate(
-            { deviceId: deviceId, tokens: { $gt: 0 } },
-            { $set: { tokens: 0 } },
-            { new: false }
-        );
+        // 1. 🪙 Buscar saldo en Balance de invitado (coincidencia exacta o minúscula)
+        const registroBalance = await Balance.findOne({
+            $or: [
+                { deviceId: deviceIdLimpio },
+                { deviceId: deviceIdLimpio.toLowerCase() }
+            ]
+        });
 
         let tokensSumados = 0;
         if (registroBalance && registroBalance.tokens > 0) {
             tokensSumados = registroBalance.tokens;
+            registroBalance.tokens = 0;
+            await registroBalance.save();
         }
 
-        // 2. 🎨 Preparar actualización atómica de cuenta y diseño
-        const updateDoc = {
-            $inc: { tokems: tokensSumados }
-        };
+        // 2. 🎨 Actualizar cuenta (saldo y diseño de plantilla)
+        if (tokensSumados > 0) {
+            usuario.tokems = (usuario.tokems || 0) + tokensSumados;
+        }
 
         if (customConfig && typeof customConfig === 'object') {
-            updateDoc.$set = { customConfig: customConfig };
+            usuario.customConfig = customConfig;
         }
 
-        const usuarioActualizado = await User.findOneAndUpdate(
-            { email: correoLimpio },
-            updateDoc,
-            { new: true }
-        );
+        await usuario.save();
 
-        // 3. 🎟️ Migrar Historial de Sorteos realizados como invitado a la Cuenta
+        // 3. 🎟️ Migrar Historial de Sorteos de invitado a la Cuenta
         await History.updateMany(
-            { deviceId: deviceId },
+            { 
+                $or: [
+                    { deviceId: deviceIdLimpio },
+                    { deviceId: deviceIdLimpio.toLowerCase() }
+                ] 
+            },
             { $set: { deviceId: correoLimpio } }
         );
 
-        // 4. 💳 Migrar Historial de Transacciones a la Cuenta
+        // 4. 💳 Migrar Historial de Transacciones de invitado a la Cuenta
         await Transaction.updateMany(
-            { deviceId: deviceId },
+            { 
+                $or: [
+                    { deviceId: deviceIdLimpio },
+                    { deviceId: deviceIdLimpio.toLowerCase() }
+                ] 
+            },
             { $set: { deviceId: correoLimpio } }
         );
 
@@ -654,11 +665,13 @@ app.post('/api/transfer-guest', verificarTokenOpcional, async (req, res) => {
         let userPreview = await Preview.findOne({ deviceId: correoLimpio, date: hoy });
         if (userPreview) previewCount = userPreview.count;
 
+        console.log(`[✅ TRANSFERENCIA EXITOSA] Migrados ${tokensSumados} Tokems, historial y diseño a: ${correoLimpio}`);
+
         return res.status(200).json({ 
             success: true, 
-            nuevoSaldo: usuarioActualizado ? usuarioActualizado.tokems : usuario.tokems,
+            nuevoSaldo: usuario.tokems,
             previewCount,
-            customConfig: usuarioActualizado ? usuarioActualizado.customConfig : usuario.customConfig 
+            customConfig: usuario.customConfig 
         });
     } catch (error) {
         console.error('Error en transferencia integral:', error);
