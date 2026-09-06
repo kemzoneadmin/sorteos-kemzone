@@ -28,6 +28,12 @@ const authLimiter = rateLimit({
     message: { error: 'Has superado el límite de intentos. Espera 15 minutos.' }
 });
 
+const redeemLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutos
+    max: 15, // Máximo 15 intentos de canje
+    message: { error: 'Demasiados intentos de canje. Intenta de nuevo en 15 minutos.' }
+});
+
 const app = express();
 app.set('trust proxy', 1); // 🚀 Permite a express-rate-limit leer la IP real del cliente en Railway
 const port = process.env.PORT || 3000;
@@ -104,6 +110,7 @@ const TransactionSchema = new mongoose.Schema({
     precio: { type: String, default: '' },
     codigoPin: { type: String, default: '' },
     detalles: { type: String, default: '' },
+    shopifyOrderId: { type: String, unique: true, sparse: true }, // 🔒 Índice único anti-doble recarga
     fecha: { type: Date, default: Date.now }
 });
 const Transaction = mongoose.model('Transaction', TransactionSchema);
@@ -249,17 +256,26 @@ if (!deviceId || deviceId === 'null' || deviceId === 'undefined') {
             console.log(`✅ Éxito (Invitado): Se le sumaron ${tokensAAgregar} Tokems al dispositivo anónimo ${deviceId}. Nuevo saldo: ${registroInvitado.tokens}`);
         }
 
-        // Registramos la transacción
-        const nuevaTx = new Transaction({
-            deviceId: identificadorLimpio,
-            tipo: 'Compra',
-            tokens: tokensAAgregar,
-            precio: order.total_price ? `$${order.total_price}` : '',
-            detalles: `Compra Shopify #${order.order_number || order.id || ''}`
-        });
-        await nuevaTx.save();
-
-        return res.status(200).send("Webhook procesado con éxito");
+        // Registramos la transacción con control anti-duplicados a nivel DB
+        try {
+            const nuevaTx = new Transaction({
+                deviceId: identificadorLimpio,
+                tipo: 'Compra',
+                tokens: tokensAAgregar,
+                precio: order.total_price ? `$${order.total_price}` : '',
+                shopifyOrderId: ordenId, // 🔒 Referencia única obligatoria
+                detalles: `Compra Shopify #${ordenId}`
+            });
+            await nuevaTx.save();
+            return res.status(200).send("Webhook procesado con éxito");
+        } catch (err) {
+            // Error 11000 = Llave duplicada (intento de escritura simultánea)
+            if (err.code === 11000) {
+                console.log(`⚠️ Webhook ignorado por MongoDB: La orden #${ordenId} ya existe (Intento concurrente).`);
+                return res.status(200).send("Orden duplicada detectada a nivel de base de datos");
+            }
+            throw err;
+        }
 
     } catch (error) {
         console.error("❌ Error procesando el Webhook de Shopify:", error);
@@ -384,7 +400,7 @@ app.post('/api/register', authLimiter, async (req, res) => {
         let usuario = await User.findOne({ email: correoLimpio });
         
         const hashedPassword = await bcrypt.hash(password, 10);
-        const codigoVerificacion = Math.floor(100000 + Math.random() * 900000).toString();
+        const codigoVerificacion = crypto.randomInt(100000, 1000000).toString();
 
         if (usuario) {
             if (usuario.isVerified) {
@@ -474,7 +490,7 @@ app.post('/api/login', authLimiter, async (req, res) => {
         );
 
         // 🚀 OBTENEMOS EL CONTEO DE LA CUENTA (Totalmente independiente)
-        const hoy = new Date().toLocaleDateString();
+        const hoy = new Date().toISOString().split('T')[0];
         let previewCount = 0;
         let finalReg = await Preview.findOne({ deviceId: correoLimpio, date: hoy });
         if (finalReg) previewCount = finalReg.count;
@@ -510,7 +526,7 @@ app.post('/api/forgot-password', authLimiter, async (req, res) => {
         }
 
         // Generamos código de 6 dígitos válido por 15 minutos
-        const codigoReset = Math.floor(100000 + Math.random() * 900000).toString();
+        const codigoReset = crypto.randomInt(100000, 1000000).toString();
         usuario.resetPasswordCode = codigoReset;
         usuario.resetPasswordExpires = new Date(Date.now() + 15 * 60 * 1000);
         await usuario.save();
@@ -580,12 +596,18 @@ app.post('/api/reset-password', authLimiter, async (req, res) => {
 // =================================================================
 // 🔄 ENDPOINT: FUSIONAR SALDO, HISTORIALES Y DISEÑO A LA CUENTA
 // =================================================================
-app.post('/api/transfer-guest', async (req, res) => {
+app.post('/api/transfer-guest', verificarTokenOpcional, async (req, res) => {
     const { email, deviceId, customConfig } = req.body;
     if (!email || !deviceId) return res.status(400).json({ error: 'Faltan parámetros.' });
 
     try {
         const correoLimpio = email.trim().toLowerCase();
+        
+        // 🔒 Validación de propiedad: solo el dueño de la sesión puede transferir a esta cuenta
+        if (!req.user || req.user.email.toLowerCase() !== correoLimpio) {
+            return res.status(403).json({ error: 'No autorizado para alterar esta cuenta.' });
+        }
+
         const usuario = await User.findOne({ email: correoLimpio });
         if (!usuario) return res.status(404).json({ error: 'Cuenta no encontrada.' });
 
@@ -629,7 +651,7 @@ app.post('/api/transfer-guest', async (req, res) => {
         );
 
         // 5. Conteo de previsualizaciones
-        const hoy = new Date().toLocaleDateString();
+        const hoy = new Date().toISOString().split('T')[0];
         let previewCount = 0;
         let userPreview = await Preview.findOne({ deviceId: correoLimpio, date: hoy });
         if (userPreview) previewCount = userPreview.count;
@@ -657,7 +679,7 @@ app.post('/api/preview', previewLimiter, async (req, res) => {
         return res.status(400).json({ error: 'El enlace debe pertenecer a una publicación de Instagram o TikTok.' });
     }
 
-    const hoy = new Date().toLocaleDateString();
+    const hoy = new Date().toISOString().split('T')[0];
     const identificadorLimpio = deviceId.trim().toLowerCase();
     let apifyRunId = null;
     let canceladoPorCliente = false;
@@ -1122,7 +1144,7 @@ app.get('/api/proxy-image', async (req, res) => {
 // =================================================================
 // 4. ENDPOINT: PROCESADOR DE PINES (CORREGIDO ANTI-CRASH)
 // =================================================================
-app.post('/api/redeem', async (req, res) => {
+app.post('/api/redeem', redeemLimiter, async (req, res) => {
     const { code, deviceId } = req.body;
     if (!code || !deviceId) return res.status(400).json({ error: 'El código y el identificador son estrictamente requeridos.' });
 
@@ -1179,7 +1201,7 @@ app.get('/api/get-balance', async (req, res) => {
 
     try {
         const identificadorLimpio = deviceId.trim().toLowerCase();
-        const hoy = new Date().toLocaleDateString();
+        const hoy = new Date().toISOString().split('T')[0];
         
         // 🚀 Consultar conteo real en MongoDB (Inmune al LocalStorage)
         let previewCount = 0;
@@ -1242,6 +1264,11 @@ app.post('/api/save-history', verificarTokenOpcional, async (req, res) => {
 app.get('/api/get-history', async (req, res) => {
     try {
         const { deviceId, uuid } = req.query;
+        
+        // 🔒 Validar que sean strings puros para evitar crashes por objetos inyectados
+        if ((deviceId && typeof deviceId !== 'string') || (uuid && typeof uuid !== 'string')) {
+            return res.status(400).json({ error: 'Parámetros inválidos.' });
+        }
         if (!deviceId && !uuid) return res.status(400).json({ error: "Falta el identificador" });
 
         const idQuery = [];
@@ -1411,10 +1438,21 @@ app.post('/api/save-transaction', verificarTokenOpcional, async (req, res) => {
 });
 
 // 2. Obtener transacciones del usuario / dispositivo
-app.get('/api/get-transactions', async (req, res) => {
+app.get('/api/get-transactions', verificarTokenOpcional, async (req, res) => {
     try {
         const { deviceId, uuid } = req.query;
+        
+        // 🔒 Prevenir inyecciones NoSQL validando que sean strings puros
+        if ((deviceId && typeof deviceId !== 'string') || (uuid && typeof uuid !== 'string')) {
+            return res.status(400).json({ error: 'Parámetros inválidos.' });
+        }
         if (!deviceId && !uuid) return res.status(400).json({ error: 'Falta identificador.' });
+
+        // 🔒 Validar propiedad si es un correo (cuenta registrada)
+        const idTarget = (deviceId || uuid).trim().toLowerCase();
+        if (idTarget.includes('@') && (!req.user || req.user.email.toLowerCase() !== idTarget)) {
+            return res.status(403).json({ error: 'Acceso no autorizado al historial.' });
+        }
 
         const idQuery = [];
         if (deviceId) {
@@ -1531,25 +1569,28 @@ app.post('/api/save-verification', async (req, res) => {
 
         const idLimpio = drawId.trim().toUpperCase();
 
-        // Si ya existe (ej: reintento), actualiza; si no, lo crea
-        const sorteoSellado = await DrawVerification.findOneAndUpdate(
-            { drawId: idLimpio },
-            {
-                drawId: idLimpio,
-                deviceId: (deviceId || 'invitado').trim().toLowerCase(),
-                customLogo: customLogo || '',
-                maquina: maquina || 'Sorteo',
-                url: url || '',
-                plataforma: plataforma || (url && url.includes('tiktok.com') ? 'TikTok' : 'Instagram'),
-                fecha: new Date(),
-                ganadores: ganadores,
-                totalComentarios: totalComentarios || 0,
-                totalParticipantesValidos: totalParticipantesValidos || listaLimpia.length,
-                verificationHash: verificationHash,
-                participantes: listaLimpia
-            },
-            { upsert: true, new: true }
-        );
+        // 🔒 Verificar que el certificado no exista previamente para garantizar inmutabilidad
+        const existente = await DrawVerification.findOne({ drawId: idLimpio });
+        if (existente) {
+            return res.status(409).json({ error: "Este sorteo ya fue certificado y es inmutable." });
+        }
+
+        // Si no existe, lo crea de forma permanente
+        const sorteoSellado = new DrawVerification({
+            drawId: idLimpio,
+            deviceId: (deviceId || 'invitado').trim().toLowerCase(),
+            customLogo: customLogo || '',
+            maquina: maquina || 'Sorteo',
+            url: url || '',
+            plataforma: plataforma || (url && url.includes('tiktok.com') ? 'TikTok' : 'Instagram'),
+            fecha: new Date(),
+            ganadores: ganadores,
+            totalComentarios: totalComentarios || 0,
+            totalParticipantesValidos: totalParticipantesValidos || listaLimpia.length,
+            verificationHash: verificationHash,
+            participantes: listaLimpia
+        });
+        await sorteoSellado.save();
 
         console.log(`[🛡️ VERIFICACIÓN] Sorteo ${idLimpio} sellado con éxito. Hash: ${verificationHash.substring(0, 16)}...`);
         return res.json({ success: true, drawId: sorteoSellado.drawId, hash: verificationHash });
