@@ -146,6 +146,14 @@ const client = new ApifyClient({
 });
 
 // =================================================================
+// 5. DICCIONARIO DE EQUIVALENCIAS DE TOKEMS (SHOPIFY)
+// =================================================================
+const TOKENS_POR_VARIANTE = {
+    "47912562720926": 1,   "47912562851998": 3,   "47912562884766": 6,   
+    "47912563015838": 12,  "47912563114142": 24,  "47912563245214": 48   
+};
+
+// =================================================================
 // 7. ENDPOINT: WEBHOOK DE SHOPIFY (BLINDADO CON HMAC)
 // =================================================================
 // IMPORTANTE: Esta ruta debe ir ANTES de los app.use(express.json())
@@ -1165,14 +1173,6 @@ app.post('/api/redeem', async (req, res) => {
 });
 
 // =================================================================
-// 5. DICCIONARIO DE EQUIVALENCIAS DE TOKEMS (SHOPIFY)
-// =================================================================
-const TOKENS_POR_VARIANTE = {
-    "47912562720926": 1,   "47912562851998": 3,   "47912562884766": 6,   
-    "47912563015838": 12,  "47912563114142": 24,  "47912563245214": 48   
-};
-
-// =================================================================
 // 6. ENDPOINT: OBTENER EL SALDO (Y CONTEO DE PREVISUALIZACIONES)
 // =================================================================
 app.get('/api/get-balance', async (req, res) => {
@@ -1214,11 +1214,16 @@ app.get('/api/get-balance', async (req, res) => {
 // =================================================================
 
 // PUERTA 1: Recibe los ganadores y los guarda en MongoDB
-app.post('/api/save-history', async (req, res) => {
+app.post('/api/save-history', verificarTokenOpcional, async (req, res) => {
     try {
-        const { deviceId, drawId, customLogo, maquina, url, ganadores } = req.body; // ✅ customLogo añadido
+        const { deviceId, drawId, customLogo, maquina, url, ganadores } = req.body;
         
-        const nuevoSorteo = new History({ 
+        const identificadorLimpio = deviceId.trim().toLowerCase();
+        if (identificadorLimpio.includes('@') && (!req.user || req.user.email.toLowerCase() !== identificadorLimpio)) {
+            return res.status(403).json({ error: 'No tienes autorización para guardar datos en esta cuenta.' });
+        }
+        
+        const nuevoSorteo = new History({
             deviceId, 
             drawId: drawId ? drawId.trim().toUpperCase() : '',
             customLogo: customLogo || '',
@@ -1369,11 +1374,16 @@ app.post('/api/reset-custom-config', async (req, res) => {
 // =================================================================
 
 // 1. Guardar nueva transacción (Compra o Canje)
-app.post('/api/save-transaction', async (req, res) => {
+app.post('/api/save-transaction', verificarTokenOpcional, async (req, res) => {
     try {
         const { deviceId, tipo, tokens, plan, precio, codigoPin, detalles } = req.body;
         if (!deviceId || !tokens) {
             return res.status(400).json({ error: 'Datos insuficientes para guardar la transacción.' });
+        }
+
+        const identificadorLimpio = deviceId.trim().toLowerCase();
+        if (identificadorLimpio.includes('@') && (!req.user || req.user.email.toLowerCase() !== identificadorLimpio)) {
+            return res.status(403).json({ error: 'No tienes autorización para guardar transacciones en esta cuenta.' });
         }
 
         const nuevaTx = new Transaction({
@@ -1423,12 +1433,18 @@ app.get('/api/get-transactions', async (req, res) => {
 });
 
 // ✅ CÓDIGO CORREGIDO Y SEGURO
-app.post('/api/delete-transaction-item', async (req, res) => {
+app.post('/api/delete-transaction-item', verificarTokenOpcional, async (req, res) => {
     try {
         const { id, deviceId } = req.body;
         if (!id || !deviceId) return res.status(400).json({ error: 'Faltan parámetros.' });
 
         const identificadorLimpio = deviceId.trim().toLowerCase();
+        
+        // 🔒 Validación de propiedad
+        if (identificadorLimpio.includes('@') && (!req.user || req.user.email.toLowerCase() !== identificadorLimpio)) {
+            return res.status(403).json({ error: 'No tienes autorización para alterar esta cuenta.' });
+        }
+
         await Transaction.deleteOne({ 
             _id: id,
             $or: [
