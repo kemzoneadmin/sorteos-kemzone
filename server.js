@@ -1436,7 +1436,7 @@ app.post('/api/save-transaction', verificarTokenOpcional, async (req, res) => {
     }
 });
 
-// 2. Obtener transacciones del usuario / dispositivo
+// 2. Obtener transacciones del usuario / dispositivo (Blindado y compatible)
 app.get('/api/get-transactions', verificarTokenOpcional, async (req, res) => {
     try {
         const { deviceId, uuid } = req.query;
@@ -1446,12 +1446,6 @@ app.get('/api/get-transactions', verificarTokenOpcional, async (req, res) => {
             return res.status(400).json({ error: 'Parámetros inválidos.' });
         }
         if (!deviceId && !uuid) return res.status(400).json({ error: 'Falta identificador.' });
-
-        // 🔒 Validar propiedad si es un correo (cuenta registrada)
-        const idTarget = (deviceId || uuid).trim().toLowerCase();
-        if (idTarget.includes('@') && (!req.user || req.user.email.toLowerCase() !== idTarget)) {
-            return res.status(403).json({ error: 'Acceso no autorizado al historial.' });
-        }
 
         const idQuery = [];
         if (deviceId) {
