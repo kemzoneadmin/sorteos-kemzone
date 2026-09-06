@@ -1053,9 +1053,13 @@ app.get('/api/proxy-image', async (req, res) => {
     }
 
     if (imageUrl.startsWith('imagenes/') || imageUrl.startsWith('Sonidos/')) {
-        return res.sendFile(path.join(__dirname, imageUrl));
+    const safePath = path.normalize(imageUrl).replace(/^(\.\.[\/\\])+/, '');
+    const fullPath = path.join(__dirname, safePath);
+    if (!fullPath.startsWith(path.join(__dirname, 'imagenes')) && !fullPath.startsWith(path.join(__dirname, 'Sonidos'))) {
+        return res.status(403).send('Acceso denegado');
     }
-
+    return res.sendFile(fullPath);
+}
     // 🔒 Lista blanca ampliada con todos los CDNs conocidos de Instagram, TikTok y Shopify
     const dominiosPermitidos = [
         'cdninstagram.com', 'fbcdn.net', 'instagram.com', 'akamaized.net', 'akamaihd.net',
