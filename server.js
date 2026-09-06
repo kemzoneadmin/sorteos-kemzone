@@ -154,14 +154,17 @@ app.post('/api/shopify-webhook', express.raw({ type: 'application/json' }), asyn
         const hmac = req.header('X-Shopify-Hmac-Sha256');
         const secret = process.env.SHOPIFY_SECRET; 
 
-        // 1. Calculamos el sello matemático con el mensaje intacto
-        const hash = crypto
+        // 1. Calculamos el sello matemático con el mensaje intacto (Buffer directo)
+        const generatedHash = crypto
             .createHmac('sha256', secret)
-            .update(req.body, 'utf8', 'hex')
+            .update(req.body)
             .digest('base64');
 
-        // 2. Si los sellos no coinciden, rebotamos al atacante
-        if (hash !== hmac) {
+        const hashBuffer = Buffer.from(generatedHash);
+        const hmacBuffer = Buffer.from(hmac || '');
+
+        // 2. Si los sellos no coinciden, rebotamos al atacante (Mitiga Timing Attacks)
+        if (hashBuffer.length !== hmacBuffer.length || !crypto.timingSafeEqual(hashBuffer, hmacBuffer)) {
             console.log('⚠️ Intento de recarga de Tokems FALSA detectado.');
             return res.status(401).send('Firma de Shopify inválida');
         }
@@ -864,25 +867,32 @@ const limiteSeguro = techoSeguro;
                 return res.status(403).json({ error: 'No tienes autorización para debitar saldo de esta cuenta.' });
             }
 
-            let usuario = await User.findOne({ email: identificadorLimpio });
-            if (!usuario || (usuario.tokems || 0) < costoReal) {
+            // Operación Atómica: Busca y descuenta en 1 solo paso, solo si el saldo es mayor o igual al costo ($gte)
+            const usuario = await User.findOneAndUpdate(
+                { email: identificadorLimpio, tokems: { $gte: costoReal } },
+                { $inc: { tokems: -costoReal } },
+                { new: true }
+            );
+
+            if (!usuario) {
                 return res.status(402).json({ error: 'Saldo insuficiente de Tokems para realizar esta extracción.' });
             }
 
-            usuario.tokems -= costoReal;
-            await usuario.save();
             nuevoSaldoDefinitivo = usuario.tokems;
             tokensCobrados = costoReal;
             usuarioAfectado = { tipo: 'user', doc: usuario };
             console.log(`[🪙] Cobrado x${costoReal} Tokems a la Cuenta: ${identificadorLimpio}. Restan: ${nuevoSaldoDefinitivo}`);
         } else {
-            let registroInvitado = await Balance.findOne({ deviceId: identificadorLimpio });
-            if (!registroInvitado || (registroInvitado.tokens || 0) < costoReal) {
+            const registroInvitado = await Balance.findOneAndUpdate(
+                { deviceId: identificadorLimpio, tokens: { $gte: costoReal } },
+                { $inc: { tokens: -costoReal } },
+                { new: true }
+            );
+
+            if (!registroInvitado) {
                 return res.status(402).json({ error: 'Saldo insuficiente de Tokems en este dispositivo.' });
             }
 
-            registroInvitado.tokens -= costoReal;
-            await registroInvitado.save();
             nuevoSaldoDefinitivo = registroInvitado.tokens;
             tokensCobrados = costoReal;
             usuarioAfectado = { tipo: 'guest', doc: registroInvitado };
@@ -1046,7 +1056,16 @@ app.get('/api/proxy-image', async (req, res) => {
         'shopify.com', 'shopifycdn.com'
     ];
 
-    const esDominioValido = dominiosPermitidos.some(d => imageUrl.includes(d));
+    let esDominioValido = false;
+    try {
+        const parsedUrl = new URL(imageUrl);
+        esDominioValido = dominiosPermitidos.some(d => 
+            parsedUrl.hostname === d || parsedUrl.hostname.endsWith('.' + d)
+        );
+    } catch (e) {
+        esDominioValido = false;
+    }
+
     if (!esDominioValido) {
         return res.redirect('https://cdn.shopify.com/s/files/1/0780/8444/0222/files/blank-profile-picture-973460_640.webp?v=1787703095');
     }
@@ -1289,12 +1308,18 @@ app.post('/api/clear-history', verificarTokenOpcional, async (req, res) => {
 // =================================================================
 
 // 1. Guarda el diseño personalizado en la cuenta del usuario
-app.post('/api/save-custom-config', async (req, res) => {
+app.post('/api/save-custom-config', verificarTokenOpcional, async (req, res) => {
     try {
         const { email, customConfig } = req.body;
         if (!email || !customConfig) return res.status(400).json({ error: "Faltan parámetros" });
 
         const correoLimpio = email.trim().toLowerCase();
+        
+        // Valida que el usuario logueado sea el dueño de la cuenta
+        if (!req.user || req.user.email.toLowerCase() !== correoLimpio) {
+            return res.status(403).json({ error: 'Acceso no autorizado a esta cuenta.' });
+        }
+
         await User.findOneAndUpdate(
             { email: correoLimpio }, 
             { $set: { customConfig: customConfig } },
