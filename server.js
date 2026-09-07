@@ -199,9 +199,15 @@ app.post('/api/shopify-webhook', express.raw({ type: 'application/json' }), asyn
         if (deviceIdAttr) deviceId = deviceIdAttr.value;
 
         if (!deviceId && order.line_items && order.line_items.length > 0) {
-            const props = order.line_items[0].properties || [];
-            const propAttr = props.find(p => p.name === '_deviceId');
-            if (propAttr) deviceId = propAttr.value;
+            // 🔥 FIX: Buscar el ID en TODOS los artículos de la orden, no solo en la posición [0]
+            for (let item of order.line_items) {
+                const props = item.properties || [];
+                const propAttr = props.find(p => p.name === '_deviceId');
+                if (propAttr && propAttr.value) {
+                    deviceId = propAttr.value;
+                    break; // Lo encontró, detiene la búsqueda
+                }
+            }
         }
 
 if (!deviceId || deviceId === 'null' || deviceId === 'undefined') {
