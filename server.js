@@ -1227,11 +1227,16 @@ app.get('/api/get-balance', async (req, res) => {
                 customConfig: usuario ? usuario.customConfig : null 
             });
         } else {
-            const registro = await Balance.findOne({ deviceId: identificadorLimpio });
+            const registro = await Balance.findOne({ 
+                $or: [
+                    { deviceId: deviceId.trim() },
+                    { deviceId: identificadorLimpio }
+                ]
+            });
             return res.json({ 
                 tokens: registro ? registro.tokens : 0, 
-                previewCount,
-                customConfig: null 
+                previewCount
+                // 🔒 No enviamos customConfig como null para no borrar el diseño local del invitado
             });
         }
     } catch (error) {
