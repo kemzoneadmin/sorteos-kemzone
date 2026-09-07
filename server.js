@@ -210,9 +210,20 @@ app.post('/api/shopify-webhook', express.raw({ type: 'application/json' }), asyn
             }
         }
 
-if (!deviceId || deviceId === 'null' || deviceId === 'undefined') {
-            console.log("⚠️ Webhook ignorado: No se detectó un deviceId válido.");
-            return res.status(200).send("Pedido sin deviceId"); 
+// 🛡️ Fallback de seguridad: Si PayPal o el pago rápido omitieron el deviceId, usamos el correo de la orden
+        if (!deviceId || deviceId === 'null' || deviceId === 'undefined') {
+            if (order.email) {
+                deviceId = order.email;
+                console.log(`ℹ️ [Webhook] deviceId ausente por pago exprés. Usando email de la orden como respaldo: ${deviceId}`);
+            } else if (order.customer && order.customer.email) {
+                deviceId = order.customer.email;
+                console.log(`ℹ️ [Webhook] deviceId ausente. Usando email del cliente como respaldo: ${deviceId}`);
+            }
+        }
+
+        if (!deviceId || deviceId === 'null' || deviceId === 'undefined') {
+            console.log("⚠️ Webhook ignorado: No se detectó un deviceId ni un correo válido en la orden.");
+            return res.status(200).send("Pedido sin identificador"); 
         }
 
 // 🔒 (Se elimina el findOne() previo aquí para evitar Race Conditions. La protección anti-duplicados ahora recae al 100% en el índice único 'shopifyOrderId' al final del webhook)
