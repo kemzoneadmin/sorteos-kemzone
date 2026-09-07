@@ -602,7 +602,7 @@ app.post('/api/transfer-guest', verificarTokenOpcional, async (req, res) => {
         const correoLimpio = email.trim().toLowerCase();
         const deviceIdLimpio = deviceId.trim();
         
-        // 🔒 Validación de propiedad: req.user debe coincidir con el correo
+        // 🔒 Validación de identidad: req.user debe ser el mismo correo de la petición
         if (!req.user || req.user.email.toLowerCase() !== correoLimpio) {
             console.error(`[❌] Intento no autorizado en transfer-guest para: ${correoLimpio}`);
             return res.status(403).json({ error: 'No autorizado para alterar esta cuenta.' });
@@ -611,7 +611,7 @@ app.post('/api/transfer-guest', verificarTokenOpcional, async (req, res) => {
         const usuario = await User.findOne({ email: correoLimpio });
         if (!usuario) return res.status(404).json({ error: 'Cuenta no encontrada.' });
 
-        // 1. 🪙 Buscar saldo en Balance de invitado (coincidencia exacta o minúscula)
+        // 1. 🪙 Buscar y vaciar saldo en Balance de invitado
         const registroBalance = await Balance.findOne({
             $or: [
                 { deviceId: deviceIdLimpio },
@@ -626,7 +626,7 @@ app.post('/api/transfer-guest', verificarTokenOpcional, async (req, res) => {
             await registroBalance.save();
         }
 
-        // 2. 🎨 Actualizar cuenta (saldo y diseño de plantilla)
+        // 2. 🎨 Fusionar saldo y plantilla de diseño a la cuenta
         if (tokensSumados > 0) {
             usuario.tokems = (usuario.tokems || 0) + tokensSumados;
         }
@@ -637,7 +637,7 @@ app.post('/api/transfer-guest', verificarTokenOpcional, async (req, res) => {
 
         await usuario.save();
 
-        // 3. 🎟️ Migrar Historial de Sorteos de invitado a la Cuenta
+        // 3. 🎟️ Migrar Historial de Sorteos realizados como invitado
         await History.updateMany(
             { 
                 $or: [
@@ -648,7 +648,7 @@ app.post('/api/transfer-guest', verificarTokenOpcional, async (req, res) => {
             { $set: { deviceId: correoLimpio } }
         );
 
-        // 4. 💳 Migrar Historial de Transacciones de invitado a la Cuenta
+        // 4. 💳 Migrar Historial de Transacciones (compras/canjes) a la cuenta
         await Transaction.updateMany(
             { 
                 $or: [
@@ -659,7 +659,7 @@ app.post('/api/transfer-guest', verificarTokenOpcional, async (req, res) => {
             { $set: { deviceId: correoLimpio } }
         );
 
-        // 5. Conteo de previsualizaciones
+        // 5. Sincronizar conteo de previsualizaciones
         const hoy = new Date().toISOString().split('T')[0];
         let previewCount = 0;
         let userPreview = await Preview.findOne({ deviceId: correoLimpio, date: hoy });
@@ -1253,19 +1253,24 @@ app.get('/api/get-balance', async (req, res) => {
 app.post('/api/save-history', verificarTokenOpcional, async (req, res) => {
     try {
         const { deviceId, drawId, customLogo, maquina, url, ganadores } = req.body;
-        
+        if (!deviceId) return res.status(400).json({ error: "Falta el identificador deviceId" });
+
         const identificadorLimpio = deviceId.trim().toLowerCase();
-        if (identificadorLimpio.includes('@') && (!req.user || req.user.email.toLowerCase() !== identificadorLimpio)) {
-            return res.status(403).json({ error: 'No tienes autorización para guardar datos en esta cuenta.' });
+        
+        // 🔒 Validación tolerante: si viene token, verifica; si el token expiró durante el sorteo, no bloquea el guardado
+        if (identificadorLimpio.includes('@') && req.user) {
+            if (req.user.email.toLowerCase() !== identificadorLimpio) {
+                return res.status(403).json({ error: 'No autorizado para esta cuenta.' });
+            }
         }
         
         const nuevoSorteo = new History({
-            deviceId, 
+            deviceId: identificadorLimpio, 
             drawId: drawId ? drawId.trim().toUpperCase() : '',
             customLogo: customLogo || '',
-            maquina, 
-            url, 
-            ganadores 
+            maquina: maquina || 'Sorteo', 
+            url: url || '', 
+            ganadores: ganadores || []
         });
         await nuevoSorteo.save();
         
