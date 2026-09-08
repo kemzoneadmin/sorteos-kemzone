@@ -1299,7 +1299,8 @@ app.post('/api/save-history', verificarTokenOpcional, async (req, res) => {
 });
 
 // PUERTA 2: Entrega el historial completo del usuario indexado para navegación fluida
-app.get('/api/get-history', async (req, res) => {
+// PUERTA 2: Entrega el historial completo del usuario indexado para navegación fluida
+app.get('/api/get-history', verificarTokenOpcional, async (req, res) => { // 👈 SE AGREGA MIDDLEWARE DE SEGURIDAD
     try {
         const { deviceId, uuid } = req.query;
         
@@ -1321,6 +1322,7 @@ app.get('/api/get-history', async (req, res) => {
 
         const historial = await History.find({ $or: idQuery })
                                        .sort({ fecha: -1 })
+                                       .limit(100) // 👈 LÍMITE ANTI-CUELGUES AÑADIDO (Carga ultra rápida)
                                        .lean();
 
         res.status(200).json({ historial });
