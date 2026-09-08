@@ -1298,31 +1298,33 @@ app.post('/api/save-history', verificarTokenOpcional, async (req, res) => {
     }
 });
 
+
 // PUERTA 2: Entrega el historial completo del usuario indexado para navegación fluida
-// PUERTA 2: Entrega el historial completo del usuario indexado para navegación fluida
-app.get('/api/get-history', verificarTokenOpcional, async (req, res) => { // 👈 SE AGREGA MIDDLEWARE DE SEGURIDAD
+// PUERTA 2: Entrega el historial del usuario con desinfección de nulos y sin cuelgues
+app.get('/api/get-history', verificarTokenOpcional, async (req, res) => {
     try {
-        const { deviceId, uuid } = req.query;
+        let { deviceId, uuid } = req.query;
         
-        // 🔒 Validar que sean strings puros para evitar inyecciones NoSQL
-        if ((deviceId && typeof deviceId !== 'string') || (uuid && typeof uuid !== 'string')) {
-            return res.status(400).json({ error: 'Parámetros inválidos.' });
+        // 🛡️ Filtra parámetros vacíos o textos literales 'null' / 'undefined'
+        if (deviceId === 'null' || deviceId === 'undefined') deviceId = null;
+        if (uuid === 'null' || uuid === 'undefined') uuid = null;
+
+        if (!deviceId && !uuid) {
+            return res.status(200).json({ historial: [] }); // Responde al instante lista vacía en 0ms
         }
-        if (!deviceId && !uuid) return res.status(400).json({ error: "Falta el identificador" });
 
         const idQuery = [];
-        if (deviceId) {
-            idQuery.push({ deviceId: deviceId });
+        if (deviceId && typeof deviceId === 'string') {
+            idQuery.push({ deviceId: deviceId.trim() });
             idQuery.push({ deviceId: deviceId.trim().toLowerCase() });
         }
-        if (uuid && uuid !== deviceId) {
-            idQuery.push({ deviceId: uuid });
+        if (uuid && typeof uuid === 'string' && uuid !== deviceId) {
+            idQuery.push({ deviceId: uuid.trim() });
             idQuery.push({ deviceId: uuid.trim().toLowerCase() });
         }
 
         const historial = await History.find({ $or: idQuery })
                                        .sort({ fecha: -1 })
-                                       .limit(100) // 👈 LÍMITE ANTI-CUELGUES AÑADIDO (Carga ultra rápida)
                                        .lean();
 
         res.status(200).json({ historial });
