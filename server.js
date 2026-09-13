@@ -1503,7 +1503,6 @@ app.get('/api/get-transactions', verificarTokenOpcional, async (req, res) => {
 
         const transacciones = await Transaction.find({ $or: idQuery })
             .sort({ fecha: -1 })
-            .limit(50)
             .lean();
 
         res.json({ success: true, transacciones });
