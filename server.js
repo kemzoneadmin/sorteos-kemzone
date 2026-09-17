@@ -943,14 +943,11 @@ app.post('/api/comments/start', verificarTokenOpcional, async (req, res) => {
         if (esTikTok) {
             const inputTikTok = {
                 "postURLs": [url],
-                "resultsLimit": 1,
-                "commentsPerPost": limiteSolicitado,
-                "maxCommentsPerPost": limiteSolicitado,
-                "downloadVideos": false,
-                "extractTranscripts": false
+                "maxTopLevelComments": limiteSolicitado,
+                "maxComments": limiteSolicitado,
+                "maxRepliesPerComment": 0
             };
-            // Usamos .start() en vez de .call() para que responda instantáneamente
-            runInfo = await client.actor("clockworks/tiktok-scraper").start(inputTikTok);
+            runInfo = await client.actor("clockworks/tiktok-comments-scraper").start(inputTikTok);
         } else {
             let cookiesInstagram = [];
             try { if (process.env.INSTAGRAM_COOKIES) cookiesInstagram = JSON.parse(process.env.INSTAGRAM_COOKIES); } catch (e) {}
@@ -1007,15 +1004,8 @@ app.post('/api/comments/status', verificarTokenOpcional, async (req, res) => {
 
         // ⏳ AÚN TRABAJANDO: DEVOLVEMOS NÚMEROS A LA BARRA DE PROGRESO
         if (status === 'RUNNING' || status === 'READY') {
-            let itemCount = 0;
-            if (!esTikTok) { 
-                // IG suelta la data en tiempo real
-                const datasetInfo = await client.dataset(datasetId).getInfo();
-                itemCount = datasetInfo.itemCount;
-            } else {
-                // TikTok lo suelta todo al final en un dataset oculto, tiramos -1 para el faking visual
-                itemCount = -1;
-            }
+            const datasetInfo = await client.dataset(datasetId).getInfo();
+            const itemCount = datasetInfo ? datasetInfo.itemCount : 0;
             return res.json({ status: 'RUNNING', itemCount });
         }
 
@@ -1025,23 +1015,17 @@ app.post('/api/comments/status', verificarTokenOpcional, async (req, res) => {
 
             if (esTikTok) {
                 const { items } = await client.dataset(datasetId).listItems();
-                if (items && items.length > 0) {
-                    const videoPost = items[0];
-                    let subDatasetId = videoPost.commentsDatasetId;
-                    if (!subDatasetId && videoPost.commentsDatasetUrl) {
-                        const match = videoPost.commentsDatasetUrl.match(/datasets\/([^\/]+)/);
-                        if (match) subDatasetId = match[1];
-                    }
-                    if (subDatasetId && subDatasetId !== 'items') {
-                        const subDatasetResult = await client.dataset(subDatasetId).listItems();
-                        const comentariosCrudos = subDatasetResult.items || [];
-                        comentariosCrudos.forEach(c => {
-                            const user = extraerUsuarioDinamicamente(c);
-                            const rawAvatar = extraerAvatarDinamicamente(c);
-                            if (user) listaComentarios.push({ username: user, text: c.text || c.commentText || "", profilePicUrl: rawAvatar });
+                (items || []).forEach(c => {
+                    const user = extraerUsuarioDinamicamente(c);
+                    const rawAvatar = extraerAvatarDinamicamente(c);
+                    if (user) {
+                        listaComentarios.push({
+                            username: user,
+                            text: c.text || c.commentText || "",
+                            profilePicUrl: rawAvatar
                         });
                     }
-                }
+                });
             } else {
                 const { items } = await client.dataset(datasetId).listItems();
                 if (items && items.length > 0) {
