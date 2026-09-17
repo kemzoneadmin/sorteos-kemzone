@@ -1004,8 +1004,13 @@ app.post('/api/comments/status', verificarTokenOpcional, async (req, res) => {
 
         // ⏳ AÚN TRABAJANDO: DEVOLVEMOS NÚMEROS A LA BARRA DE PROGRESO
         if (status === 'RUNNING' || status === 'READY') {
-            const datasetInfo = await client.dataset(datasetId).getInfo();
-            const itemCount = datasetInfo ? datasetInfo.itemCount : 0;
+            let itemCount = 0;
+            try {
+                const datasetInfo = await client.dataset(datasetId).get();
+                itemCount = datasetInfo ? (datasetInfo.itemCount || 0) : 0;
+            } catch (errDataset) {
+                itemCount = 0;
+            }
             return res.json({ status: 'RUNNING', itemCount });
         }
 
@@ -1096,6 +1101,13 @@ app.post('/api/comments/status', verificarTokenOpcional, async (req, res) => {
 
     } catch (error) {
         console.error('Error en /api/comments/status:', error);
+        // 🛑 Blindaje: Si el servidor falla al consultar, matamos el run en Apify para que no siga cobrando
+        if (runId) {
+            try { 
+                await client.run(runId).abort(); 
+                console.log(`[🛑 CORTE DE SEGURIDAD] Tarea ${runId} abortada en Apify por error en status.`);
+            } catch (e) {}
+        }
         return res.status(500).json({ error: 'Error interno consultando estado a Apify.' });
     }
 });
