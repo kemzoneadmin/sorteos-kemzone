@@ -856,7 +856,7 @@ app.post('/api/preview', previewLimiter, async (req, res) => {
 });
 
 // =================================================================
-// 2. ENDPOINT: EXTRACCIÓN MASIVA (CON REEMBOLSO AUTOMÁTICO Y TOPE SEGURO)
+// 2. ENDPOINTS: EXTRACCIÓN MASIVA (LONG POLLING, PROGRESO Y REEMBOLSOS)
 // =================================================================
 
 // 🧮 Función oficial de cálculo de Tokems según la tabla de precios
@@ -876,7 +876,22 @@ function calcularCostoTokemsServidor(total) {
     return 48 + bloquesExtras;
 }
 
-app.post('/api/comments', verificarTokenOpcional, async (req, res) => {
+function obtenerTechoServidor(tokens) {
+    if (tokens <= 1) return 300;
+    if (tokens === 2) return 600;
+    if (tokens === 3) return 1000;
+    if (tokens === 6) return 2000;
+    if (tokens === 12) return 4000;
+    if (tokens === 24) return 10000;
+    if (tokens === 30) return 12500;
+    if (tokens === 36) return 15000;
+    if (tokens === 42) return 17500;
+    if (tokens === 48) return 20000;
+    return 20000 + ((tokens - 48) * 500);
+}
+
+// 🚀 2.1 INICIAR LA EXTRACCIÓN Y DEVOLVER TICKET (START)
+app.post('/api/comments/start', verificarTokenOpcional, async (req, res) => {
     const { url, maxComments, deviceId, costoTokens } = req.body;
     if (!url) return res.status(400).json({ error: 'La URL es obligatoria' });
 
@@ -886,60 +901,31 @@ app.post('/api/comments', verificarTokenOpcional, async (req, res) => {
 
     const esTikTok = url.includes('tiktok.com');
     const costoReal = parseInt(costoTokens) || 0;
-    
-    // 🔒 Techo máximo calculado de forma segura en servidor
-    function obtenerTechoServidor(tokens) {
-        if (tokens <= 1) return 300;
-        if (tokens === 2) return 600;
-        if (tokens === 3) return 1000;
-        if (tokens === 6) return 2000;
-        if (tokens === 12) return 4000;
-        if (tokens === 24) return 10000;
-        if (tokens === 30) return 12500;
-        if (tokens === 36) return 15000;
-        if (tokens === 42) return 17500;
-        if (tokens === 48) return 20000;
-        return 20000 + ((tokens - 48) * 500);
-    }
-
-// ✅ CÓDIGO CORREGIDO Y SEGURO
-const techoSeguro = obtenerTechoServidor(costoReal);
-const limiteSeguro = techoSeguro;
+    const limiteSeguro = obtenerTechoServidor(costoReal);
+    // Para no excedernos de lo máximo que permite tu token
+    const limiteSolicitado = Math.max(parseInt(maxComments) || 0, limiteSeguro); 
 
     try {
-        console.log(`\n[📥] Extracción masiva en marcha (${esTikTok ? 'TikTok' : 'Instagram'}) para: ${url}`);
+        console.log(`\n[📥] Arranque en la nube (${esTikTok ? 'TikTok' : 'Instagram'}) para: ${url}`);
         
         let nuevoSaldoDefinitivo = 0;
-        let tokensCobrados = 0;
-        let usuarioAfectado = null;
-
-// 💰 1. DÉBITO INICIAL DE TOKEMS (BLINDADO CON VALIDACIÓN DE FONDOS)
-        if (!deviceId || costoReal <= 0) {
-            return res.status(400).json({ error: 'Parámetros de cobro inválidos.' });
-        }
-
         const identificadorLimpio = deviceId.trim().toLowerCase();
 
+        // 💰 1. DÉBITO INICIAL DE TOKEMS (Operación Atómica Inmediata)
         if (identificadorLimpio.includes('@')) {
             if (!req.user || req.user.email.toLowerCase() !== identificadorLimpio) {
                 return res.status(403).json({ error: 'No tienes autorización para debitar saldo de esta cuenta.' });
             }
 
-            // Operación Atómica: Busca y descuenta en 1 solo paso, solo si el saldo es mayor o igual al costo ($gte)
             const usuario = await User.findOneAndUpdate(
                 { email: identificadorLimpio, tokems: { $gte: costoReal } },
                 { $inc: { tokems: -costoReal } },
                 { new: true }
             );
 
-            if (!usuario) {
-                return res.status(402).json({ error: 'Saldo insuficiente de Tokems para realizar esta extracción.' });
-            }
-
+            if (!usuario) return res.status(402).json({ error: 'Saldo insuficiente de Tokems para este tamaño de extracción.' });
             nuevoSaldoDefinitivo = usuario.tokems;
-            tokensCobrados = costoReal;
-            usuarioAfectado = { tipo: 'user', doc: usuario };
-            console.log(`[🪙] Cobrado x${costoReal} Tokems a la Cuenta: ${identificadorLimpio}. Restan: ${nuevoSaldoDefinitivo}`);
+            console.log(`[🪙] Cobrado x${costoReal} Tokems a la Cuenta. Restan: ${nuevoSaldoDefinitivo}`);
         } else {
             const registroInvitado = await Balance.findOneAndUpdate(
                 { deviceId: identificadorLimpio, tokens: { $gte: costoReal } },
@@ -947,146 +933,201 @@ const limiteSeguro = techoSeguro;
                 { new: true }
             );
 
-            if (!registroInvitado) {
-                return res.status(402).json({ error: 'Saldo insuficiente de Tokems en este dispositivo.' });
-            }
-
+            if (!registroInvitado) return res.status(402).json({ error: 'Saldo insuficiente de Tokems en este dispositivo.' });
             nuevoSaldoDefinitivo = registroInvitado.tokens;
-            tokensCobrados = costoReal;
-            usuarioAfectado = { tipo: 'guest', doc: registroInvitado };
-            console.log(`[🪙] Cobrado x${costoReal} Tokems al Dispositivo: ${identificadorLimpio}. Restan: ${nuevoSaldoDefinitivo}`);
+            console.log(`[🪙] Cobrado x${costoReal} Tokems a Invitado. Restan: ${nuevoSaldoDefinitivo}`);
         }
 
-        let listaComentarios = [];
-
-        // 🤖 2. EXTRACCIÓN CON FRENO EN APIFY
+        // 🤖 2. ENCENDER EL ACTOR DE APIFY PERO SOLTAR LA LÍNEA
+        let runInfo;
         if (esTikTok) {
             const inputTikTok = {
                 "postURLs": [url],
                 "resultsLimit": 1,
-                "commentsPerPost": limiteSeguro,
-                "maxCommentsPerPost": limiteSeguro,
+                "commentsPerPost": limiteSolicitado,
+                "maxCommentsPerPost": limiteSolicitado,
                 "downloadVideos": false,
                 "extractTranscripts": false
             };
-
-            const run = await client.actor("clockworks/tiktok-scraper").call(inputTikTok);
-            const { items } = await client.dataset(run.defaultDatasetId).listItems();
-
-            if (items && items.length > 0) {
-                const videoPost = items[0];
-                let subDatasetId = videoPost.commentsDatasetId;
-                if (!subDatasetId && videoPost.commentsDatasetUrl) {
-                    const match = videoPost.commentsDatasetUrl.match(/datasets\/([^\/]+)/);
-                    if (match) subDatasetId = match[1];
-                }
-
-                if (subDatasetId && subDatasetId !== 'items') {
-                    console.log(`[📦] Descargando comentarios del dataset indexado: ${subDatasetId}`);
-                    const subDatasetResult = await client.dataset(subDatasetId).listItems();
-                    const comentariosCrudos = subDatasetResult.items || [];
-
-                    comentariosCrudos.forEach(c => {
-                        const user = extraerUsuarioDinamicamente(c);
-                        const rawAvatar = extraerAvatarDinamicamente(c);
-                        if (user) {
-                            listaComentarios.push({
-                                username: user,
-                                text: c.text || c.commentText || "",
-                                profilePicUrl: rawAvatar
-                            });
-                        }
-                    });
-                }
-            }
-
+            // Usamos .start() en vez de .call() para que responda instantáneamente
+            runInfo = await client.actor("clockworks/tiktok-scraper").start(inputTikTok);
         } else {
             let cookiesInstagram = [];
-            try {
-                if (process.env.INSTAGRAM_COOKIES) {
-                    cookiesInstagram = JSON.parse(process.env.INSTAGRAM_COOKIES);
-                }
-            } catch (e) {
-                console.error("Error parseando INSTAGRAM_COOKIES:", e);
-            }
+            try { if (process.env.INSTAGRAM_COOKIES) cookiesInstagram = JSON.parse(process.env.INSTAGRAM_COOKIES); } catch (e) {}
 
             const inputInstagram = {
                 "addParentData": false,
                 "directUrls": [url],
-                "resultsLimit": limiteSeguro,
+                "resultsLimit": limiteSolicitado,
                 "resultsType": "comments",
                 "searchLimit": 10,
                 "searchType": "hashtag",
                 "proxyConfiguration": { "useApifyProxy": true },
                 ...(cookiesInstagram.length > 0 && { "loginCookies": cookiesInstagram })
             };
-
-            const run = await client.actor("shu8hvrXbJbY3Eb9W").call(inputInstagram);
-            const { items } = await client.dataset(run.defaultDatasetId).listItems();
-
-            if (items && items.length > 0) {
-                listaComentarios = items
-                    .filter(c => c.ownerUsername || c.username || c.author)
-                    .map(c => {
-                        const user = c.ownerUsername || c.username || c.author || "Participante";
-                        const avatar = extraerAvatarDinamicamente(c) || c.ownerProfilePicUrl || c.profilePicUrl || c.authorProfilePicUrl || "";
-                        return {
-                            username: user,
-                            text: c.text || c.caption || "",
-                            profilePicUrl: avatar
-                        };
-                    });
-            }
+            runInfo = await client.actor("shu8hvrXbJbY3Eb9W").start(inputInstagram);
         }
 
-// 🔄 3. LÓGICA DE REEMBOLSO AUTOMÁTICO TRAS LA LIMPIEZA (0 COMENTARIOS = 0 TOKEMS)
-        const costoFinalCalculado = listaComentarios.length === 0 ? 0 : calcularCostoTokemsServidor(listaComentarios.length);
-        let tokemsReembolsados = 0;
-
-        if (costoReal > costoFinalCalculado && deviceId) {
-            tokemsReembolsados = costoReal - costoFinalCalculado;
-            const identificadorLimpio = deviceId.trim().toLowerCase();
-
-            if (identificadorLimpio.includes('@')) {
-                const usuario = await User.findOneAndUpdate(
-                    { email: identificadorLimpio },
-                    { $inc: { tokems: tokemsReembolsados } },
-                    { new: true }
-                );
-                if (usuario) nuevoSaldoDefinitivo = usuario.tokems;
-            } else {
-                const registroInvitado = await Balance.findOneAndUpdate(
-                    { deviceId: identificadorLimpio },
-                    { $inc: { tokens: tokemsReembolsados } },
-                    { new: true }
-                );
-                if (registroInvitado) nuevoSaldoDefinitivo = registroInvitado.tokens;
-            }
-            console.log(`[🔄 REEMBOLSO] Se devolvieron ${tokemsReembolsados} Tokems a ${deviceId}. Saldo final: ${nuevoSaldoDefinitivo}`);
-        }
-
-        console.log(`[✅] Proceso completado. Se enviaron ${listaComentarios.length} comentarios válidos.`);
-        
         return res.json({ 
-            comments: listaComentarios, 
+            success: true, 
+            runId: runInfo.id, 
+            datasetId: runInfo.defaultDatasetId,
             nuevoSaldo: nuevoSaldoDefinitivo,
-            reembolso: tokemsReembolsados
+            esTikTok: esTikTok
         });
 
     } catch (error) {
-        if (typeof tokensCobrados !== 'undefined' && tokensCobrados > 0 && typeof usuarioAfectado !== 'undefined' && usuarioAfectado) {
-            if (usuarioAfectado.tipo === 'user') {
-                usuarioAfectado.doc.tokems += tokensCobrados;
-                await usuarioAfectado.doc.save();
-            } else {
-                usuarioAfectado.doc.tokens += tokensCobrados;
-                await usuarioAfectado.doc.save();
-            }
-            console.log(`[🔄 DEVOLUCIÓN] Devueltos ${tokensCobrados} Tokems por caída de API.`);
-        }
+        console.error('❌ Error crítico en /api/comments/start:', error);
         
-        console.error('❌ Error crítico en /api/comments:', error);
-        return res.status(500).json({ error: 'Error en Apify: ' + error.message });
+        // ROLLBACK: Reembolsamos si falló al arrancar Apify (Caída de servidores o Auth Key expirada)
+        if (costoReal > 0) {
+            const identificadorLimpio = deviceId.trim().toLowerCase();
+            if (identificadorLimpio.includes('@')) {
+                await User.updateOne({ email: identificadorLimpio }, { $inc: { tokems: costoReal } });
+            } else {
+                await Balance.updateOne({ deviceId: identificadorLimpio }, { $inc: { tokens: costoReal } });
+            }
+            console.log(`[🔄 ROLLBACK] Tokems devueltos íntegros por fallo al arrancar Apify.`);
+        }
+
+        return res.status(500).json({ error: 'Error en Apify al intentar iniciar el servicio: ' + error.message });
+    }
+});
+
+
+// 📡 2.2 CONSULTAR EL ESTADO REAL DE LA EXTRACCIÓN (STATUS)
+app.post('/api/comments/status', verificarTokenOpcional, async (req, res) => {
+    const { runId, datasetId, esTikTok, deviceId, costoTokens } = req.body;
+    const costoReal = parseInt(costoTokens) || 0;
+    const identificadorLimpio = deviceId ? deviceId.trim().toLowerCase() : '';
+
+    try {
+        const run = await client.run(runId).get();
+        const status = run.status;
+
+        // ⏳ AÚN TRABAJANDO: DEVOLVEMOS NÚMEROS A LA BARRA DE PROGRESO
+        if (status === 'RUNNING' || status === 'READY') {
+            let itemCount = 0;
+            if (!esTikTok) { 
+                // IG suelta la data en tiempo real
+                const datasetInfo = await client.dataset(datasetId).getInfo();
+                itemCount = datasetInfo.itemCount;
+            } else {
+                // TikTok lo suelta todo al final en un dataset oculto, tiramos -1 para el faking visual
+                itemCount = -1;
+            }
+            return res.json({ status: 'RUNNING', itemCount });
+        }
+
+        // ✅ ¡FINALIZADO CON ÉXITO!
+        if (status === 'SUCCEEDED') {
+            let listaComentarios = [];
+
+            if (esTikTok) {
+                const { items } = await client.dataset(datasetId).listItems();
+                if (items && items.length > 0) {
+                    const videoPost = items[0];
+                    let subDatasetId = videoPost.commentsDatasetId;
+                    if (!subDatasetId && videoPost.commentsDatasetUrl) {
+                        const match = videoPost.commentsDatasetUrl.match(/datasets\/([^\/]+)/);
+                        if (match) subDatasetId = match[1];
+                    }
+                    if (subDatasetId && subDatasetId !== 'items') {
+                        const subDatasetResult = await client.dataset(subDatasetId).listItems();
+                        const comentariosCrudos = subDatasetResult.items || [];
+                        comentariosCrudos.forEach(c => {
+                            const user = extraerUsuarioDinamicamente(c);
+                            const rawAvatar = extraerAvatarDinamicamente(c);
+                            if (user) listaComentarios.push({ username: user, text: c.text || c.commentText || "", profilePicUrl: rawAvatar });
+                        });
+                    }
+                }
+            } else {
+                const { items } = await client.dataset(datasetId).listItems();
+                if (items && items.length > 0) {
+                    listaComentarios = items
+                        .filter(c => c.ownerUsername || c.username || c.author)
+                        .map(c => {
+                            const user = c.ownerUsername || c.username || c.author || "Participante";
+                            const avatar = extraerAvatarDinamicamente(c) || c.ownerProfilePicUrl || c.profilePicUrl || c.authorProfilePicUrl || "";
+                            return { username: user, text: c.text || c.caption || "", profilePicUrl: avatar };
+                        });
+                }
+            }
+
+            // 🔄 AUDITORÍA FINAL: LÓGICA DE REEMBOLSO DE FONDOS
+            const costoFinalCalculado = listaComentarios.length === 0 ? 0 : calcularCostoTokemsServidor(listaComentarios.length);
+            let tokemsReembolsados = 0;
+            let nuevoSaldoDefinitivo = 0;
+
+            if (costoReal > costoFinalCalculado && identificadorLimpio) {
+                tokemsReembolsados = costoReal - costoFinalCalculado;
+                
+                if (identificadorLimpio.includes('@')) {
+                    const usuario = await User.findOneAndUpdate(
+                        { email: identificadorLimpio }, 
+                        { $inc: { tokems: tokemsReembolsados } }, 
+                        { new: true }
+                    );
+                    if (usuario) nuevoSaldoDefinitivo = usuario.tokems;
+                } else {
+                    const registroInvitado = await Balance.findOneAndUpdate(
+                        { deviceId: identificadorLimpio }, 
+                        { $inc: { tokens: tokemsReembolsados } }, 
+                        { new: true }
+                    );
+                    if (registroInvitado) nuevoSaldoDefinitivo = registroInvitado.tokens;
+                }
+                console.log(`[🔄 REEMBOLSO AUDITORÍA] Faltaron comentarios. Devueltos ${tokemsReembolsados} Tokems.`);
+            }
+
+            console.log(`[✅] Proceso cerrado. Enviados ${listaComentarios.length} comentarios reales al navegador.`);
+            return res.json({ 
+                status: 'SUCCEEDED', 
+                comments: listaComentarios, 
+                reembolso: tokemsReembolsados,
+                nuevoSaldo: nuevoSaldoDefinitivo
+            });
+        }
+
+// ❌ FALLÓ O CADUCÓ (Error de Apify - SÍ SE REEMBOLSA)
+        if (status === 'FAILED' || status === 'TIMED-OUT') {
+            let saldoRestaurado = 0;
+            if (identificadorLimpio.includes('@')) {
+                const u = await User.findOneAndUpdate({ email: identificadorLimpio }, { $inc: { tokems: costoReal } }, { new: true });
+                if(u) saldoRestaurado = u.tokems;
+            } else {
+                const b = await Balance.findOneAndUpdate({ deviceId: identificadorLimpio }, { $inc: { tokens: costoReal } }, { new: true });
+                if(b) saldoRestaurado = b.tokens;
+            }
+            console.log(`[❌ CAÍDA APIFY] Fallo interno del bot. Reembolso total de ${costoReal} Tokems.`);
+            return res.status(500).json({ error: `La extracción falló en los servidores (Status: ${status}). Tus Tokems han sido devueltos.`, nuevoSaldo: saldoRestaurado });
+        }
+
+        // 🛑 ABORTADO (El usuario cerró la página o presionó la X - PENALIZACIÓN, NO SE REEMBOLSA)
+        if (status === 'ABORTED') {
+            console.log(`[🛑 CANCELADO] Proceso abortado por el usuario. SIN REEMBOLSO de los ${costoReal} Tokems.`);
+            return res.status(500).json({ error: `Sorteo cancelado. Has perdido los Tokems debitados debido a la política de cancelación en curso.` });
+        }
+
+    } catch (error) {
+        console.error('Error en /api/comments/status:', error);
+        return res.status(500).json({ error: 'Error interno consultando estado a Apify.' });
+    }
+});
+
+// 🛑 2.3 CANCELACIÓN DIRECTA DESDE EL NAVEGADOR (ABORT)
+app.post('/api/comments/abort', verificarTokenOpcional, async (req, res) => {
+    const { runId } = req.body;
+    try {
+        // Orden directa de asesinato al proceso de Apify para que deje de consumir cuota de tu tarjeta
+        await client.run(runId).abort();
+        
+        console.log(`[🛑 USUARIO CANCELA] Proceso detenido en Apify para ahorrar saldo. Cero reembolsos aplicados.`);
+        return res.json({ success: true, message: 'Abortado. Sin reembolso por políticas de uso.' });
+        
+    } catch (error) {
+        return res.status(500).json({ error: 'No se pudo abortar el proceso remoto.' });
     }
 });
 
