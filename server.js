@@ -1069,6 +1069,15 @@ app.post('/api/comments/status', verificarTokenOpcional, async (req, res) => {
                     if (registroInvitado) nuevoSaldoDefinitivo = registroInvitado.tokens;
                 }
                 console.log(`[🔄 REEMBOLSO AUDITORÍA] Faltaron comentarios. Devueltos ${tokemsReembolsados} Tokems.`);
+            } else if (identificadorLimpio) {
+                // 🛡️ Si no hubo reembolso, consultamos el saldo real en la base de datos para no devolver 0
+                if (identificadorLimpio.includes('@')) {
+                    const usuario = await User.findOne({ email: identificadorLimpio });
+                    if (usuario) nuevoSaldoDefinitivo = usuario.tokems;
+                } else {
+                    const registroInvitado = await Balance.findOne({ deviceId: identificadorLimpio });
+                    if (registroInvitado) nuevoSaldoDefinitivo = registroInvitado.tokens;
+                }
             }
 
             console.log(`[✅] Proceso cerrado. Enviados ${listaComentarios.length} comentarios reales al navegador.`);
