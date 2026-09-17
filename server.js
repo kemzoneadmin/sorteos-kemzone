@@ -766,13 +766,11 @@ app.post('/api/preview', previewLimiter, async (req, res) => {
         if (esTikTok) {
             const inputTikTok = {
                 "postURLs": [url],
-                "commentsPerPost": limiteSolicitado,
-                "maxRepliesPerComment": 0,
-                "excludePinnedPosts": false,
-                "resultsPerPage": 100
+                "resultsLimit": 1,
+                "commentsPerPost": 0,
+                "downloadVideos": false,
+                "extractTranscripts": false
             };
-            runInfo = await client.actor("clockworks/tiktok-comments-scraper").start(inputTikTok);
-        }
 
             // Inicia el actor guardando su ID para permitir abortos
             const run = await client.actor("clockworks/tiktok-scraper").start(inputTikTok);
@@ -945,9 +943,10 @@ app.post('/api/comments/start', verificarTokenOpcional, async (req, res) => {
         if (esTikTok) {
             const inputTikTok = {
                 "postURLs": [url],
-                "maxTopLevelComments": limiteSolicitado,
-                "maxComments": limiteSolicitado,
-                "maxRepliesPerComment": 0
+                "commentsPerPost": limiteSolicitado,
+                "maxRepliesPerComment": 0,
+                "excludePinnedPosts": false,
+                "resultsPerPage": 100
             };
             runInfo = await client.actor("clockworks/tiktok-comments-scraper").start(inputTikTok);
         } else {
