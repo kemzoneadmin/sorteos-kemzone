@@ -766,11 +766,13 @@ app.post('/api/preview', previewLimiter, async (req, res) => {
         if (esTikTok) {
             const inputTikTok = {
                 "postURLs": [url],
-                "resultsLimit": 1,
-                "commentsPerPost": 0,
-                "downloadVideos": false,
-                "extractTranscripts": false
+                "commentsPerPost": limiteSolicitado,
+                "maxRepliesPerComment": 0,
+                "excludePinnedPosts": false,
+                "resultsPerPage": 100
             };
+            runInfo = await client.actor("clockworks/tiktok-comments-scraper").start(inputTikTok);
+        }
 
             // Inicia el actor guardando su ID para permitir abortos
             const run = await client.actor("clockworks/tiktok-scraper").start(inputTikTok);
