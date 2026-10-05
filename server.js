@@ -189,6 +189,66 @@ ExtractionSchema.index({ huboManipulacion: 1 });
 
 const Extraction = mongoose.model('Extraction', ExtractionSchema, 'extractions');
 
+// =================================================================
+// 🛒 ESQUEMA: AUDITORÍA DE WEBHOOKS DE SHOPIFY (ANTI-PAGOS PERDIDOS)
+// =================================================================
+const WebhookLogSchema = new mongoose.Schema({
+    shopifyOrderId: { type: String, required: true, index: true },
+    deviceIdDetectado: { type: String, default: null, index: true },
+    emailOrden: { type: String, default: null, index: true },
+    tokensComprados: { type: Number, default: 0 },
+    precioTotal: { type: String, default: '' },
+    estado: { 
+        type: String, 
+        enum: ['EXITOSO', 'HUERFANO_SIN_ID', 'SIN_TOKENS', 'DUPLICADO_IGNORADO'], 
+        required: true,
+        index: true
+    },
+    detalles: { type: String, default: '' },
+    fecha: { type: Date, default: Date.now }
+}, { timestamps: true });
+
+WebhookLogSchema.index({ shopifyOrderId: 1, fecha: -1 });
+const WebhookLog = mongoose.model('WebhookLog', WebhookLogSchema, 'webhook_logs');
+
+// =================================================================
+// 🎟️ ESQUEMA: AUDITORÍA DE CANJES DE PINES (ANTI-FUERZA BRUTA)
+// =================================================================
+const PinAttemptSchema = new mongoose.Schema({
+    codigoIngresado: { type: String, required: true, uppercase: true, trim: true, index: true },
+    deviceId: { type: String, required: true, index: true },
+    ip: { type: String, default: '' },
+    exito: { type: Boolean, required: true, index: true },
+    motivoFallo: { 
+        type: String, 
+        enum: ['NINGUNO', 'PIN_INEXISTENTE', 'PIN_YA_USADO', 'CUENTA_NO_ENCONTRADA'], 
+        default: 'NINGUNO' 
+    },
+    fecha: { type: Date, default: Date.now }
+}, { timestamps: true });
+
+PinAttemptSchema.index({ ip: 1, fecha: -1 });
+const PinAttempt = mongoose.model('PinAttempt', PinAttemptSchema, 'pin_attempts');
+
+// =================================================================
+// 🔐 ESQUEMA: AUDITORÍA DE INICIOS DE SESIÓN (ANTI-ROBO DE CUENTAS)
+// =================================================================
+const LoginLogSchema = new mongoose.Schema({
+    email: { type: String, required: true, lowercase: true, trim: true, index: true },
+    ip: { type: String, default: '' },
+    userAgent: { type: String, default: '' },
+    exito: { type: Boolean, required: true, index: true },
+    motivo: { 
+        type: String, 
+        enum: ['LOGIN_EXITOSO', 'CREDENCIALES_INVALIDAS', 'CUENTA_NO_VERIFICADA'], 
+        default: 'LOGIN_EXITOSO' 
+    },
+    fecha: { type: Date, default: Date.now }
+}, { timestamps: true });
+
+LoginLogSchema.index({ email: 1, fecha: -1 });
+const LoginLog = mongoose.model('LoginLog', LoginLogSchema, 'login_logs');
+
 // 🔒 CLIENTE APIFY PROTEGIDO CON VARIABLES DE ENTORNO
 const client = new ApifyClient({
     token: process.env.APIFY_TOKEN
@@ -261,6 +321,20 @@ app.post('/api/shopify-webhook', express.raw({ type: 'application/json' }), asyn
 
         if (!deviceId || deviceId === 'null' || deviceId === 'undefined') {
             console.log("⚠️ Webhook ignorado: No se detectó un deviceId ni un correo válido en la orden.");
+            
+            // 📝 Registrar orden huérfana para reclamos manuales
+            try {
+                await new WebhookLog({
+                    shopifyOrderId: String(order.order_number || order.id || 'DESCONOCIDA'),
+                    deviceIdDetectado: null,
+                    emailOrden: order.email || (order.customer && order.customer.email) || null,
+                    tokensComprados: 0,
+                    precioTotal: order.total_price ? `$${order.total_price}` : '',
+                    estado: 'HUERFANO_SIN_ID',
+                    detalles: 'Pago recibido sin deviceId ni cuenta asociada.'
+                }).save();
+            } catch (errLog) {}
+
             return res.status(200).send("Pedido sin identificador"); 
         }
 
@@ -284,6 +358,19 @@ app.post('/api/shopify-webhook', express.raw({ type: 'application/json' }), asyn
 
         if (tokensAAgregar === 0) {
             console.log("⚠️ El pedido no contenía ninguna variante de Tokems registrada.");
+
+            try {
+                await new WebhookLog({
+                    shopifyOrderId: ordenId,
+                    deviceIdDetectado: deviceId,
+                    emailOrden: order.email || null,
+                    tokensComprados: 0,
+                    precioTotal: order.total_price ? `$${order.total_price}` : '',
+                    estado: 'SIN_TOKENS',
+                    detalles: 'Pedido recibido pero no contenía variantes de Tokems válidas.'
+                }).save();
+            } catch (errLog) {}
+
             return res.status(200).send("No hay tokens que sumar");
         }
 
@@ -304,6 +391,19 @@ app.post('/api/shopify-webhook', express.raw({ type: 'application/json' }), asyn
             // Error 11000 = Llave duplicada detectada en el mismo milisegundo
             if (err.code === 11000) {
                 console.log(`⚠️ Webhook ignorado: La orden #${ordenId} ya fue registrada previamente.`);
+                
+                try {
+                    await new WebhookLog({
+                        shopifyOrderId: ordenId,
+                        deviceIdDetectado: identificadorLimpio,
+                        emailOrden: order.email || null,
+                        tokensComprados: tokensAAgregar,
+                        precioTotal: order.total_price ? `$${order.total_price}` : '',
+                        estado: 'DUPLICADO_IGNORADO',
+                        detalles: 'Intento de procesamiento repetido frenado por índice único.'
+                    }).save();
+                } catch (errLog) {}
+
                 return res.status(200).send("Orden ya procesada");
             }
             throw err;
@@ -327,6 +427,19 @@ app.post('/api/shopify-webhook', express.raw({ type: 'application/json' }), asyn
             await registroInvitado.save();
             console.log(`✅ Éxito (Invitado): Se le sumaron ${tokensAAgregar} Tokems al dispositivo anónimo ${deviceId}. Nuevo saldo: ${registroInvitado.tokens}`);
         }
+
+// 📝 Registrar acreditación exitosa en webhook_logs
+        try {
+            await new WebhookLog({
+                shopifyOrderId: ordenId,
+                deviceIdDetectado: identificadorLimpio,
+                emailOrden: order.email || (order.customer && order.customer.email) || null,
+                tokensComprados: tokensAAgregar,
+                precioTotal: order.total_price ? `$${order.total_price}` : '',
+                estado: 'EXITOSO',
+                detalles: `Acreditados ${tokensAAgregar} Tokems a ${identificadorLimpio}`
+            }).save();
+        } catch (errLog) {}
 
         return res.status(200).send("Webhook procesado con éxito");
 
@@ -525,14 +638,40 @@ app.post('/api/login', authLimiter, async (req, res) => {
     const { email, password } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'Por favor rellena todos los campos.' });
 
+    const correoLimpio = email.trim().toLowerCase();
+    const clientIp = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.ip || '';
+    const userAgent = req.headers['user-agent'] || 'Desconocido';
+
     try {
-        const correoLimpio = email.trim().toLowerCase();
         const usuario = await User.findOne({ email: correoLimpio });
 
         if (!usuario || !(await bcrypt.compare(password, usuario.password))) {
+            // 📝 Registrar intento fallido
+            try {
+                await new LoginLog({
+                    email: correoLimpio,
+                    ip: clientIp,
+                    userAgent: userAgent,
+                    exito: false,
+                    motivo: 'CREDENCIALES_INVALIDAS'
+                }).save();
+            } catch (errLog) {}
+
             return res.status(400).json({ error: 'El correo o la contraseña son totalmente incorrectos.' });
         }
+
         if (!usuario.isVerified) {
+            // 📝 Registrar bloqueo por falta de verificación
+            try {
+                await new LoginLog({
+                    email: correoLimpio,
+                    ip: clientIp,
+                    userAgent: userAgent,
+                    exito: false,
+                    motivo: 'CUENTA_NO_VERIFICADA'
+                }).save();
+            } catch (errLog) {}
+
             return res.status(401).json({ error: 'Esta cuenta no se encuentra verificada. Revisa tu correo electrónico.' });
         }
 
@@ -542,18 +681,28 @@ app.post('/api/login', authLimiter, async (req, res) => {
             { expiresIn: '30d' }
         );
 
-        // 🚀 OBTENEMOS EL CONTEO DE LA CUENTA (Totalmente independiente)
         const hoy = new Date().toISOString().split('T')[0];
         let previewCount = 0;
         let finalReg = await Preview.findOne({ deviceId: correoLimpio, date: hoy });
         if (finalReg) previewCount = finalReg.count;
 
-       return res.json({
+        // 📝 Registrar login exitoso
+        try {
+            await new LoginLog({
+                email: correoLimpio,
+                ip: clientIp,
+                userAgent: userAgent,
+                exito: true,
+                motivo: 'LOGIN_EXITOSO'
+            }).save();
+        } catch (errLog) {}
+
+        return res.json({
             success: true,
             token,
             tokems: usuario.tokems,
             previewCount,
-            customConfig: usuario.customConfig // 👈 Envía el diseño guardado al loguearse
+            customConfig: usuario.customConfig
         });
     } catch (error) {
         console.error('Error en /api/login:', error);
@@ -1315,27 +1464,57 @@ app.post('/api/redeem', redeemLimiter, async (req, res) => {
     const { code, deviceId } = req.body;
     if (!code || !deviceId) return res.status(400).json({ error: 'El código y el identificador son estrictamente requeridos.' });
 
+    const codigoLimpio = code.trim().toUpperCase();
+    const identificadorLimpio = deviceId.trim().toLowerCase();
+    const clientIp = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.ip || '';
+
     try {
-        // 🔒 Operación atómica directa en MongoDB: bloquea el pin al instante en el mismo milisegundo
+        // 🔒 Operación atómica directa en MongoDB: bloquea el pin al instante
         const pin = await Pin.findOneAndUpdate(
-            { code: code.trim().toUpperCase(), used: false },
+            { code: codigoLimpio, used: false },
             { $set: { used: true } },
             { new: true }
         );
 
         if (!pin) {
+            // 🕵 Auditoría forense: averiguar por qué falló
+            let motivoFallo = 'PIN_INEXISTENTE';
+            try {
+                const pinUsado = await Pin.findOne({ code: codigoLimpio });
+                if (pinUsado && pinUsado.used) {
+                    motivoFallo = 'PIN_YA_USADO';
+                }
+                await new PinAttempt({
+                    codigoIngresado: codigoLimpio,
+                    deviceId: identificadorLimpio,
+                    ip: clientIp,
+                    exito: false,
+                    motivoFallo: motivoFallo
+                }).save();
+            } catch (errLog) {}
+
             return res.status(400).json({ error: 'El pin introducido no es válido o ya fue canjeado.' });
         }
 
-        const identificadorLimpio = deviceId.trim().toLowerCase();
         let nuevoSaldo = 0;
 
         if (identificadorLimpio.includes('@')) {
             let usuario = await User.findOne({ email: identificadorLimpio });
             if (!usuario) {
-                // Si la cuenta no existe, revertimos el pin para no perderlo
+                // Revertir pin si la cuenta no existe
                 pin.used = false;
                 await pin.save();
+
+                try {
+                    await new PinAttempt({
+                        codigoIngresado: codigoLimpio,
+                        deviceId: identificadorLimpio,
+                        ip: clientIp,
+                        exito: false,
+                        motivoFallo: 'CUENTA_NO_ENCONTRADA'
+                    }).save();
+                } catch (errLog) {}
+
                 return res.status(404).json({ error: 'Cuenta no encontrada.' });
             }
             
@@ -1351,6 +1530,17 @@ app.post('/api/redeem', redeemLimiter, async (req, res) => {
             await registroInvitado.save();
             nuevoSaldo = registroInvitado.tokens;
         }
+
+        // 📝 Registrar canje exitoso
+        try {
+            await new PinAttempt({
+                codigoIngresado: codigoLimpio,
+                deviceId: identificadorLimpio,
+                ip: clientIp,
+                exito: true,
+                motivoFallo: 'NINGUNO'
+            }).save();
+        } catch (errLog) {}
 
         return res.status(200).json({ success: true, tokens: pin.tokens, userTokens: nuevoSaldo });
     } catch (error) {
