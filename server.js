@@ -151,6 +151,44 @@ DrawVerificationSchema.index({ createdAt: 1 }, { expireAfterSeconds: 604800 });
 
 const DrawVerification = mongoose.model('DrawVerification', DrawVerificationSchema);
 
+// =================================================================
+// 🕵️️ ESQUEMA: AUDITORÍA DE EXTRACCIONES Y SORTEOS (ANTI-RECLAMOS)
+// =================================================================
+const ExtractionSchema = new mongoose.Schema({
+    runId: { type: String, required: true, unique: true, index: true },
+    deviceId: { type: String, required: true, index: true },
+    email: { type: String, default: null },
+    esRegistrado: { type: Boolean, default: false },
+    ip: { type: String, default: '' },
+    url: { type: String, required: true },
+    plataforma: { type: String, enum: ['TikTok', 'Instagram'], required: true },
+    maquina: { type: String, default: 'Ruleta' },
+
+    // 📊 Métricas de auditoría
+    comentariosOriginales: { type: Number, required: true },
+    comentariosDeclarados: { type: Number, required: true },
+    huboManipulacion: { type: Boolean, default: false }, // true si el cliente redujo el número para pagar menos
+
+    // 🪙 Costos y cobertura técnica
+    tokemsCobrados: { type: Number, required: true },
+    techoCubierto: { type: Number, required: true }, // Límite que cubre el Tokem pagado
+    comentariosExtraidos: { type: Number, default: 0 },
+    tokemsReembolsados: { type: Number, default: 0 },
+
+    estado: { 
+        type: String, 
+        enum: ['EN_PROCESO', 'COMPLETADO', 'FALLIDO', 'ABORTADO'], 
+        default: 'EN_PROCESO' 
+    },
+    fecha: { type: Date, default: Date.now }
+}, { timestamps: true });
+
+// Índices rápidos para que encuentres los reclamos al instante
+ExtractionSchema.index({ deviceId: 1, fecha: -1 });
+ExtractionSchema.index({ huboManipulacion: 1 });
+
+const Extraction = mongoose.model('Extraction', ExtractionSchema, 'extractions');
+
 // 🔒 CLIENTE APIFY PROTEGIDO CON VARIABLES DE ENTORNO
 const client = new ApifyClient({
     token: process.env.APIFY_TOKEN
@@ -892,7 +930,15 @@ function obtenerTechoServidor(tokens) {
 
 // 🚀 2.1 INICIAR LA EXTRACCIÓN Y DEVOLVER TICKET (START)
 app.post('/api/comments/start', verificarTokenOpcional, async (req, res) => {
-    const { url, maxComments, deviceId, costoTokens } = req.body;
+    const { 
+        url, 
+        maxComments, 
+        deviceId, 
+        costoTokens, 
+        comentariosDetectados, 
+        comentariosDeclarados, 
+        maquina 
+    } = req.body;
     if (!url) return res.status(400).json({ error: 'La URL es obligatoria' });
 
     if (!url.includes('tiktok.com') && !url.includes('instagram.com')) {
@@ -964,6 +1010,36 @@ app.post('/api/comments/start', verificarTokenOpcional, async (req, res) => {
                 ...(cookiesInstagram.length > 0 && { "loginCookies": cookiesInstagram })
             };
             runInfo = await client.actor("shu8hvrXbJbY3Eb9W").start(inputInstagram);
+        }
+
+        // 📋 AUDITORÍA: Guardar registro forense en la colección 'extractions'
+        try {
+            const comDetectados = parseInt(comentariosDetectados) || limiteSolicitado;
+            const comDeclarados = parseInt(comentariosDeclarados) || limiteSolicitado;
+            const manipulado = comDeclarados < comDetectados;
+            const esCuentaRegistrada = identificadorLimpio.includes('@');
+            const ipCliente = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.ip || '';
+
+            const logAuditoria = new Extraction({
+                runId: runInfo.id,
+                deviceId: identificadorLimpio,
+                email: esCuentaRegistrada ? identificadorLimpio : null,
+                esRegistrado: esCuentaRegistrada,
+                ip: ipCliente,
+                url: url,
+                plataforma: esTikTok ? 'TikTok' : 'Instagram',
+                maquina: maquina || 'Ruleta',
+                comentariosOriginales: comDetectados,
+                comentariosDeclarados: comDeclarados,
+                huboManipulacion: manipulado,
+                tokemsCobrados: costoReal,
+                techoCubierto: limiteSeguro,
+                estado: 'EN_PROCESO'
+            });
+            await logAuditoria.save();
+            console.log(`[📋 AUDITORÍA] Extracción registrada: Run ${runInfo.id} | Declaró: ${comDeclarados} | Real: ${comDetectados} | Manipulado: ${manipulado}`);
+        } catch (errLog) {
+            console.error("Aviso no bloqueante al registrar auditoría:", errLog.message);
         }
 
         return res.json({ 
@@ -1080,6 +1156,20 @@ app.post('/api/comments/status', verificarTokenOpcional, async (req, res) => {
                 }
             }
 
+// 📝 Actualizar auditoría a COMPLETADO con el total extraído
+            try {
+                await Extraction.updateOne(
+                    { runId: runId },
+                    { 
+                        $set: { 
+                            comentariosExtraidos: listaComentarios.length,
+                            tokemsReembolsados: tokemsReembolsados,
+                            estado: 'COMPLETADO' 
+                        } 
+                    }
+                );
+            } catch (errUp) {}
+
             console.log(`[✅] Proceso cerrado. Enviados ${listaComentarios.length} comentarios reales al navegador.`);
             return res.json({ 
                 status: 'SUCCEEDED', 
@@ -1099,12 +1189,14 @@ app.post('/api/comments/status', verificarTokenOpcional, async (req, res) => {
                 const b = await Balance.findOneAndUpdate({ deviceId: identificadorLimpio }, { $inc: { tokens: costoReal } }, { new: true });
                 if(b) saldoRestaurado = b.tokens;
             }
+            await Extraction.updateOne({ runId: runId }, { $set: { estado: 'FALLIDO' } }).catch(() => {});
             console.log(`[❌ CAÍDA APIFY] Fallo interno del bot. Reembolso total de ${costoReal} Tokems.`);
             return res.status(500).json({ error: `La extracción falló en los servidores (Status: ${status}). Tus Tokems han sido devueltos.`, nuevoSaldo: saldoRestaurado });
         }
 
         // 🛑 ABORTADO (El usuario cerró la página o presionó la X - PENALIZACIÓN, NO SE REEMBOLSA)
         if (status === 'ABORTED') {
+            await Extraction.updateOne({ runId: runId }, { $set: { estado: 'ABORTADO' } }).catch(() => {});
             console.log(`[🛑 CANCELADO] Proceso abortado por el usuario. SIN REEMBOLSO de los ${costoReal} Tokems.`);
             return res.status(500).json({ error: `Sorteo cancelado. Has perdido los Tokems debitados debido a la política de cancelación en curso.` });
         }
@@ -1128,7 +1220,7 @@ app.post('/api/comments/abort', verificarTokenOpcional, async (req, res) => {
     try {
         // Orden directa de asesinato al proceso de Apify para que deje de consumir cuota de tu tarjeta
         await client.run(runId).abort();
-        
+        await Extraction.updateOne({ runId: runId }, { $set: { estado: 'ABORTADO' } }).catch(() => {});
         console.log(`[🛑 USUARIO CANCELA] Proceso detenido en Apify para ahorrar saldo. Cero reembolsos aplicados.`);
         return res.json({ success: true, message: 'Abortado. Sin reembolso por políticas de uso.' });
         
