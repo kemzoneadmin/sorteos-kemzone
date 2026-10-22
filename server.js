@@ -266,7 +266,7 @@ const TOKENS_POR_VARIANTE = {
 // 7. ENDPOINT: WEBHOOK DE SHOPIFY (BLINDADO CON HMAC)
 // =================================================================
 // IMPORTANTE: Esta ruta debe ir ANTES de los app.use(express.json())
-app.post('/api/shopify-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+app.post('/api/shopify-webhook-kz07x', express.raw({ type: 'application/json' }), async (req, res) => {
     try {
         const hmac = req.header('X-Shopify-Hmac-Sha256');
         const secret = process.env.SHOPIFY_SECRET; 
