@@ -596,7 +596,7 @@ async function inicializarTiendaKemZonePorDefecto() {
                     badgeText: '🎁 PIN por API',
                     description: 'Código PIN oficial de Roblox para canjear por Robux o suscripción Premium. Entrega en pantalla al aprobarse el pago.',
                     instructions: 'Escribe tu correo o WhatsApp donde también respaldaremos tu código PIN.',
-                    cardImageUrl: 'https://images.unsplash.com/photo-1614680376593-902f749f7ffc?auto=format&fit=crop&w=600&q=80',
+                    cardImageUrl: 'https://images.unsplash.com/photo-1579373903781-fd5c0c30c4cd?auto=format&fit=crop&w=600&q=80',
                     uidLabel: 'Tu Correo o WhatsApp de recepción',
                     sortOrder: 4,
                     packages: [
