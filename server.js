@@ -223,7 +223,6 @@ const StoreSettingsSchema = new mongoose.Schema({
     storeOpen: { type: Boolean, default: true },
     autoTriggerApiOnTokems: { type: Boolean, default: true },
     announcementText: { type: String, default: '🔥 KEM!ZONE OFICIAL: Recargas y Gift Cards al instante — Aceptamos Pago Móvil, Binance, Zinli y Tokems KZ' },
-showAnnouncement: { type: Boolean, default: true },
     // 🎨 Configuración editable del Banner Principal (Portada)
     heroConfig: {
         tagText: { type: String, default: '🇻🇪 Tienda Oficial verificada • +11.4K en Instagram' },
