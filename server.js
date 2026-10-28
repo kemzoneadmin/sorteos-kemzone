@@ -300,6 +300,7 @@ uidLabel: { type: String, default: 'ID de Jugador (UID)' },
         tokemsPrice: { type: Number, required: true },
         apiProviderName: { type: String, default: 'DEFAULT_API' },
         apiProductSku: { type: String, default: '' },
+        imageUrl: { type: String, default: '' },
         backupPinVault: [{ type: String }],
         inStock: { type: Boolean, default: true }
     }]
