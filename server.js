@@ -223,6 +223,7 @@ const StoreSettingsSchema = new mongoose.Schema({
     storeOpen: { type: Boolean, default: true },
     autoTriggerApiOnTokems: { type: Boolean, default: true },
     announcementText: { type: String, default: '🔥 KEM!ZONE OFICIAL: Recargas y Gift Cards al instante — Aceptamos Pago Móvil, Binance, Zinli y Tokems KZ' },
+    hideAnnouncement: { type: Boolean, default: false },
     // 🎨 Configuración editable del Banner Principal (Portada)
     heroConfig: {
         tagText: { type: String, default: '🇻🇪 Tienda Oficial verificada • +11.4K en Instagram' },
@@ -1815,7 +1816,7 @@ app.get('/api/admin/overview', verificarSoloAdmin, async (req, res) => {
 // 2. Modificar Tasa Bs/USD, Portada Hero, Loot Relámpago y Configuración General
 app.post('/api/admin/settings', verificarSoloAdmin, async (req, res) => {
     try {
-        const { exchangeRateVES, tokemValueUSD, storeOpen, autoTriggerApiOnTokems, announcementText, heroConfig, flashOffers } = req.body;
+        const { exchangeRateVES, tokemValueUSD, storeOpen, autoTriggerApiOnTokems, announcementText, hideAnnouncement, heroConfig, flashOffers } = req.body;
         let settings = await StoreSettings.findOne({ key: 'main_settings' });
         if (!settings) settings = new StoreSettings({ key: 'main_settings' });
 
@@ -1824,6 +1825,7 @@ app.post('/api/admin/settings', verificarSoloAdmin, async (req, res) => {
         if (typeof storeOpen === 'boolean') settings.storeOpen = storeOpen;
         if (typeof autoTriggerApiOnTokems === 'boolean') settings.autoTriggerApiOnTokems = autoTriggerApiOnTokems;
         if (announcementText !== undefined) settings.announcementText = announcementText;
+        if (typeof hideAnnouncement === 'boolean') settings.hideAnnouncement = hideAnnouncement;
         if (heroConfig && typeof heroConfig === 'object') settings.heroConfig = heroConfig;
         if (Array.isArray(flashOffers)) settings.flashOffers = flashOffers;
         settings.updatedBy = req.adminUser.email;
