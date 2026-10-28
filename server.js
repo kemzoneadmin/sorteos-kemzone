@@ -1472,6 +1472,9 @@ app.post('/api/orders/create', orderLimiter, verificarTokenOpcional, async (req,
 
 // 📡 3. RECOMENDACIÓN PRO #3: CONSULTA EN VIVO DE LA BARRA DE PROGRESO (ZONA 3 Y 4)
 app.get('/api/orders/live-status/:orderId', async (req, res) => {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.set('Pragma', 'no-cache');
+    res.set('Expires', '0');
     try {
         const idLimpio = req.params.orderId.trim().toUpperCase();
         const orden = await Order.findOne({ orderId: idLimpio }).select('-internalAccountLogin.accountPass -costUSD').lean();
