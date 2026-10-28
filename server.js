@@ -834,7 +834,7 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
 
     return {
         success: true,
-        deliveredCode: `RECARGA ACREDITADA VÍA API AL ID: ${orden.playerUid}`,
+        deliveredCode: `RECARGA ACREDITADA AL ID: ${orden.playerUid}`,
         apiOrderId: 'API-TOPUP-' + Date.now(),
         raw: { mode: 'api_topup_ready' }
     };
@@ -1755,7 +1755,6 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
 // 👑 DASHBOARD 1: ENDPOINTS EXCLUSIVOS PARA TI (ADMIN / DESARROLLADOR)
 // =================================================================
 
-// 1. Obtener Estadísticas Financieras Completas, Juegos Top, Bancos y Catálogo Completo
 app.get('/api/admin/overview', verificarSoloAdmin, async (req, res) => {
     try {
         const hoyInicio = new Date();
@@ -1769,25 +1768,32 @@ app.get('/api/admin/overview', verificarSoloAdmin, async (req, res) => {
             settings,
             products,
             paymentMethods,
-            ordenesEntregadasHoy,
-            ordenesEntregadasMes,
+            todasLasOrdenes,
             pendientesCount,
             ticketsAbiertosCount,
+            todosLosTickets,
             workersList,
-            totalClientesCount,
-            usuariosConSaldo
+            todosLosUsuarios,
+            balancesInvitados,
+            todosLosPines,
+            transaccionesTokems
         ] = await Promise.all([
             StoreSettings.findOne({ key: 'main_settings' }).lean(),
             CatalogProduct.find().sort({ sortOrder: 1 }).lean(),
             PaymentMethod.find().sort({ sortOrder: 1 }).lean(),
-            Order.find({ status: 'ENTREGADO', completedAt: { $gte: hoyInicio } }).lean(),
-            Order.find({ status: 'ENTREGADO', completedAt: { $gte: mesInicio } }).lean(),
+            Order.find().sort({ fecha: -1 }).limit(3000).select('-internalAccountLogin.accountPass -apiRawResponse').lean(),
             Order.countDocuments({ status: 'EN_PROCESO' }),
             SupportTicket.countDocuments({ status: { $in: ['ABIERTO', 'EN_REVISION'] } }),
-            User.find({ role: { $in: ['worker', 'admin'] } }).select('email role tokems').lean(),
-            User.countDocuments(),
-            User.find({ tokems: { $gt: 0 } }).select('tokems').lean()
+            SupportTicket.find().sort({ createdAt: -1 }).limit(300).select('ticketId orderId userEmail category status createdAt').lean(),
+            User.find({ role: { $in: ['worker', 'admin'] } }).select('email accountName role tokems').lean(),
+            User.find().sort({ createdAt: -1 }).select('accountName email role isVerified tokems savedProfiles createdAt').lean(),
+            Balance.find({ tokens: { $gt: 0 } }).select('deviceId tokens').lean(),
+            Pin.find().select('code tokens used createdBy createdAt').lean(),
+            Transaction.find().sort({ fecha: -1 }).limit(1000).select('deviceId tipo tokens plan precio fecha').lean()
         ]);
+
+        const ordenesEntregadasHoy = todasLasOrdenes.filter(o => o.status === 'ENTREGADO' && new Date(o.completedAt || o.fecha) >= hoyInicio);
+        const ordenesEntregadasMes = todasLasOrdenes.filter(o => o.status === 'ENTREGADO' && new Date(o.completedAt || o.fecha) >= mesInicio);
 
         const ventasHoyUSD = ordenesEntregadasHoy.reduce((acc, o) => acc + (Number(o.totalAmountUSD) || 0), 0);
         const ventasHoyVES = ordenesEntregadasHoy.reduce((acc, o) => acc + (Number(o.totalAmountVES) || 0), 0);
@@ -1795,9 +1801,11 @@ app.get('/api/admin/overview', verificarSoloAdmin, async (req, res) => {
 
         const ventasMesUSD = ordenesEntregadasMes.reduce((acc, o) => acc + (Number(o.totalAmountUSD) || 0), 0);
         const gananciaNetaMesUSD = ordenesEntregadasMes.reduce((acc, o) => acc + ((Number(o.totalAmountUSD) || 0) - (Number(o.costUSD) || 0)), 0);
-        const tokemsEnCirculacion = usuariosConSaldo.reduce((acc, u) => acc + (Number(u.tokems) || 0), 0);
 
-        // Desglose por Trabajador, por Juego y por Método de Pago en el mes
+        const tokemsCuentas = todosLosUsuarios.reduce((acc, u) => acc + (Number(u.tokems) || 0), 0);
+        const tokemsInvitados = balancesInvitados.reduce((acc, b) => acc + (Number(b.tokens) || 0), 0);
+        const tokemsEnCirculacion = tokemsCuentas + tokemsInvitados;
+
         const rendimientoTrabajadores = {};
         const ventasPorJuego = {};
         const ventasPorMetodo = {};
@@ -1817,6 +1825,9 @@ app.get('/api/admin/overview', verificarSoloAdmin, async (req, res) => {
             ventasPorMetodo[metodo].usd = Number((ventasPorMetodo[metodo].usd + (Number(o.totalAmountUSD) || 0)).toFixed(2));
         });
 
+        const pinesUsados = todosLosPines.filter(p => p.used);
+        const pinesDisponibles = todosLosPines.filter(p => !p.used);
+
         return res.json({
             success: true,
             analytics: {
@@ -1829,11 +1840,25 @@ app.get('/api/admin/overview', verificarSoloAdmin, async (req, res) => {
                 gananciaNetaMesUSD: Number(gananciaNetaMesUSD.toFixed(2)),
                 pendientesCount,
                 ticketsAbiertosCount,
-                totalClientesCount,
+                totalClientesCount: todosLosUsuarios.length,
                 tokemsEnCirculacion: Number(tokemsEnCirculacion.toFixed(2)),
+                tokemsCuentas: Number(tokemsCuentas.toFixed(2)),
+                tokemsInvitados: Number(tokemsInvitados.toFixed(2)),
                 rendimientoTrabajadores,
                 ventasPorJuego,
-                ventasPorMetodo
+                ventasPorMetodo,
+                // Datasets completos para filtrado por Día, Semana, Mes, Año y Paginación
+                rawOrders: todasLasOrdenes,
+                rawUsers: todosLosUsuarios,
+                rawTickets: todosLosTickets,
+                rawTransactions: transaccionesTokems,
+                pinsStats: {
+                    totalCount: todosLosPines.length,
+                    usedCount: pinesUsados.length,
+                    availableCount: pinesDisponibles.length,
+                    usedTokemsSum: Number(pinesUsados.reduce((a, p) => a + (Number(p.tokens) || 0), 0).toFixed(2)),
+                    availableTokemsSum: Number(pinesDisponibles.reduce((a, p) => a + (Number(p.tokens) || 0), 0).toFixed(2))
+                }
             },
             settings,
             products,
