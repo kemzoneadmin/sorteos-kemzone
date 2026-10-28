@@ -83,6 +83,7 @@ const Balance = mongoose.model('Balance', BalanceSchema);
 
 // 👤 CUENTAS DE USUARIOS (SOPORTA LOS 3 DASHBOARDS: CLIENT, WORKER, ADMIN)
 const UserSchema = new mongoose.Schema({
+    accountName: { type: String, default: '', trim: true },
     email: { type: String, required: true, unique: true, lowercase: true, trim: true },
     password: { type: String, required: true },
     role: { type: String, enum: ['client', 'worker', 'admin'], default: 'client' },
@@ -958,10 +959,11 @@ app.get('/', (req, res) => {
 // 🔐 ENDPOINTS DE AUTENTICACIÓN (CON ROLES: CLIENT, WORKER, ADMIN)
 // =================================================================
 app.post('/api/register', authLimiter, async (req, res) => {
-    const { email, password } = req.body;
-    if (!email || !password) return res.status(400).json({ error: 'El correo y la contraseña son obligatorios' });
+    const { accountName, email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ error: 'Todos los campos son obligatorios.' });
 
     try {
+        const nombreLimpio = (accountName || '').trim() || email.split('@')[0];
         const correoLimpio = email.trim().toLowerCase();
         let usuario = await User.findOne({ email: correoLimpio });
         const hashedPassword = await bcrypt.hash(password, 10);
@@ -972,6 +974,7 @@ app.post('/api/register', authLimiter, async (req, res) => {
             if (usuario.isVerified) {
                 return res.status(400).json({ error: 'El correo electrónico ya está registrado. Por favor inicia sesión.' });
             } else {
+                usuario.accountName = nombreLimpio;
                 usuario.password = hashedPassword;
                 usuario.verificationCode = codigoVerificacion;
                 usuario.role = rolAsignado;
@@ -979,6 +982,7 @@ app.post('/api/register', authLimiter, async (req, res) => {
             }
         } else {
             usuario = new User({
+                accountName: nombreLimpio,
                 email: correoLimpio,
                 password: hashedPassword,
                 role: rolAsignado,
@@ -992,12 +996,22 @@ app.post('/api/register', authLimiter, async (req, res) => {
             to: correoLimpio,
             subject: 'Código de verificación - Kem!Zone',
             html: `
-                <div style="font-family: sans-serif; background-color: #09090d; color: #ffffff; padding: 24px; border-radius: 12px; border: 2px solid #ff6600; max-width: 500px;">
-                    <h2 style="color: #ff6600; text-transform: uppercase;">¡Bienvenido a Kem!Zone!</h2>
-                    <p style="color: #cccccc;">Usa el siguiente código de 6 dígitos para verificar tu cuenta:</p>
-                    <div style="background-color: #14141d; border: 1px dashed #ff6600; padding: 15px; text-align: center; font-size: 28px; font-weight: bold; color: #ff6600; letter-spacing: 5px; border-radius: 8px; margin: 20px 0;">
+                <div style="font-family: 'Poppins', sans-serif; background-color: #09090d; color: #ffffff; padding: 32px 24px; border-radius: 18px; border: 1.5px solid #ff6600; max-width: 480px; margin: 0 auto; text-align: center;">
+                    <div style="display: inline-block; background: rgba(255,102,0,0.15); border: 1px solid #ff6600; color: #ff6600; font-weight: 800; font-size: 12px; padding: 5px 14px; border-radius: 50px; letter-spacing: 1px; margin-bottom: 14px;">
+                        KEM!ZONE OFICIAL
+                    </div>
+                    <h2 style="color: #ffffff; margin: 0 0 8px 0; font-size: 22px; text-transform: uppercase; letter-spacing: 0.5px;">
+                        ¡Hola, <span style="color: #ff6600;">${nombreLimpio}</span>!
+                    </h2>
+                    <p style="color: #9ba1b0; font-size: 14px; line-height: 1.5; margin-bottom: 22px;">
+                        Ingresa el siguiente código de seguridad de 6 dígitos en la ventana de verificación para activar tu cuenta de Kem!Zone:
+                    </p>
+                    <div style="background-color: #12121c; border: 1.5px dashed #ff6600; padding: 18px; text-align: center; font-size: 30px; font-weight: 900; color: #ff6600; letter-spacing: 8px; border-radius: 12px; margin: 0 auto 20px auto;">
                         ${codigoVerificacion}
                     </div>
+                    <p style="color: #6c7283; font-size: 12px; margin: 0;">
+                        Si no solicitaste crear esta cuenta, puedes ignorar este mensaje.
+                    </p>
                 </div>
             `
         });
@@ -1024,7 +1038,11 @@ app.post('/api/verify', authLimiter, async (req, res) => {
         usuario.verificationCode = null; 
         await usuario.save();
 
-        return res.status(200).json({ success: true, message: 'Tu cuenta ha sido verificada exitosamente.' });
+        return res.status(200).json({
+            success: true,
+            accountName: usuario.accountName || correoLimpio.split('@')[0],
+            message: 'Tu cuenta ha sido verificada exitosamente.'
+        });
     } catch (error) {
         return res.status(500).json({ error: 'Error interno al procesar la verificación.' });
     }
@@ -1073,8 +1091,9 @@ app.post('/api/login', authLimiter, async (req, res) => {
         return res.json({
             success: true,
             token,
+            accountName: usuario.accountName || usuario.email.split('@')[0],
             email: usuario.email,
-            role: rolEfectivo, // 'client', 'worker', o 'admin'
+            role: rolEfectivo,
             tokems: usuario.tokems,
             savedProfiles: usuario.savedProfiles || [],
             previewCount,
@@ -1099,24 +1118,36 @@ app.post('/api/forgot-password', authLimiter, async (req, res) => {
         usuario.resetPasswordExpires = new Date(Date.now() + 15 * 60 * 1000);
         await usuario.save();
 
+        const nombreMostrar = usuario.accountName || correoLimpio.split('@')[0];
+
         await resend.emails.send({
             from: 'Kem!Zone <registro@kzsorteos.com>',
             to: correoLimpio,
-            subject: 'Código para restablecer tu contraseña - Kem!Zone',
+            subject: 'Código de recuperación de contraseña - Kem!Zone',
             html: `
-                <div style="font-family: sans-serif; background-color: #09090d; color: #ffffff; padding: 25px; border-radius: 12px; border: 2px solid #ff6600; max-width: 500px;">
-                    <h2 style="color: #ff6600; text-align: center;">Recuperación de Contraseña</h2>
-                    <p style="color: #cccccc; text-align: center;">Usa el siguiente código de seguridad:</p>
-                    <div style="background-color: #14141d; border: 1px dashed #ff6600; padding: 15px; text-align: center; font-size: 28px; font-weight: bold; color: #ff6600; letter-spacing: 5px; border-radius: 8px; margin: 20px 0;">
+                <div style="font-family: 'Poppins', sans-serif; background-color: #09090d; color: #ffffff; padding: 32px 24px; border-radius: 18px; border: 1.5px solid #ff6600; max-width: 480px; margin: 0 auto; text-align: center;">
+                    <div style="display: inline-block; background: rgba(255,102,0,0.15); border: 1px solid #ff6600; color: #ff6600; font-weight: 800; font-size: 12px; padding: 5px 14px; border-radius: 50px; letter-spacing: 1px; margin-bottom: 14px;">
+                        SEGURIDAD KEM!ZONE
+                    </div>
+                    <h2 style="color: #ffffff; margin: 0 0 8px 0; font-size: 22px; text-transform: uppercase;">
+                        RECUPERAR <span style="color: #ff6600;">CONTRASEÑA</span>
+                    </h2>
+                    <p style="color: #9ba1b0; font-size: 14px; line-height: 1.5; margin-bottom: 22px;">
+                        Hola <b style="color:#ffffff;">${nombreMostrar}</b>, usa este código de 6 dígitos para establecer tu nueva contraseña (válido por 15 minutos):
+                    </p>
+                    <div style="background-color: #12121c; border: 1.5px dashed #ff6600; padding: 18px; text-align: center; font-size: 30px; font-weight: 900; color: #ff6600; letter-spacing: 8px; border-radius: 12px; margin: 0 auto 20px auto;">
                         ${codigoReset}
                     </div>
+                    <p style="color: #6c7283; font-size: 12px; margin: 0;">
+                        Si no solicitaste este cambio, tu cuenta sigue protegida y puedes ignorar este correo.
+                    </p>
                 </div>
             `
         });
 
         return res.status(200).json({ success: true, message: 'Código enviado exitosamente a tu correo.' });
     } catch (error) {
-        return res.status(500).json({ error: 'Error al enviar el correo.' });
+        return res.status(500).json({ error: 'Error al enviar el correo de recuperación.' });
     }
 });
 
@@ -1131,10 +1162,11 @@ app.post('/api/reset-password', authLimiter, async (req, res) => {
             return res.status(400).json({ error: 'El código de seguridad es incorrecto.' });
         }
         if (!usuario.resetPasswordExpires || new Date(usuario.resetPasswordExpires) < new Date()) {
-            return res.status(400).json({ error: 'El código ha expirado.' });
+            return res.status(400).json({ error: 'El código ha expirado. Solicita uno nuevo.' });
         }
 
         usuario.password = await bcrypt.hash(newPassword, 10);
+        usuario.isVerified = true;
         usuario.resetPasswordCode = null;
         usuario.resetPasswordExpires = null;
         await usuario.save();
@@ -2375,6 +2407,7 @@ app.get('/api/get-balance', async (req, res) => {
             const role = usuario ? determinarRolDeUsuario(usuario.email, usuario.role) : 'client';
             return res.json({ 
                 tokens: usuario ? usuario.tokems : 0, 
+                accountName: usuario ? (usuario.accountName || '') : '',
                 role,
                 previewCount,
                 customConfig: usuario ? usuario.customConfig : null 
