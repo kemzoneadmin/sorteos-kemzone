@@ -1809,6 +1809,29 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
     }
 });
 
+// 🗑️ ELIMINAR ORDEN DEFINITIVAMENTE (Se descuenta de estadísticas y del historial del cliente)
+app.post('/api/worker/delete-order', verificarTrabajadorOAdmin, async (req, res) => {
+    try {
+        const { orderId } = req.body;
+        if (!orderId) return res.status(400).json({ error: 'Falta el ID de la orden.' });
+
+        const idLimpio = String(orderId).trim().toUpperCase();
+        const ordenBorrada = await Order.findOneAndDelete({ orderId: idLimpio });
+
+        if (!ordenBorrada) {
+            return res.status(404).json({ error: 'La orden no existe o ya fue eliminada.' });
+        }
+
+        return res.json({
+            success: true,
+            message: `Orden #${idLimpio} eliminada con éxito de la base de datos.`
+        });
+    } catch (error) {
+        console.error('Error eliminando orden:', error);
+        return res.status(500).json({ error: 'Error al eliminar la orden.' });
+    }
+});
+
 // 👑 DASHBOARD 1: ENDPOINTS EXCLUSIVOS PARA TI (ADMIN / DESARROLLADOR)
 // =================================================================
 
