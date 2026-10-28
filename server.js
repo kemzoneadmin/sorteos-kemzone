@@ -377,10 +377,14 @@ const OrderSchema = new mongoose.Schema({
     // 📡 Estado para la Barra de Progreso en Vivo del Cliente (Zona 3 y 4)
     status: {
         type: String,
-        enum: ['INICIANDO', 'EN_PROCESO', 'EJECUTANDO_API', 'ENTREGADO', 'RECHAZADO', 'ERROR_API'],
+        enum: ['INICIANDO', 'EN_PROCESO', 'EN_REVISION', 'EJECUTANDO_API', 'ENTREGADO', 'RECHAZADO', 'ERROR_API'],
         default: 'EN_PROCESO',
         index: true
     },
+    hadReview: { type: Boolean, default: false },
+    reviewReason: { type: String, default: '' },
+    reviewedByWorker: { type: String, default: '' },
+    clientReviewWhatsappSent: { type: Boolean, default: false },
     statusMessage: { type: String, default: 'Verificando referencia de pago con un operador...' },
     progressPercent: { type: Number, default: 45 }, // 20% Iniciando -> 50% En Proceso -> 100% Entregado
 
@@ -1482,6 +1486,40 @@ app.get('/api/orders/live-status/:orderId', async (req, res) => {
     }
 });
 
+// 📲 Guardar el WhatsApp enviado por el cliente cuando su orden está EN REVISIÓN
+app.post('/api/orders/client-review-contact', async (req, res) => {
+    try {
+        const { orderId, userWhatsapp } = req.body;
+        if (!orderId || !userWhatsapp || String(userWhatsapp).trim().length < 7) {
+            return res.status(400).json({ error: 'Por favor ingresa un número de WhatsApp válido.' });
+        }
+
+        const idLimpio = String(orderId).trim().toUpperCase();
+        const wsLimpio = String(userWhatsapp).trim();
+
+        const orden = await Order.findOneAndUpdate(
+            { orderId: idLimpio },
+            { 
+                $set: { 
+                    userWhatsapp: wsLimpio, 
+                    clientReviewWhatsappSent: true 
+                } 
+            },
+            { new: true }
+        ).select('-internalAccountLogin.accountPass -costUSD');
+
+        if (!orden) return res.status(404).json({ error: 'Orden no encontrada.' });
+
+        return res.json({
+            success: true,
+            message: 'Tu número de WhatsApp fue recibido. Un operador te escribirá en breve.',
+            order: orden
+        });
+    } catch (error) {
+        return res.status(500).json({ error: 'Error al registrar tu número de WhatsApp.' });
+    }
+});
+
 // 👤 4. ZONA DE CUENTA DE CLIENTES (HISTORIAL DE COMPRAS, PINES Y PERFILES DE JUEGO GUARDADOS)
 app.get('/api/client/account-overview', verificarTokenOpcional, async (req, res) => {
     try {
@@ -1721,6 +1759,25 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
             }
 
             return res.json({ success: true, message: `Orden #${orden.orderId} aprobada y entregada al cliente.`, order: orden });
+        }
+
+// ⚠️ SI EL TRABAJADOR PONE LA ORDEN EN REVISIÓN (MONTO INCORRECTO, CUENTA EQUIVOCADA, ETC.)
+        if (action === 'REVISION') {
+            const motivo = (workerNotes || 'Detectamos un detalle con tu pago que debemos verificar contigo.').trim();
+            orden.status = 'EN_REVISION';
+            orden.progressPercent = 100;
+            orden.hadReview = true;
+            orden.reviewReason = motivo;
+            orden.workerNotes = motivo;
+            orden.statusMessage = '⚠️ Tu pedido se encuentra en revisión. Revisa el mensaje del operador aquí abajo.';
+            orden.reviewedByWorker = req.staffUser.email;
+            await orden.save();
+
+            return res.json({
+                success: true,
+                message: `Orden #${orden.orderId} puesta en revisión.`,
+                order: orden
+            });
         }
 
         // ❌ SI EL TRABAJADOR RECHAZA LA ORDEN (EJ: PAGO MÓVIL FALSO O NO LLEGÓ)
