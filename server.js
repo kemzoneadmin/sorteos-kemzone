@@ -279,25 +279,27 @@ const CatalogProductSchema = new mongoose.Schema({
     cardImageUrl: { type: String, default: '' },
     flyerImageUrl: { type: String, default: '' }, // Flyer de precios de tu Instagram @kemzone07
     // Configuración de campos que se le piden al cliente en la Zona 1
-    uidLabel: { type: String, default: 'ID de Jugador (UID)' },
+uidLabel: { type: String, default: 'ID de Jugador (UID)' },
     requiresServer: { type: Boolean, default: false },
     serverLabel: { type: String, default: 'Zona / Servidor' },
-    requiresInternalLogin: { type: Boolean, default: false }, // True solo para Recargas Internas
-    serviceCommissionPercent: { type: Number, default: 0 },   // % de comisión automática (Ej: para Zinli)
+    requiresRegion: { type: Boolean, default: false },
+    regionsList: [{ type: String }], // Regiones escritas manualmente por el Desarrollador
+    requiresInternalLogin: { type: Boolean, default: false }, // Ahora actúa como "Requiere contacto por WhatsApp"
+    serviceCommissionPercent: { type: Number, default: 0 },
     isFlashOffer: { type: Boolean, default: false },
     flashDiscountText: { type: String, default: '' },
     active: { type: Boolean, default: true },
     sortOrder: { type: Number, default: 0 },
-    // Lista de paquetes de precios dentro del juego/servicio
     packages: [{
         packageId: { type: String, required: true },
         name: { type: String, required: true },
-        priceUSD: { type: Number, required: true },     // Precio de venta al público en USD
-        costUSD: { type: Number, default: 0 },          // Tu costo mayorista (para calcular tu ganancia neta en estadísticas)
-        tokemsPrice: { type: Number, required: true },  // Precio en Tokems KZ
-        apiProviderName: { type: String, default: 'DEFAULT_API' }, // Ej: 'RELORECARGAS', 'CODESWHOLESALE', 'SMILEONE'
-        apiProductSku: { type: String, default: '' },   // El SKU o ID del paquete en la API de tu proveedor
-        backupPinVault: [{ type: String }],             // Bóveda opcional de códigos PIN por si quieres pre-cargar stock
+        tabGroup: { type: String, default: 'principales' }, // 'principales' (Diamantes/Monedas) o 'especiales' (Paquetes/Pases)
+        priceUSD: { type: Number, required: true },
+        costUSD: { type: Number, default: 0 },
+        tokemsPrice: { type: Number, required: true },
+        apiProviderName: { type: String, default: 'DEFAULT_API' },
+        apiProductSku: { type: String, default: '' },
+        backupPinVault: [{ type: String }],
         inStock: { type: Boolean, default: true }
     }]
 }, { timestamps: true });
@@ -345,7 +347,9 @@ const OrderSchema = new mongoose.Schema({
     // Datos de Destino (ID Jugador, Correo Zinli o Credenciales de Recarga Interna)
     playerUid: { type: String, required: true },
     playerServer: { type: String, default: '' },
+    playerRegion: { type: String, default: '' },
     playerNickname: { type: String, default: '' },
+    paypalPayerName: { type: String, default: '' },
     internalAccountLogin: {
         loginMethod: { type: String, default: '' }, // Ej: Activision, Facebook, Google
         accountUser: { type: String, default: '' },
@@ -1164,22 +1168,67 @@ app.get('/api/store/bootstrap', async (req, res) => {
     }
 });
 
-// 2. Crear Orden en la Zona 2 -> Pasa a la Zona 3 (Barra en Vivo)
+// 1.5 Verificar ID de Jugador en el Paso 1 (Recargas por ID)
+app.post('/api/orders/verify-player', async (req, res) => {
+    try {
+        const { productSlug, playerUid, playerServer, playerRegion } = req.body;
+        if (!playerUid || String(playerUid).trim().length < 3) {
+            return res.status(400).json({ error: 'Ingresa un ID de jugador válido.' });
+        }
+
+        // Si tienes configurada una URL de verificación de ID en Railway (PROVIDER_VERIFY_URL)
+        if (process.env.PROVIDER_VERIFY_URL && process.env.PROVIDER_API_KEY) {
+            try {
+                const resp = await axios.post(process.env.PROVIDER_VERIFY_URL, {
+                    api_key: process.env.PROVIDER_API_KEY,
+                    game: productSlug,
+                    uid: String(playerUid).trim(),
+                    server: playerServer || '',
+                    region: playerRegion || ''
+                }, { timeout: 8000 });
+
+                if (resp.data && resp.data.nickname) {
+                    return res.json({
+                        success: true,
+                        verified: true,
+                        nickname: resp.data.nickname,
+                        message: `✅ Cuenta verificada: ${resp.data.nickname}`
+                    });
+                }
+            } catch (e) {}
+        }
+
+        // Si el juego o la API no soporta mostrar el apodo en vivo, devuelve tu mensaje exacto:
+        return res.json({
+            success: true,
+            verified: false,
+            nickname: '',
+            message: 'ℹ️ No se puede verificar la cuenta en este juego, igualmente si escribió bien su ID, no habrá problemas.'
+        });
+    } catch (error) {
+        return res.status(500).json({ error: 'Error al validar el ID.' });
+    }
+});
+
+// 2. Crear Orden en la Pestaña de Pago -> Pasa a la Pestaña de Entrega en Vivo
 app.post('/api/orders/create', orderLimiter, verificarTokenOpcional, async (req, res) => {
     try {
         const {
-            orderType, // 'PRODUCT_ORDER' o 'TOKEM_TOPUP'
+            orderType,
             deviceId,
             userEmail,
             userWhatsapp,
             productSlug,
             packageId,
-            customTokemAmount, // Si está comprando Tokems con Pago Móvil/Binance
+            customTokemAmount,
             playerUid,
             playerServer,
+            playerRegion,
             playerNickname,
+            paypalPayerName,
             internalAccountLogin,
             paymentMethodKey,
+            paymentMethodNameCustom,
             paymentReference
         } = req.body;
 
@@ -1188,20 +1237,26 @@ app.post('/api/orders/create', orderLimiter, verificarTokenOpcional, async (req,
             return res.status(403).json({ error: 'La tienda está en mantenimiento temporal. Intenta en unos minutos.' });
         }
 
-        const metodoPago = await PaymentMethod.findOne({ methodKey: paymentMethodKey, active: true });
+        let metodoPago = await PaymentMethod.findOne({ methodKey: paymentMethodKey, active: true });
+        if (!metodoPago && paymentMethodKey && paymentMethodKey.startsWith('pago_movil')) {
+            metodoPago = await PaymentMethod.findOne({ methodKey: 'pago_movil' });
+        }
         if (!metodoPago) {
-            return res.status(400).json({ error: 'Método de pago no válido o inactivo.' });
+            metodoPago = {
+                methodKey: paymentMethodKey || 'pago_movil',
+                name: paymentMethodNameCustom || 'Pago Verificable',
+                requiresReference: paymentMethodKey !== 'tokems_kz',
+                refDigitsLength: 6
+            };
         }
 
         const identificadorLimpio = (userEmail || deviceId || 'invitado').trim().toLowerCase();
         const refLimpia = (paymentReference || '').trim().toUpperCase();
 
-        // Validar que haya puesto los 6 dígitos si no paga con Tokems
         if (metodoPago.requiresReference && refLimpia.length < 4) {
-            return res.status(400).json({ error: `Debes ingresar los últimos ${metodoPago.refDigitsLength || 6} dígitos de la referencia de tu pago.` });
+            return res.status(400).json({ error: 'Debes ingresar los últimos dígitos de la referencia o ID de transacción.' });
         }
 
-        // 🚨 RECOMENDACIÓN PRO #1: DETECTOR AUTOMÁTICO DE REFERENCIAS DUPLICADAS EN LAS ÚLTIMAS 48H
         let esRefDuplicada = false;
         let textoAlertaDuplicada = '';
         if (metodoPago.requiresReference && refLimpia) {
@@ -1218,7 +1273,6 @@ app.post('/api/orders/create', orderLimiter, verificarTokenOpcional, async (req,
             }
         }
 
-        // Calcular montos según si compra un Producto del catálogo o si está comprando Tokems
         let nombreProducto = '';
         let nombrePaquete = '';
         let mainCat = 'recargas';
@@ -1257,7 +1311,6 @@ app.post('/api/orders/create', orderLimiter, verificarTokenOpcional, async (req,
             apiProv = pkg.apiProviderName || 'DEFAULT_API';
             apiSku = pkg.apiProductSku || pkg.packageId;
 
-            // 🧮 RECOMENDACIÓN PRO #2: CALCULADORA AUTOMÁTICA DE COMISIÓN (EJ: ZINLI)
             if (productoDB.serviceCommissionPercent > 0) {
                 feeUSD = Number(((baseUSD * productoDB.serviceCommissionPercent) / 100).toFixed(2));
             }
@@ -1269,7 +1322,6 @@ app.post('/api/orders/create', orderLimiter, verificarTokenOpcional, async (req,
         let pagadoConTokems = false;
         let nuevoSaldoTokems = null;
 
-        // 🪙 SI EL CLIENTE ELIGE PAGAR CON SU SALDO DE TOKEMS KZ
         if (paymentMethodKey === 'tokems_kz') {
             if (orderType === 'TOKEM_TOPUP') {
                 return res.status(400).json({ error: 'No puedes comprar Tokems pagando con Tokems.' });
@@ -1299,11 +1351,21 @@ app.post('/api/orders/create', orderLimiter, verificarTokenOpcional, async (req,
                 tokens: -costoEnTokems,
                 plan: `${nombreProducto} - ${nombrePaquete}`,
                 precio: `$${totalUSD}`,
-                detalles: `Pago con Tokems KZ para ID: ${playerUid}`
+                detalles: `Pago con Tokems KZ (${playerUid || userWhatsapp || 'Directo'})`
             }).save().catch(() => {});
         }
 
         const orderId = 'KZ-' + crypto.randomInt(100000, 999999).toString();
+
+        // Definir destino limpio según si es Recarga ID, Recarga Interna (WhatsApp) o GiftCard/Servicio
+        let uidDestinoFinal = (playerUid || '').trim();
+        if (!uidDestinoFinal) {
+            if (fulfillment === 'MANUAL_INTERNAL' || subCat === 'recargas_internas') {
+                uidDestinoFinal = userWhatsapp ? `WS: ${userWhatsapp.trim()}` : 'Contacto por WhatsApp';
+            } else {
+                uidDestinoFinal = 'Entrega Automática de Código';
+            }
+        }
 
         const nuevaOrden = new Order({
             orderId,
@@ -1320,12 +1382,14 @@ app.post('/api/orders/create', orderLimiter, verificarTokenOpcional, async (req,
             packageName: nombrePaquete,
             apiProviderName: apiProv,
             apiProductSku: apiSku,
-            playerUid: (playerUid || identificadorLimpio).trim(),
+            playerUid: uidDestinoFinal,
             playerServer: (playerServer || '').trim(),
+            playerRegion: (playerRegion || '').trim(),
             playerNickname: (playerNickname || '').trim(),
+            paypalPayerName: (paypalPayerName || '').trim(),
             internalAccountLogin: internalAccountLogin || {},
             paymentMethodKey,
-            paymentMethodName: metodoPago.name,
+            paymentMethodName: paymentMethodNameCustom || metodoPago.name,
             paymentReference: pagadoConTokems ? 'TOKEMS-KZ' : refLimpia,
             isDuplicateRef: esRefDuplicada,
             duplicateWarningText: textoAlertaDuplicada,
@@ -1342,7 +1406,6 @@ app.post('/api/orders/create', orderLimiter, verificarTokenOpcional, async (req,
             progressPercent: 50
         });
 
-        // ⚡ Si pagó con Tokems KZ y el producto es de entrega por API (no recarga interna), se entrega en el acto
         if (pagadoConTokems && settings.autoTriggerApiOnTokems && fulfillment !== 'MANUAL_INTERNAL') {
             const apiRes = await ejecutarEntregaPorAPI(nuevaOrden, productoDB);
             if (apiRes.success) {
