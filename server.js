@@ -153,7 +153,6 @@ const DrawVerificationSchema = new mongoose.Schema({
     verificationHash: { type: String, required: true },
     participantes: [{ type: mongoose.Schema.Types.Mixed }]
 }, { timestamps: true });
-DrawVerificationSchema.index({ drawId: 1 });
 DrawVerificationSchema.index({ createdAt: 1 }, { expireAfterSeconds: 604800 });
 const DrawVerification = mongoose.model('DrawVerification', DrawVerificationSchema);
 
