@@ -221,14 +221,28 @@ const StoreSettingsSchema = new mongoose.Schema({
     exchangeRateVES: { type: Number, default: 55.00 }, // Tasa Bs por $1 USD
     tokemValueUSD: { type: Number, default: 1.00 },    // 1 Tokem = $1.00 USD
     storeOpen: { type: Boolean, default: true },
-    autoTriggerApiOnTokems: { type: Boolean, default: true }, // Si paga con Tokems, dispara la API al instante
+    autoTriggerApiOnTokems: { type: Boolean, default: true },
     announcementText: { type: String, default: '🔥 KEM!ZONE OFICIAL: Recargas y Gift Cards al instante — Aceptamos Pago Móvil, Binance, Zinli y Tokems KZ' },
-    heroBanners: [{
-        title: String,
-        subtitle: String,
-        imageUrl: String,
-        targetSlug: String,
-        badgeText: String
+    // 🎨 Configuración editable del Banner Principal (Portada)
+    heroConfig: {
+        tagText: { type: String, default: '🇻🇪 Tienda Oficial verificada • +11.4K en Instagram' },
+        titleMain: { type: String, default: 'RECARGA TUS' },
+        titleHighlight: { type: String, default: 'JUEGOS FAVORITOS' },
+        titleEnd: { type: String, default: 'AL INSTANTE' },
+        description: { type: String, default: 'Entrega rápida por ID de jugador y códigos digitales originales. Paga cómodamente en Bolívares (Pago Móvil), USDT (Binance), Tarjeta o usa tus Tokems KZ sin comisiones.' },
+        mascotUrl: { type: String, default: 'https://cdn.shopify.com/s/files/1/0780/8444/0222/files/kem-ganador.png?v=1782718783' }
+    },
+    // ⚡ Configuración editable de las Ofertas de Loot Relámpago
+    flashOffers: [{
+        slug: { type: String, default: 'free-fire-id' },
+        pkgId: { type: String, default: 'ff_semanal' },
+        game: { type: String, default: 'FREE FIRE' },
+        title: { type: String, default: 'Tarjeta Semanal FF' },
+        oldUsd: { type: Number, default: 2.50 },
+        usd: { type: Number, default: 1.95 },
+        discount: { type: String, default: '-22%' },
+        timer: { type: String, default: '3D 08H 45M' },
+        img: { type: String, default: 'https://images.unsplash.com/photo-1542751371-adc38448a05e?auto=format&fit=crop&w=300&q=80' }
     }],
     updatedBy: { type: String, default: 'system' }
 }, { timestamps: true });
@@ -1642,11 +1656,10 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
     }
 });
 
-// =================================================================
 // 👑 DASHBOARD 1: ENDPOINTS EXCLUSIVOS PARA TI (ADMIN / DESARROLLADOR)
 // =================================================================
 
-// 1. Obtener Estadísticas Financieras Completas, Rendimiento de Trabajadores y Catálogo Completo
+// 1. Obtener Estadísticas Financieras Completas, Juegos Top, Bancos y Catálogo Completo
 app.get('/api/admin/overview', verificarSoloAdmin, async (req, res) => {
     try {
         const hoyInicio = new Date();
@@ -1664,7 +1677,9 @@ app.get('/api/admin/overview', verificarSoloAdmin, async (req, res) => {
             ordenesEntregadasMes,
             pendientesCount,
             ticketsAbiertosCount,
-            workersList
+            workersList,
+            totalClientesCount,
+            usuariosConSaldo
         ] = await Promise.all([
             StoreSettings.findOne({ key: 'main_settings' }).lean(),
             CatalogProduct.find().sort({ sortOrder: 1 }).lean(),
@@ -1673,22 +1688,37 @@ app.get('/api/admin/overview', verificarSoloAdmin, async (req, res) => {
             Order.find({ status: 'ENTREGADO', completedAt: { $gte: mesInicio } }).lean(),
             Order.countDocuments({ status: 'EN_PROCESO' }),
             SupportTicket.countDocuments({ status: { $in: ['ABIERTO', 'EN_REVISION'] } }),
-            User.find({ role: { $in: ['worker', 'admin'] } }).select('email role tokems').lean()
+            User.find({ role: { $in: ['worker', 'admin'] } }).select('email role tokems').lean(),
+            User.countDocuments(),
+            User.find({ tokems: { $gt: 0 } }).select('tokems').lean()
         ]);
 
-        // Cálculo de ventas y ganancia neta hoy y del mes
         const ventasHoyUSD = ordenesEntregadasHoy.reduce((acc, o) => acc + (Number(o.totalAmountUSD) || 0), 0);
         const ventasHoyVES = ordenesEntregadasHoy.reduce((acc, o) => acc + (Number(o.totalAmountVES) || 0), 0);
         const gananciaNetaHoyUSD = ordenesEntregadasHoy.reduce((acc, o) => acc + ((Number(o.totalAmountUSD) || 0) - (Number(o.costUSD) || 0)), 0);
 
         const ventasMesUSD = ordenesEntregadasMes.reduce((acc, o) => acc + (Number(o.totalAmountUSD) || 0), 0);
         const gananciaNetaMesUSD = ordenesEntregadasMes.reduce((acc, o) => acc + ((Number(o.totalAmountUSD) || 0) - (Number(o.costUSD) || 0)), 0);
+        const tokemsEnCirculacion = usuariosConSaldo.reduce((acc, u) => acc + (Number(u.tokems) || 0), 0);
 
-        // Ranking de órdenes aprobadas por trabajador en el mes
+        // Desglose por Trabajador, por Juego y por Método de Pago en el mes
         const rendimientoTrabajadores = {};
+        const ventasPorJuego = {};
+        const ventasPorMetodo = {};
+
         ordenesEntregadasMes.forEach(o => {
-            const op = o.approvedByWorker || 'AUTO';
+            const op = o.approvedByWorker || 'AUTO-API';
             rendimientoTrabajadores[op] = (rendimientoTrabajadores[op] || 0) + 1;
+
+            const juego = o.productName || 'Otro';
+            if (!ventasPorJuego[juego]) ventasPorJuego[juego] = { count: 0, usd: 0 };
+            ventasPorJuego[juego].count += 1;
+            ventasPorJuego[juego].usd = Number((ventasPorJuego[juego].usd + (Number(o.totalAmountUSD) || 0)).toFixed(2));
+
+            const metodo = o.paymentMethodName || o.paymentMethodKey || 'Otro';
+            if (!ventasPorMetodo[metodo]) ventasPorMetodo[metodo] = { count: 0, usd: 0 };
+            ventasPorMetodo[metodo].count += 1;
+            ventasPorMetodo[metodo].usd = Number((ventasPorMetodo[metodo].usd + (Number(o.totalAmountUSD) || 0)).toFixed(2));
         });
 
         return res.json({
@@ -1703,7 +1733,11 @@ app.get('/api/admin/overview', verificarSoloAdmin, async (req, res) => {
                 gananciaNetaMesUSD: Number(gananciaNetaMesUSD.toFixed(2)),
                 pendientesCount,
                 ticketsAbiertosCount,
-                rendimientoTrabajadores
+                totalClientesCount,
+                tokemsEnCirculacion: Number(tokemsEnCirculacion.toFixed(2)),
+                rendimientoTrabajadores,
+                ventasPorJuego,
+                ventasPorMetodo
             },
             settings,
             products,
@@ -1715,10 +1749,10 @@ app.get('/api/admin/overview', verificarSoloAdmin, async (req, res) => {
     }
 });
 
-// 2. Modificar Tasa Bs/USD, Flyers/Banners y Configuración General
+// 2. Modificar Tasa Bs/USD, Portada Hero, Loot Relámpago y Configuración General
 app.post('/api/admin/settings', verificarSoloAdmin, async (req, res) => {
     try {
-        const { exchangeRateVES, tokemValueUSD, storeOpen, autoTriggerApiOnTokems, announcementText, heroBanners } = req.body;
+        const { exchangeRateVES, tokemValueUSD, storeOpen, autoTriggerApiOnTokems, announcementText, heroConfig, flashOffers } = req.body;
         let settings = await StoreSettings.findOne({ key: 'main_settings' });
         if (!settings) settings = new StoreSettings({ key: 'main_settings' });
 
@@ -1727,7 +1761,8 @@ app.post('/api/admin/settings', verificarSoloAdmin, async (req, res) => {
         if (typeof storeOpen === 'boolean') settings.storeOpen = storeOpen;
         if (typeof autoTriggerApiOnTokems === 'boolean') settings.autoTriggerApiOnTokems = autoTriggerApiOnTokems;
         if (announcementText !== undefined) settings.announcementText = announcementText;
-        if (Array.isArray(heroBanners)) settings.heroBanners = heroBanners;
+        if (heroConfig && typeof heroConfig === 'object') settings.heroConfig = heroConfig;
+        if (Array.isArray(flashOffers)) settings.flashOffers = flashOffers;
         settings.updatedBy = req.adminUser.email;
 
         await settings.save();
@@ -1777,7 +1812,7 @@ app.post('/api/admin/payment-method/save', verificarSoloAdmin, async (req, res) 
             return res.status(400).json({ error: 'Identificador y nombre del método de pago requeridos.' });
         }
 
-        const keyLimpia = methodData.methodKey.trim().toLowerCase();
+        const keyLimpia = methodData.methodKey.trim().toLowerCase().replace(/\s+/g, '_');
         const metodo = await PaymentMethod.findOneAndUpdate(
             { methodKey: keyLimpia },
             { $set: { ...methodData, methodKey: keyLimpia } },
@@ -1790,7 +1825,18 @@ app.post('/api/admin/payment-method/save', verificarSoloAdmin, async (req, res) 
     }
 });
 
-// 6. Gestionar Permisos de Trabajadores (Dar o quitar rango 'worker' a un correo) y Saldo Tokems
+// 5.1 Eliminar un Método de Pago
+app.post('/api/admin/payment-method/delete', verificarSoloAdmin, async (req, res) => {
+    try {
+        const { methodKey } = req.body;
+        await PaymentMethod.deleteOne({ methodKey: (methodKey || '').trim().toLowerCase() });
+        return res.json({ success: true });
+    } catch (error) {
+        return res.status(500).json({ error: 'Error eliminando método de pago.' });
+    }
+});
+
+// 6. Gestionar Permisos de Trabajadores y Saldo Tokems
 app.post('/api/admin/staff-and-tokens', verificarSoloAdmin, async (req, res) => {
     try {
         const { action, targetEmail, roleToSet, tokensAmount } = req.body;
