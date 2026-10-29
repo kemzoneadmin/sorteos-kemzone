@@ -1671,7 +1671,7 @@ app.post('/api/tickets/reply', verificarTokenOpcional, async (req, res) => {
 // 👷 DASHBOARD 2: ENDPOINTS PARA TRABAJADORES / OPERADORES
 // =================================================================
 
-// 1. Cola de órdenes y tickets en tiempo real para el trabajador y el dueño
+// 1. Cola de órdenes, tickets y lista de operadores en tiempo real
 app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
     try {
         const { statusFilter } = req.query;
@@ -1683,25 +1683,27 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
             query.status = statusFilter;
         }
 
-        // 🔒 PRIVACIDAD DE OPERADORES: Un trabajador NUNCA ve órdenes apartadas por otro trabajador
+        // 🔒 PRIVACIDAD ESTRICTA: Cada trabajador solo recibe la Cola por Apartar pública + SUS propias órdenes
         if (!isOwner) {
             query.$or = [
-                { claimedByWorker: '' },
-                { claimedByWorker: null },
-                { claimedByWorker: { $exists: false } },
+                {
+                    status: { $in: ['EN_PROCESO', 'ERROR_API'] },
+                    $or: [{ claimedByWorker: '' }, { claimedByWorker: null }, { claimedByWorker: { $exists: false } }]
+                },
                 { claimedByWorker: workerEmail },
                 { approvedByWorker: workerEmail },
                 { reviewedByWorker: workerEmail }
             ];
         }
 
-        const [orders, ticketsAbiertos, pendientesSinApartarCount] = await Promise.all([
-            Order.find(query).sort({ fecha: -1 }).limit(180).select('-costUSD').lean(),
+        const [orders, ticketsAbiertos, pendientesSinApartarCount, workersList] = await Promise.all([
+            Order.find(query).sort({ fecha: -1 }).limit(250).select('-costUSD').lean(),
             SupportTicket.find({ status: { $in: ['ABIERTO', 'EN_REVISION'] } }).sort({ updatedAt: -1 }).limit(50).lean(),
             Order.countDocuments({
                 status: 'EN_PROCESO',
                 $or: [{ claimedByWorker: '' }, { claimedByWorker: null }, { claimedByWorker: { $exists: false } }]
-            })
+            }),
+            isOwner ? User.find({ role: { $in: ['worker', 'admin'] } }).select('email accountName role tokems').lean() : Promise.resolve([])
         ]);
 
         return res.json({
@@ -1711,7 +1713,8 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
             role: req.effectiveRole,
             pendientesCount: pendientesSinApartarCount,
             orders,
-            tickets: ticketsAbiertos
+            tickets: ticketsAbiertos,
+            workersList
         });
     } catch (error) {
         return res.status(500).json({ error: 'Error cargando cola de trabajo.' });
