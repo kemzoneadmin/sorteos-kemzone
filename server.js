@@ -311,6 +311,7 @@ const CatalogProduct = mongoose.model('CatalogProduct', CatalogProductSchema, 'c
 const PaymentMethodSchema = new mongoose.Schema({
     methodKey: { type: String, required: true, unique: true, trim: true }, // 'pago_movil', 'binance', 'zinli', 'paypal', 'tokems_kz'
     name: { type: String, required: true },
+    buttonTitle: { type: String, default: '' }, // Título personalizado del botón naranja selector
     currency: { type: String, enum: ['VES', 'USD', 'USDT', 'TOKEMS'], default: 'VES' },
     icon: { type: String, default: '💳' },
     accountHolder: { type: String, default: '' },
