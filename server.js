@@ -245,6 +245,18 @@ const StoreSettingsSchema = new mongoose.Schema({
         timer: { type: String, default: '3D 08H 45M' },
         img: { type: String, default: 'https://images.unsplash.com/photo-1542751371-adc38448a05e?auto=format&fit=crop&w=300&q=80' }
     }],
+    // 🗂️ Configuración editable de la sección Juegos de Recarga y Gift Cards y sus Filtros
+    catalogSectionConfig: {
+        icon: { type: String, default: '🎮' },
+        titleWhite: { type: String, default: 'Juegos de' },
+        titleOrange: { type: String, default: 'Recarga y Gift Cards' },
+        allPillLabel: { type: String, default: '🔥 Todos los Productos' },
+        pills: [{
+            pillId: { type: String, default: '' },
+            label: { type: String, default: '' },
+            productSlugs: [{ type: String }]
+        }]
+    },
     updatedBy: { type: String, default: 'system' }
 }, { timestamps: true });
 const StoreSettings = mongoose.model('StoreSettings', StoreSettingsSchema, 'store_settings');
@@ -2128,10 +2140,10 @@ app.get('/api/admin/overview', verificarSoloAdmin, async (req, res) => {
     }
 });
 
-// 2. Modificar Tasa Bs/USD, Portada Hero, Loot Relámpago y Configuración General
+// 2. Modificar Tasa Bs/USD, Portada Hero, Loot Relámpago, Filtros de Catálogo y Configuración General
 app.post('/api/admin/settings', verificarSoloAdmin, async (req, res) => {
     try {
-        const { exchangeRateVES, tokemValueUSD, storeOpen, autoTriggerApiOnTokems, announcementText, hideAnnouncement, heroConfig, flashOffers } = req.body;
+        const { exchangeRateVES, tokemValueUSD, storeOpen, autoTriggerApiOnTokems, announcementText, hideAnnouncement, heroConfig, flashOffers, catalogSectionConfig } = req.body;
         let settings = await StoreSettings.findOne({ key: 'main_settings' });
         if (!settings) settings = new StoreSettings({ key: 'main_settings' });
 
@@ -2143,6 +2155,7 @@ app.post('/api/admin/settings', verificarSoloAdmin, async (req, res) => {
         if (typeof hideAnnouncement === 'boolean') settings.hideAnnouncement = hideAnnouncement;
         if (heroConfig && typeof heroConfig === 'object') settings.heroConfig = heroConfig;
         if (Array.isArray(flashOffers)) settings.flashOffers = flashOffers;
+        if (catalogSectionConfig && typeof catalogSectionConfig === 'object') settings.catalogSectionConfig = catalogSectionConfig;
         settings.updatedBy = req.adminUser.email;
 
         await settings.save();
