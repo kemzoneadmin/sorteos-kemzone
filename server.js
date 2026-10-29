@@ -1331,25 +1331,6 @@ app.post('/api/orders/create', orderLimiter, verificarTokenOpcional, async (req,
         const identificadorLimpio = (userEmail || deviceId || 'invitado').trim().toLowerCase();
         const refLimpia = (paymentReference || '').trim().toUpperCase();
 
-// 🛡️ ESCUDO ANTI-DOBLE CLIC (3 segundos solo si es exactamente la misma referencia y mismo destino)
-        const hace3Segundos = new Date(Date.now() - 3 * 1000);
-        const ordenDobleClic = await Order.findOne({
-            deviceId: identificadorLimpio,
-            productSlug: String(productSlug || 'tokems-kz').trim().toLowerCase(),
-            packageId: String(packageId || 'tokems_pack').trim(),
-            playerUid: String(playerUid || '').trim(),
-            paymentReference: paymentMethodKey === 'tokems_kz' ? 'TOKEMS-KZ' : refLimpia,
-            fecha: { $gte: hace3Segundos }
-        }).lean();
-
-        if (ordenDobleClic) {
-            return res.status(200).json({
-                success: true,
-                order: ordenDobleClic,
-                deduplicated: true
-            });
-        }
-
         if (metodoPago.requiresReference && refLimpia.length < 4) {
             return res.status(400).json({ error: 'Debes ingresar los últimos dígitos de la referencia o ID de transacción.' });
         }
