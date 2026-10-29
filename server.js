@@ -1358,11 +1358,18 @@ app.post('/api/orders/create', orderLimiter, verificarTokenOpcional, async (req,
             baseUSD = Number((cantTokems * (settings.tokemValueUSD || 1)).toFixed(2));
             costoEnTokems = cantTokems;
         } else {
-            productoDB = await CatalogProduct.findOne({ slug: productSlug, active: true });
+            const slugBuscado = String(productSlug || '').trim().toLowerCase();
+            productoDB = await CatalogProduct.findOne({ slug: slugBuscado, active: true });
             if (!productoDB) return res.status(404).json({ error: 'Producto no encontrado.' });
 
-            const pkg = productoDB.packages.find(p => p.packageId === packageId);
-            if (!pkg || !pkg.inStock) return res.status(400).json({ error: 'Paquete agotado o no disponible.' });
+            const idPkgBuscado = String(packageId || '').trim();
+            const nombrePkgBuscado = String(req.body.packageName || '').trim().toLowerCase();
+
+            const pkg = (productoDB.packages || []).find(p =>
+                String(p.packageId || p.id || '').trim() === idPkgBuscado ||
+                (nombrePkgBuscado && String(p.name || '').trim().toLowerCase() === nombrePkgBuscado)
+            );
+            if (!pkg || pkg.inStock === false) return res.status(400).json({ error: 'Paquete agotado o no disponible.' });
 
             nombreProducto = productoDB.name;
             nombrePaquete = pkg.name;
