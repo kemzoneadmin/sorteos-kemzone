@@ -1331,6 +1331,23 @@ app.post('/api/orders/create', orderLimiter, verificarTokenOpcional, async (req,
         const identificadorLimpio = (userEmail || deviceId || 'invitado').trim().toLowerCase();
         const refLimpia = (paymentReference || '').trim().toUpperCase();
 
+// 🛡️ ESCUDO ANTI-BUCLES: Si el mismo usuario envía el mismo pedido en menos de 15 segundos, devuelve la misma orden sin duplicarla
+        const hace15Segundos = new Date(Date.now() - 15 * 1000);
+        const ordenRecienteIdentica = await Order.findOne({
+            deviceId: identificadorLimpio,
+            productSlug: String(productSlug || 'tokems-kz').trim().toLowerCase(),
+            packageId: String(packageId || 'tokems_pack').trim(),
+            fecha: { $gte: hace15Segundos }
+        }).lean();
+
+        if (ordenRecienteIdentica) {
+            return res.status(200).json({
+                success: true,
+                order: ordenRecienteIdentica,
+                deduplicated: true
+            });
+        }
+
         if (metodoPago.requiresReference && refLimpia.length < 4) {
             return res.status(400).json({ error: 'Debes ingresar los últimos dígitos de la referencia o ID de transacción.' });
         }
