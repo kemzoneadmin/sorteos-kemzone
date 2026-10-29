@@ -383,6 +383,9 @@ const OrderSchema = new mongoose.Schema({
         default: 'EN_PROCESO',
         index: true
     },
+    claimedByWorker: { type: String, default: '', lowercase: true, trim: true, index: true },
+    claimedByName: { type: String, default: '' },
+    claimedAt: { type: Date, default: null },
     hadReview: { type: Boolean, default: false },
     reviewReason: { type: String, default: '' },
     reviewedByWorker: { type: String, default: '' },
@@ -1668,26 +1671,45 @@ app.post('/api/tickets/reply', verificarTokenOpcional, async (req, res) => {
 // 👷 DASHBOARD 2: ENDPOINTS PARA TRABAJADORES / OPERADORES
 // =================================================================
 
-// 1. Cola de órdenes y tickets en tiempo real para el trabajador
+// 1. Cola de órdenes y tickets en tiempo real para el trabajador y el dueño
 app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
     try {
         const { statusFilter } = req.query;
+        const workerEmail = (req.staffUser.email || '').trim().toLowerCase();
+        const isOwner = req.effectiveRole === 'admin';
+
         const query = {};
         if (statusFilter && statusFilter !== 'TODAS') {
             query.status = statusFilter;
         }
 
-        const [orders, ticketsAbiertos, pendientesCount] = await Promise.all([
-            Order.find(query).sort({ fecha: -1 }).limit(120).select('-costUSD').lean(),
+        // 🔒 PRIVACIDAD DE OPERADORES: Un trabajador NUNCA ve órdenes apartadas por otro trabajador
+        if (!isOwner) {
+            query.$or = [
+                { claimedByWorker: '' },
+                { claimedByWorker: null },
+                { claimedByWorker: { $exists: false } },
+                { claimedByWorker: workerEmail },
+                { approvedByWorker: workerEmail },
+                { reviewedByWorker: workerEmail }
+            ];
+        }
+
+        const [orders, ticketsAbiertos, pendientesSinApartarCount] = await Promise.all([
+            Order.find(query).sort({ fecha: -1 }).limit(180).select('-costUSD').lean(),
             SupportTicket.find({ status: { $in: ['ABIERTO', 'EN_REVISION'] } }).sort({ updatedAt: -1 }).limit(50).lean(),
-            Order.countDocuments({ status: 'EN_PROCESO' })
+            Order.countDocuments({
+                status: 'EN_PROCESO',
+                $or: [{ claimedByWorker: '' }, { claimedByWorker: null }, { claimedByWorker: { $exists: false } }]
+            })
         ]);
 
         return res.json({
             success: true,
-            workerEmail: req.staffUser.email,
+            workerEmail,
+            workerName: req.staffUser.accountName || workerEmail.split('@')[0],
             role: req.effectiveRole,
-            pendientesCount,
+            pendientesCount: pendientesSinApartarCount,
             orders,
             tickets: ticketsAbiertos
         });
@@ -1696,7 +1718,106 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
     }
 });
 
-// 2. Acción del Trabajador: APROBAR (Dispara API automáticamente y actualiza la barra del cliente) o RECHAZAR
+// 📌 1.5 APARTAR, LIBERAR O TOMAR CONTROL DE UNA ORDEN (CANDADO ATÓMICO)
+app.post('/api/worker/claim-order', verificarTrabajadorOAdmin, async (req, res) => {
+    try {
+        const { orderId, action } = req.body; // 'CLAIM' | 'RELEASE' | 'FORCE_TAKE'
+        if (!orderId || !action) return res.status(400).json({ error: 'Faltan parámetros.' });
+
+        const idLimpio = String(orderId).trim().toUpperCase();
+        const staffEmail = (req.staffUser.email || '').trim().toLowerCase();
+        const staffName = req.staffUser.accountName || staffEmail.split('@')[0];
+        const isOwner = req.effectiveRole === 'admin';
+
+        if (action === 'CLAIM') {
+            // Bloqueo atómico: solo se aparta si nadie más la ha apartado
+            const ordenApartada = await Order.findOneAndUpdate(
+                {
+                    orderId: idLimpio,
+                    $or: [
+                        { claimedByWorker: '' },
+                        { claimedByWorker: null },
+                        { claimedByWorker: { $exists: false } },
+                        { claimedByWorker: staffEmail }
+                    ]
+                },
+                {
+                    $set: {
+                        claimedByWorker: staffEmail,
+                        claimedByName: staffName,
+                        claimedAt: new Date()
+                    }
+                },
+                { new: true }
+            ).select('-costUSD');
+
+            if (!ordenApartada) {
+                const existente = await Order.findOne({ orderId: idLimpio }).select('claimedByWorker claimedByName').lean();
+                if (!existente) return res.status(404).json({ error: 'La orden ya no existe.' });
+                return res.status(409).json({
+                    error: `⚠️ Esta orden acaba de ser apartada por ${existente.claimedByName || existente.claimedByWorker}.`
+                });
+            }
+
+            return res.json({
+                success: true,
+                message: `Orden #${idLimpio} apartada en tu zona privada.`,
+                order: ordenApartada
+            });
+        }
+
+        if (action === 'RELEASE') {
+            const ordenActual = await Order.findOne({ orderId: idLimpio });
+            if (!ordenActual) return res.status(404).json({ error: 'Orden no encontrada.' });
+
+            if (!isOwner && ordenActual.claimedByWorker && ordenActual.claimedByWorker !== staffEmail) {
+                return res.status(403).json({ error: 'Solo el operador que apartó la orden o el Dueño pueden liberarla.' });
+            }
+
+            ordenActual.claimedByWorker = '';
+            ordenActual.claimedByName = '';
+            ordenActual.claimedAt = null;
+            await ordenActual.save();
+
+            return res.json({
+                success: true,
+                message: `Orden #${idLimpio} devuelta a la cola pública.`,
+                order: ordenActual
+            });
+        }
+
+        if (action === 'FORCE_TAKE') {
+            if (!isOwner) return res.status(403).json({ error: 'Acción exclusiva del Dueño.' });
+
+            const ordenTomada = await Order.findOneAndUpdate(
+                { orderId: idLimpio },
+                {
+                    $set: {
+                        claimedByWorker: staffEmail,
+                        claimedByName: staffName,
+                        claimedAt: new Date()
+                    }
+                },
+                { new: true }
+            ).select('-costUSD');
+
+            if (!ordenTomada) return res.status(404).json({ error: 'Orden no encontrada.' });
+
+            return res.json({
+                success: true,
+                message: `Has tomado el control de la orden #${idLimpio} en tu zona privada.`,
+                order: ordenTomada
+            });
+        }
+
+        return res.status(400).json({ error: 'Acción de apartado inválida.' });
+    } catch (error) {
+        console.error('Error en /api/worker/claim-order:', error);
+        return res.status(500).json({ error: 'Error al procesar el apartado de la orden.' });
+    }
+});
+
+// 2. Acción del Trabajador: APROBAR, REVISIÓN o RECHAZAR (Requiere que esté apartada)
 app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res) => {
     try {
         const { orderId, action, manualPinCode, workerNotes } = req.body;
@@ -1704,6 +1825,24 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
 
         const orden = await Order.findOne({ orderId: orderId.trim().toUpperCase() });
         if (!orden) return res.status(404).json({ error: 'Orden no encontrada.' });
+
+        const staffEmail = (req.staffUser.email || '').trim().toLowerCase();
+        const staffName = req.staffUser.accountName || staffEmail.split('@')[0];
+        const isOwner = req.effectiveRole === 'admin';
+
+        // Verificar que otro trabajador no la tenga apartada
+        if (!isOwner && orden.claimedByWorker && orden.claimedByWorker !== staffEmail) {
+            return res.status(403).json({
+                error: `Esta orden está apartada privadamente por ${orden.claimedByName || orden.claimedByWorker}.`
+            });
+        }
+
+        // Asegurar que quede registrada como apartada por quien la procesa
+        if (!orden.claimedByWorker) {
+            orden.claimedByWorker = staffEmail;
+            orden.claimedByName = staffName;
+            orden.claimedAt = new Date();
+        }
 
         // ✅ SI EL TRABAJADOR VERIFICÓ LOS 6 DÍGITOS DEL PAGO MÓVIL Y LE DA A APROBAR
         if (action === 'APROBAR') {
@@ -1734,7 +1873,7 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
                 orden.statusMessage = `¡Se han acreditado +${orden.tokemsAmount} Tokems KZ en tu cuenta!`;
                 orden.progressPercent = 100;
                 orden.deliveredCode = `+${orden.tokemsAmount} TOKEMS KZ ACREDITADOS`;
-                orden.approvedByWorker = req.staffUser.email;
+                orden.approvedByWorker = staffEmail;
                 orden.completedAt = new Date();
                 await orden.save();
 
@@ -1760,7 +1899,7 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
             orden.statusMessage = orden.fulfillmentType === 'API_GIFT_CARD'
                 ? '¡Código generado y entregado! Cópialo aquí abajo.'
                 : '¡Recarga entregada con éxito! Verifica tu cuenta del juego.';
-            orden.approvedByWorker = req.staffUser.email;
+            orden.approvedByWorker = staffEmail;
             orden.completedAt = new Date();
             await orden.save();
 
@@ -1788,7 +1927,7 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
             return res.json({ success: true, message: `Orden #${orden.orderId} aprobada y entregada al cliente.`, order: orden });
         }
 
-// ⚠️ SI EL TRABAJADOR PONE LA ORDEN EN REVISIÓN (MONTO INCORRECTO, CUENTA EQUIVOCADA, ETC.)
+        // ⚠️ SI EL TRABAJADOR PONE LA ORDEN EN REVISIÓN
         if (action === 'REVISION') {
             const motivo = (workerNotes || 'Detectamos un detalle con tu pago que debemos verificar contigo.').trim();
             orden.status = 'EN_REVISION';
@@ -1798,7 +1937,7 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
             orden.reviewReason = motivo;
             orden.workerNotes = motivo;
             orden.statusMessage = '⚠️ Tu pedido se encuentra en revisión. Revisa el mensaje del operador aquí abajo.';
-            orden.reviewedByWorker = req.staffUser.email;
+            orden.reviewedByWorker = staffEmail;
             await orden.save();
 
             return res.json({
@@ -1808,7 +1947,7 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
             });
         }
 
-        // ❌ SI EL TRABAJADOR RECHAZA LA ORDEN (INCLUSO SI ESTABA ANTES EN REVISIÓN)
+        // ❌ SI EL TRABAJADOR RECHAZA LA ORDEN
         if (action === 'RECHAZAR') {
             const yaEstabaRechazada = orden.status === 'RECHAZADO';
             if (orden.status === 'EN_REVISION') {
@@ -1818,11 +1957,10 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
             orden.progressPercent = 100;
             orden.statusMessage = (workerNotes || '').trim() || 'No pudimos verificar tu referencia de pago. Si crees que es un error, abre un ticket de soporte.';
             orden.workerNotes = (workerNotes || '').trim() || 'Referencia no encontrada';
-            orden.approvedByWorker = req.staffUser.email;
+            orden.approvedByWorker = staffEmail;
             orden.completedAt = new Date();
             await orden.save();
 
-            // Si había pagado con Tokems KZ, se le reembolsan automáticamente
             if (orden.paidWithTokems && !yaEstabaRechazada && orden.tokemsAmount > 0) {
                 if (orden.deviceId.includes('@')) {
                     await User.updateOne({ email: orden.deviceId }, { $inc: { tokems: orden.tokemsAmount } });
