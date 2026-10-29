@@ -318,7 +318,8 @@ const PaymentMethodSchema = new mongoose.Schema({
     phoneOrEmail: { type: String, default: '' },
     documentId: { type: String, default: '' }, // Cédula o RIF
     binancePayId: { type: String, default: '' },
-    instructions: { type: String, default: 'Realiza el pago exacto y coloca los últimos 6 dígitos de la referencia.' },
+    copyText: { type: String, default: '' }, // Formato exacto en líneas al darle a Copiar Dato
+    instructions: { type: String, default: '' },
     requiresReference: { type: Boolean, default: true },
     refDigitsLength: { type: Number, default: 6 },
     extraFeePercent: { type: Number, default: 0 },
@@ -519,6 +520,27 @@ async function inicializarTiendaKemZonePorDefecto() {
                 }
             ]);
             console.log('✅ [Seed] Métodos de pago creados en payment_methods');
+        }
+
+        // Asegurar que PayPal ($) exista en el Dashboard de Métodos de Pago igual que Zinli
+        const existePaypal = await PaymentMethod.findOne({ methodKey: 'paypal' });
+        if (!existePaypal) {
+            await new PaymentMethod({
+                methodKey: 'paypal',
+                name: 'PayPal ($)',
+                currency: 'USD',
+                icon: '🅿️',
+                bankName: '',
+                phoneOrEmail: 'pagos@kemzone07.com',
+                documentId: '',
+                copyText: 'pagos@kemzone07.com',
+                instructions: '',
+                requiresReference: true,
+                refDigitsLength: 6,
+                active: true,
+                sortOrder: 3
+            }).save();
+            console.log('✅ [Seed] Método de pago PayPal ($) añadido al Dashboard');
         }
 
         // 3. Catálogo inicial con tus divisiones exactas (Sin PayPal en Servicios, solo Zinli y Windows 11)
