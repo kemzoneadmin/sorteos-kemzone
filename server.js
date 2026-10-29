@@ -1331,19 +1331,21 @@ app.post('/api/orders/create', orderLimiter, verificarTokenOpcional, async (req,
         const identificadorLimpio = (userEmail || deviceId || 'invitado').trim().toLowerCase();
         const refLimpia = (paymentReference || '').trim().toUpperCase();
 
-// 🛡️ ESCUDO ANTI-BUCLES: Si el mismo usuario envía el mismo pedido en menos de 15 segundos, devuelve la misma orden sin duplicarla
-        const hace15Segundos = new Date(Date.now() - 15 * 1000);
-        const ordenRecienteIdentica = await Order.findOne({
+// 🛡️ ESCUDO ANTI-DOBLE CLIC (3 segundos solo si es exactamente la misma referencia y mismo destino)
+        const hace3Segundos = new Date(Date.now() - 3 * 1000);
+        const ordenDobleClic = await Order.findOne({
             deviceId: identificadorLimpio,
             productSlug: String(productSlug || 'tokems-kz').trim().toLowerCase(),
             packageId: String(packageId || 'tokems_pack').trim(),
-            fecha: { $gte: hace15Segundos }
+            playerUid: String(playerUid || '').trim(),
+            paymentReference: paymentMethodKey === 'tokems_kz' ? 'TOKEMS-KZ' : refLimpia,
+            fecha: { $gte: hace3Segundos }
         }).lean();
 
-        if (ordenRecienteIdentica) {
+        if (ordenDobleClic) {
             return res.status(200).json({
                 success: true,
-                order: ordenRecienteIdentica,
+                order: ordenDobleClic,
                 deduplicated: true
             });
         }
