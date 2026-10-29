@@ -257,6 +257,8 @@ const StoreSettingsSchema = new mongoose.Schema({
             productSlugs: [{ type: String }]
         }]
     },
+    // 🧭 Configuración editable de la Cabecera, Mega-Menús, Submenús y sus Productos
+    navigationConfig: { type: mongoose.Schema.Types.Mixed, default: null },
     updatedBy: { type: String, default: 'system' }
 }, { timestamps: true });
 const StoreSettings = mongoose.model('StoreSettings', StoreSettingsSchema, 'store_settings');
@@ -2140,10 +2142,22 @@ app.get('/api/admin/overview', verificarSoloAdmin, async (req, res) => {
     }
 });
 
-// 2. Modificar Tasa Bs/USD, Portada Hero, Loot Relámpago, Filtros de Catálogo y Configuración General
+// 2. Modificar Tasa Bs/USD, Portada Hero, Loot Relámpago, Filtros, Menús y Configuración General
 app.post('/api/admin/settings', verificarSoloAdmin, async (req, res) => {
     try {
-        const { exchangeRateVES, tokemValueUSD, storeOpen, autoTriggerApiOnTokems, announcementText, hideAnnouncement, heroConfig, flashOffers, catalogSectionConfig } = req.body;
+        const {
+            exchangeRateVES,
+            tokemValueUSD,
+            storeOpen,
+            autoTriggerApiOnTokems,
+            announcementText,
+            hideAnnouncement,
+            heroConfig,
+            flashOffers,
+            catalogSectionConfig,
+            navigationConfig
+        } = req.body;
+
         let settings = await StoreSettings.findOne({ key: 'main_settings' });
         if (!settings) settings = new StoreSettings({ key: 'main_settings' });
 
@@ -2155,7 +2169,14 @@ app.post('/api/admin/settings', verificarSoloAdmin, async (req, res) => {
         if (typeof hideAnnouncement === 'boolean') settings.hideAnnouncement = hideAnnouncement;
         if (heroConfig && typeof heroConfig === 'object') settings.heroConfig = heroConfig;
         if (Array.isArray(flashOffers)) settings.flashOffers = flashOffers;
-        if (catalogSectionConfig && typeof catalogSectionConfig === 'object') settings.catalogSectionConfig = catalogSectionConfig;
+        if (catalogSectionConfig && typeof catalogSectionConfig === 'object') {
+            settings.catalogSectionConfig = catalogSectionConfig;
+            settings.markModified('catalogSectionConfig');
+        }
+        if (navigationConfig && typeof navigationConfig === 'object') {
+            settings.navigationConfig = navigationConfig;
+            settings.markModified('navigationConfig');
+        }
         settings.updatedBy = req.adminUser.email;
 
         await settings.save();
