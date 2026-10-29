@@ -1846,12 +1846,10 @@ app.post('/api/worker/delete-order', verificarTrabajadorOAdmin, async (req, res)
 
 app.get('/api/admin/overview', verificarSoloAdmin, async (req, res) => {
     try {
-        const hoyInicio = new Date();
-        hoyInicio.setHours(0, 0, 0, 0);
-
-        const mesInicio = new Date();
-        mesInicio.setDate(1);
-        mesInicio.setHours(0, 0, 0, 0);
+        // Sincronizado con zona horaria de Venezuela (UTC-4) para que no reinicie a las 8:00 PM
+        const ahoraVzla = new Date(Date.now() - (4 * 60 * 60 * 1000));
+        const hoyInicio = new Date(Date.UTC(ahoraVzla.getUTCFullYear(), ahoraVzla.getUTCMonth(), ahoraVzla.getUTCDate(), 4, 0, 0, 0));
+        const mesInicio = new Date(Date.UTC(ahoraVzla.getUTCFullYear(), ahoraVzla.getUTCMonth(), 1, 4, 0, 0, 0));
 
         const [
             settings,
