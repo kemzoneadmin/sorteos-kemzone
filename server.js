@@ -384,6 +384,7 @@ const OrderSchema = new mongoose.Schema({
     hadReview: { type: Boolean, default: false },
     reviewReason: { type: String, default: '' },
     reviewedByWorker: { type: String, default: '' },
+    reviewedAt: { type: Date, default: null },
     clientReviewWhatsappSent: { type: Boolean, default: false },
     statusMessage: { type: String, default: 'Verificando referencia de pago con un operador...' },
     progressPercent: { type: Number, default: 45 }, // 20% Iniciando -> 50% En Proceso -> 100% Entregado
@@ -1770,6 +1771,7 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
             orden.status = 'EN_REVISION';
             orden.progressPercent = 100;
             orden.hadReview = true;
+            orden.reviewedAt = new Date();
             orden.reviewReason = motivo;
             orden.workerNotes = motivo;
             orden.statusMessage = '⚠️ Tu pedido se encuentra en revisión. Revisa el mensaje del operador aquí abajo.';
@@ -1783,14 +1785,18 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
             });
         }
 
-        // ❌ SI EL TRABAJADOR RECHAZA LA ORDEN (EJ: PAGO MÓVIL FALSO O NO LLEGÓ)
+        // ❌ SI EL TRABAJADOR RECHAZA LA ORDEN (INCLUSO SI ESTABA ANTES EN REVISIÓN)
         if (action === 'RECHAZAR') {
             const yaEstabaRechazada = orden.status === 'RECHAZADO';
+            if (orden.status === 'EN_REVISION') {
+                orden.hadReview = true;
+            }
             orden.status = 'RECHAZADO';
             orden.progressPercent = 100;
-            orden.statusMessage = workerNotes || 'No pudimos verificar tu referencia de pago. Si crees que es un error, abre un ticket de soporte.';
-            orden.workerNotes = workerNotes || 'Referencia no encontrada';
+            orden.statusMessage = (workerNotes || '').trim() || 'No pudimos verificar tu referencia de pago. Si crees que es un error, abre un ticket de soporte.';
+            orden.workerNotes = (workerNotes || '').trim() || 'Referencia no encontrada';
             orden.approvedByWorker = req.staffUser.email;
+            orden.completedAt = new Date();
             await orden.save();
 
             // Si había pagado con Tokems KZ, se le reembolsan automáticamente
