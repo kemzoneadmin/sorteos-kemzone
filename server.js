@@ -316,6 +316,7 @@ uidLabel: { type: String, default: 'ID de Jugador (UID)' },
         apiProviderName: { type: String, default: 'DEFAULT_API' },
         apiProductSku: { type: String, default: '' },
         imageUrl: { type: String, default: '' },
+        isGiftCardPin: { type: Boolean, default: false },
         backupPinVault: [{ type: String }],
         inStock: { type: Boolean, default: true }
     }]
@@ -358,6 +359,7 @@ const OrderSchema = new mongoose.Schema({
     mainCategory: { type: String, default: 'recargas' },
     subCategory: { type: String, default: 'recargas_id' },
     fulfillmentType: { type: String, default: 'API_DIRECT_TOPUP' },
+    isGiftCardPin: { type: Boolean, default: false },
     packageId: { type: String, required: true },
     packageName: { type: String, required: true },
     apiProviderName: { type: String, default: '' },
@@ -1368,6 +1370,7 @@ app.post('/api/orders/create', orderLimiter, verificarTokenOpcional, async (req,
         let costoEnTokems = 0;
         let apiProv = '';
         let apiSku = '';
+        let esPinGiftCard = false;
         let productoDB = null;
 
         if (orderType === 'TOKEM_TOPUP') {
@@ -1401,6 +1404,9 @@ app.post('/api/orders/create', orderLimiter, verificarTokenOpcional, async (req,
             costoEnTokems = Number(pkg.tokemsPrice || pkg.priceUSD);
             apiProv = pkg.apiProviderName || 'DEFAULT_API';
             apiSku = pkg.apiProductSku || pkg.packageId;
+            esPinGiftCard = pkg.isGiftCardPin !== undefined
+                ? Boolean(pkg.isGiftCardPin)
+                : (productoDB.mainCategory === 'giftcards' || productoDB.fulfillmentType === 'API_GIFT_CARD');
 
             if (productoDB.serviceCommissionPercent > 0) {
                 feeUSD = Number(((baseUSD * productoDB.serviceCommissionPercent) / 100).toFixed(2));
@@ -1495,6 +1501,7 @@ app.post('/api/orders/create', orderLimiter, verificarTokenOpcional, async (req,
             mainCategory: mainCat,
             subCategory: subCat,
             fulfillmentType: fulfillment,
+            isGiftCardPin: esPinGiftCard,
             packageId: packageId || 'tokems_pack',
             packageName: nombrePaquete,
             apiProviderName: apiProv,
