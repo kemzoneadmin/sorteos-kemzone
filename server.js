@@ -308,7 +308,8 @@ const CatalogProductSchema = new mongoose.Schema({
     description: { type: String, default: '' },
     instructions: { type: String, default: 'Ingresa tu ID correctamente y selecciona el paquete que deseas recargar.' },
     cardImageUrl: { type: String, default: '' },
-    flyerImageUrl: { type: String, default: '' }, // Flyer de precios de tu Instagram @kemzone07
+    flyerImageUrl: { type: String, default: '' }, // Imagen del Banner Superior dentro del producto
+    infoImageUrl: { type: String, default: '' },  // Imagen exclusiva para "Información e Instrucciones del Producto"
     // Configuración de campos que se le piden al cliente en la Zona 1
 uidLabel: { type: String, default: 'ID de Jugador (UID)' },
     requiresServer: { type: Boolean, default: false },
