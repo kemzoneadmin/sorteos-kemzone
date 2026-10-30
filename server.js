@@ -218,8 +218,9 @@ const LoginLog = mongoose.model('LoginLog', LoginLogSchema, 'login_logs');
 // ⚙️ 2.1 CONFIGURACIÓN GLOBAL DE LA TIENDA (Editable desde tu Dashboard Admin)
 const StoreSettingsSchema = new mongoose.Schema({
     key: { type: String, unique: true, default: 'main_settings' },
-    exchangeRateVES: { type: Number, default: 55.00 }, // Tasa Bs por $1 USD
-    tokemValueUSD: { type: Number, default: 1.00 },    // 1 Tokem = $1.00 USD
+    exchangeRateVES: { type: Number, default: 1012.00 }, // 🔒 Tasa KZ Interna (Multiplica precio USD base a Bs)
+    bcvRateVES: { type: Number, default: 889.25 },       // 🏛️ Tasa BCV Pública (Visible al público y divide Bs a USD BCV)
+    tokemValueUSD: { type: Number, default: 1.00 },      // 1 Tokem = $1.00 USD base KZ
     storeOpen: { type: Boolean, default: true },
     autoTriggerApiOnTokems: { type: Boolean, default: true },
     announcementText: { type: String, default: '🔥 KEM!ZONE OFICIAL: Recargas y Gift Cards al instante — Aceptamos Pago Móvil, Binance, Zinli y Tokems KZ' },
@@ -381,12 +382,17 @@ const OrderSchema = new mongoose.Schema({
     paymentReference: { type: String, default: '', index: true }, // Últimos 6 dígitos
     isDuplicateRef: { type: Boolean, default: false, index: true }, // 🚨 Alerta roja si alguien repitió referencia
     duplicateWarningText: { type: String, default: '' },
-    exchangeRateApplied: { type: Number, required: true },
-    baseAmountUSD: { type: Number, required: true },
+exchangeRateApplied: { type: Number, required: true }, // Tasa KZ aplicada
+    bcvRateApplied: { type: Number, default: 889.25 },     // Tasa BCV aplicada
+    baseAmountUSD: { type: Number, required: true },       // Precio base KZ USD
+    bcvAmountUSD: { type: Number, default: 0 },            // Precio público BCV USD (Bs / BCV)
+    discountUSD: { type: Number, default: 0 },             // Descuento aplicado en métodos USD
+    paypalFeeUSD: { type: Number, default: 0 },            // Comisión PayPal (5.4% + $0.30)
+    clientPayUSD: { type: Number, default: 0 },            // Monto final en USD que paga el cliente ($1.21 PayPal, $0.84 Binance/Zinli, $0.96 ref BCV)
     serviceFeeUSD: { type: Number, default: 0 },
-    totalAmountUSD: { type: Number, required: true },
-    totalAmountVES: { type: Number, required: true },
-    costUSD: { type: Number, default: 0 }, // Para calcular ganancia neta en tu Dashboard
+    totalAmountUSD: { type: Number, required: true },      // Ingreso neto KZ USD para tus estadísticas y ganancias
+    totalAmountVES: { type: Number, required: true },      // Monto exacto en Bolívares (Base KZ * Tasa KZ)
+    costUSD: { type: Number, default: 0 },                 // Para calcular ganancia neta en tu Dashboard
     tokemsAmount: { type: Number, default: 0 },
     paidWithTokems: { type: Boolean, default: false },
 
@@ -1401,8 +1407,34 @@ app.post('/api/orders/create', orderLimiter, verificarTokenOpcional, async (req,
             }
         }
 
+        const tasaKZ = Number(settings.exchangeRateVES) || 1012.00;
+        const tasaBCV = Number(settings.bcvRateVES) || tasaKZ || 889.25;
+
+        // Precio Neto KZ en USD (El valor real de venta en tu catálogo)
         const totalUSD = Number((baseUSD + feeUSD).toFixed(2));
-        const totalVES = Number((totalUSD * settings.exchangeRateVES).toFixed(2));
+        // Monto en Bolívares multiplicando por la Tasa KZ Interna
+        const totalVES = Number((totalUSD * tasaKZ).toFixed(2));
+        // Monto Público en USD dividiendo los Bolívares entre la Tasa BCV
+        const bcvAmountUSD = tasaBCV > 0 ? Number((totalVES / tasaBCV).toFixed(2)) : totalUSD;
+        // Descuento aplicado para métodos en USD (Baja de BCV USD a KZ USD)
+        const discountUSD = Math.max(0, Number((bcvAmountUSD - totalUSD).toFixed(2)));
+
+        const keyMetodoLower = String(paymentMethodKey || '').toLowerCase();
+        const esPagoMovil = keyMetodoLower.includes('pago_movil') || metodoPago.currency === 'VES';
+        const esPaypal = keyMetodoLower.includes('paypal');
+
+        let paypalFeeUSD = 0;
+        let clientPayUSD = totalUSD;
+
+        if (esPagoMovil) {
+            clientPayUSD = bcvAmountUSD;
+        } else if (esPaypal) {
+            // Fórmula exacta de Calculadora PayPal (5.4% + $0.30 USD fijos)
+            clientPayUSD = Number(((totalUSD + 0.30) / (1 - 0.054)).toFixed(2));
+            paypalFeeUSD = Math.max(0, Number((clientPayUSD - totalUSD).toFixed(2)));
+        } else {
+            clientPayUSD = totalUSD;
+        }
 
         let pagadoConTokems = false;
         let nuevoSaldoTokems = null;
@@ -1478,8 +1510,13 @@ app.post('/api/orders/create', orderLimiter, verificarTokenOpcional, async (req,
             paymentReference: pagadoConTokems ? 'TOKEMS-KZ' : refLimpia,
             isDuplicateRef: esRefDuplicada,
             duplicateWarningText: textoAlertaDuplicada,
-            exchangeRateApplied: settings.exchangeRateVES,
+            exchangeRateApplied: tasaKZ,
+            bcvRateApplied: tasaBCV,
             baseAmountUSD: baseUSD,
+            bcvAmountUSD,
+            discountUSD,
+            paypalFeeUSD,
+            clientPayUSD,
             serviceFeeUSD: feeUSD,
             totalAmountUSD: totalUSD,
             totalAmountVES: totalVES,
@@ -2169,6 +2206,7 @@ app.post('/api/admin/settings', verificarSoloAdmin, async (req, res) => {
     try {
         const {
             exchangeRateVES,
+            bcvRateVES,
             tokemValueUSD,
             storeOpen,
             autoTriggerApiOnTokems,
@@ -2184,6 +2222,7 @@ app.post('/api/admin/settings', verificarSoloAdmin, async (req, res) => {
         if (!settings) settings = new StoreSettings({ key: 'main_settings' });
 
         if (exchangeRateVES !== undefined) settings.exchangeRateVES = Number(exchangeRateVES);
+        if (bcvRateVES !== undefined) settings.bcvRateVES = Number(bcvRateVES);
         if (tokemValueUSD !== undefined) settings.tokemValueUSD = Number(tokemValueUSD);
         if (typeof storeOpen === 'boolean') settings.storeOpen = storeOpen;
         if (typeof autoTriggerApiOnTokems === 'boolean') settings.autoTriggerApiOnTokems = autoTriggerApiOnTokems;
