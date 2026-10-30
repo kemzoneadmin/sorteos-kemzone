@@ -273,6 +273,8 @@ const StoreSettingsSchema = new mongoose.Schema({
     },
     // 🧭 Configuración editable de la Cabecera, Mega-Menús, Submenús y sus Productos
     navigationConfig: { type: mongoose.Schema.Types.Mixed, default: null },
+    // 🎨 Configuración y Plantillas de Flyers Canva (Sincronizado en MongoDB)
+    flyersCanvaConfig: { type: mongoose.Schema.Types.Mixed, default: null },
     updatedBy: { type: String, default: 'system' }
 }, { timestamps: true });
 const StoreSettings = mongoose.model('StoreSettings', StoreSettingsSchema, 'store_settings');
@@ -2532,7 +2534,8 @@ app.post('/api/admin/settings', verificarSoloAdmin, async (req, res) => {
             flashSectionConfig,
             flashOffers,
             catalogSectionConfig,
-            navigationConfig
+            navigationConfig,
+            flyersCanvaConfig
         } = req.body;
 
         let settings = await StoreSettings.findOne({ key: 'main_settings' });
@@ -2561,6 +2564,10 @@ app.post('/api/admin/settings', verificarSoloAdmin, async (req, res) => {
         if (navigationConfig && typeof navigationConfig === 'object') {
             settings.navigationConfig = navigationConfig;
             settings.markModified('navigationConfig');
+        }
+        if (flyersCanvaConfig && typeof flyersCanvaConfig === 'object') {
+            settings.flyersCanvaConfig = flyersCanvaConfig;
+            settings.markModified('flyersCanvaConfig');
         }
         settings.updatedBy = req.adminUser.email;
 
