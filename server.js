@@ -2579,10 +2579,10 @@ app.post('/api/admin/settings', verificarSoloAdmin, async (req, res) => {
     }
 });
 
-// 3. Crear o Editar cualquier Juego, Gift Card, Servicio, Flyer o Paquete de Precios (Soporta renombrar Slug sin duplicar)
+// 3. Crear o Editar cualquier Juego, Gift Card o Servicio (Aislado por _id para jamás mezclar imágenes entre productos)
 app.post('/api/admin/product/save', verificarSoloAdmin, async (req, res) => {
     try {
-        const { originalSlug, ...productData } = req.body;
+        const { productId, originalSlug, _id, ...productData } = req.body;
         if (!productData.slug || !productData.name || !productData.mainCategory || !productData.subCategory) {
             return res.status(400).json({ error: 'Slug, nombre, categoría y subcategoría son obligatorios.' });
         }
@@ -2590,75 +2590,117 @@ app.post('/api/admin/product/save', verificarSoloAdmin, async (req, res) => {
         const slugNuevo = productData.slug.trim().toLowerCase().replace(/\s+/g, '-');
         const slugAnterior = (originalSlug || '').trim().toLowerCase();
 
+        // Campos explícitos de este producto para evitar que cualquier referencia cruzada afecte a otro documento
+        const camposLimpios = {
+            slug: slugNuevo,
+            name: productData.name.trim(),
+            mainCategory: productData.mainCategory,
+            subCategory: productData.subCategory,
+            fulfillmentType: productData.fulfillmentType || 'API_DIRECT_TOPUP',
+            regionText: productData.regionText || '',
+            badgeText: productData.badgeText || '',
+            uidLabel: productData.uidLabel || 'ID de Jugador (UID)',
+            serviceCommissionPercent: Number(productData.serviceCommissionPercent || 0),
+            cardImageUrl: productData.cardImageUrl !== undefined ? String(productData.cardImageUrl).trim() : '',
+            flyerImageUrl: productData.flyerImageUrl !== undefined ? String(productData.flyerImageUrl).trim() : '',
+            infoImageUrl: productData.infoImageUrl !== undefined ? String(productData.infoImageUrl).trim() : '',
+            description: productData.description || '',
+            instructions: productData.instructions || '',
+            requiresServer: Boolean(productData.requiresServer),
+            requiresRegion: Boolean(productData.requiresRegion),
+            regionsList: Array.isArray(productData.regionsList) ? productData.regionsList : [],
+            requiresInternalLogin: Boolean(productData.requiresInternalLogin),
+            active: productData.active !== false,
+            packages: Array.isArray(productData.packages) ? productData.packages : []
+        };
+
+        let productoExistente = null;
+        if (productId && mongoose.Types.ObjectId.isValid(productId)) {
+            productoExistente = await CatalogProduct.findById(productId);
+        }
+        if (!productoExistente && slugAnterior) {
+            productoExistente = await CatalogProduct.findOne({ slug: slugAnterior });
+        }
+
         let productoActualizado = null;
 
-        // Si estamos editando un producto existente y le cambiaste el Slug:
-        if (slugAnterior && slugAnterior !== slugNuevo) {
-            const yaExisteConNuevoSlug = await CatalogProduct.findOne({ slug: slugNuevo });
-            if (yaExisteConNuevoSlug) {
-                return res.status(400).json({ error: `Ya existe otro producto con el identificador "${slugNuevo}". Usa uno diferente.` });
+        // CASO A: Editando un producto existente
+        if (productoExistente) {
+            const slugViejoReal = productoExistente.slug;
+
+            // Verificar que el nuevo slug no pertenezca a OTRO producto distinto
+            const colision = await CatalogProduct.findOne({
+                slug: slugNuevo,
+                _id: { $ne: productoExistente._id }
+            });
+            if (colision) {
+                return res.status(400).json({
+                    error: `Ya existe otro producto ("${colision.name}") usando el identificador "${slugNuevo}". Elige un Slug diferente.`
+                });
             }
 
-            productoActualizado = await CatalogProduct.findOneAndUpdate(
-                { slug: slugAnterior },
-                { $set: { ...productData, slug: slugNuevo } },
+            productoActualizado = await CatalogProduct.findByIdAndUpdate(
+                productoExistente._id,
+                { $set: camposLimpios },
                 { new: true }
             );
 
-            // Actualizar automáticamente el Slug en los Filtros de Inicio, Mega-Menús y Ofertas Relámpago
-            const settings = await StoreSettings.findOne({ key: 'main_settings' });
-            if (settings) {
-                let huboCambioSettings = false;
+            // Si cambió el Slug, actualizar referencias en Filtros, Menús y Loot Relámpago
+            if (slugViejoReal && slugViejoReal !== slugNuevo) {
+                const settings = await StoreSettings.findOne({ key: 'main_settings' });
+                if (settings) {
+                    let huboCambioSettings = false;
 
-                if (settings.catalogSectionConfig && Array.isArray(settings.catalogSectionConfig.pills)) {
-                    settings.catalogSectionConfig.pills.forEach(pill => {
-                        if (Array.isArray(pill.productSlugs)) {
-                            const idx = pill.productSlugs.indexOf(slugAnterior);
-                            if (idx !== -1) {
-                                pill.productSlugs[idx] = slugNuevo;
-                                huboCambioSettings = true;
-                            }
-                        }
-                    });
-                    if (huboCambioSettings) settings.markModified('catalogSectionConfig');
-                }
-
-                if (settings.navigationConfig && Array.isArray(settings.navigationConfig.menus)) {
-                    settings.navigationConfig.menus.forEach(menu => {
-                        (menu.submenus || []).forEach(sub => {
-                            if (Array.isArray(sub.productSlugs)) {
-                                const idx = sub.productSlugs.indexOf(slugAnterior);
+                    if (settings.catalogSectionConfig && Array.isArray(settings.catalogSectionConfig.pills)) {
+                        settings.catalogSectionConfig.pills.forEach(pill => {
+                            if (Array.isArray(pill.productSlugs)) {
+                                const idx = pill.productSlugs.indexOf(slugViejoReal);
                                 if (idx !== -1) {
-                                    sub.productSlugs[idx] = slugNuevo;
+                                    pill.productSlugs[idx] = slugNuevo;
                                     huboCambioSettings = true;
                                 }
                             }
                         });
-                    });
-                    if (huboCambioSettings) settings.markModified('navigationConfig');
-                }
+                        if (huboCambioSettings) settings.markModified('catalogSectionConfig');
+                    }
 
-                if (Array.isArray(settings.flashOffers)) {
-                    settings.flashOffers.forEach(of => {
-                        if (of.slug === slugAnterior) {
-                            of.slug = slugNuevo;
-                            huboCambioSettings = true;
-                        }
-                    });
-                    if (huboCambioSettings) settings.markModified('flashOffers');
-                }
+                    if (settings.navigationConfig && Array.isArray(settings.navigationConfig.menus)) {
+                        settings.navigationConfig.menus.forEach(menu => {
+                            (menu.submenus || []).forEach(sub => {
+                                if (Array.isArray(sub.productSlugs)) {
+                                    const idx = sub.productSlugs.indexOf(slugViejoReal);
+                                    if (idx !== -1) {
+                                        sub.productSlugs[idx] = slugNuevo;
+                                        huboCambioSettings = true;
+                                    }
+                                }
+                            });
+                        });
+                        if (huboCambioSettings) settings.markModified('navigationConfig');
+                    }
 
-                if (huboCambioSettings) await settings.save();
+                    if (Array.isArray(settings.flashOffers)) {
+                        settings.flashOffers.forEach(of => {
+                            if (of.slug === slugViejoReal) {
+                                of.slug = slugNuevo;
+                                huboCambioSettings = true;
+                            }
+                        });
+                        if (huboCambioSettings) settings.markModified('flashOffers');
+                    }
+
+                    if (huboCambioSettings) await settings.save();
+                }
             }
-        }
-
-        // Si es un producto nuevo o el Slug no cambió:
-        if (!productoActualizado) {
-            productoActualizado = await CatalogProduct.findOneAndUpdate(
-                { slug: slugNuevo },
-                { $set: { ...productData, slug: slugNuevo } },
-                { new: true, upsert: true }
-            );
+        } else {
+            // CASO B: Creando un producto nuevo o guardando un producto Duplicado
+            const yaExiste = await CatalogProduct.findOne({ slug: slugNuevo });
+            if (yaExiste) {
+                return res.status(400).json({
+                    error: `El identificador "${slugNuevo}" ya está en uso por "${yaExiste.name}". Cambia el Slug para crear el nuevo producto sin sobrescribir el anterior.`
+                });
+            }
+            productoActualizado = await new CatalogProduct(camposLimpios).save();
         }
 
         return res.json({ success: true, product: productoActualizado });
