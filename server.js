@@ -234,7 +234,14 @@ const StoreSettingsSchema = new mongoose.Schema({
         description: { type: String, default: 'Entrega rápida por ID de jugador y códigos digitales originales. Paga cómodamente en Bolívares (Pago Móvil), USDT (Binance), Tarjeta o usa tus Tokems KZ sin comisiones.' },
         mascotUrl: { type: String, default: 'https://cdn.shopify.com/s/files/1/0780/8444/0222/files/kem-ganador.png?v=1782718783' }
     },
-    // ⚡ Configuración editable de las Ofertas de Loot Relámpago
+    // ⚡ Configuración editable del Título y Emoji de la sección Loot Relámpago
+    flashSectionConfig: {
+        titleWhite: { type: String, default: 'Loot' },
+        titleOrange: { type: String, default: 'Relámpago' },
+        icon: { type: String, default: '⚡' },
+        subtitle: { type: String, default: 'Ofertas especiales del día' }
+    },
+    // ⚡ Paquetes Únicos de Oferta creados en Loot Relámpago
     flashOffers: [{
         slug: { type: String, default: 'free-fire-id' },
         pkgId: { type: String, default: 'ff_semanal' },
@@ -242,9 +249,15 @@ const StoreSettingsSchema = new mongoose.Schema({
         title: { type: String, default: 'Tarjeta Semanal FF' },
         oldUsd: { type: Number, default: 2.50 },
         usd: { type: Number, default: 1.95 },
+        costUSD: { type: Number, default: 1.50 },
+        tokemsPrice: { type: Number, default: 1.95 },
         discount: { type: String, default: '-22%' },
         timer: { type: String, default: '3D 08H 45M' },
-        img: { type: String, default: 'https://images.unsplash.com/photo-1542751371-adc38448a05e?auto=format&fit=crop&w=300&q=80' }
+        img: { type: String, default: 'https://images.unsplash.com/photo-1542751371-adc38448a05e?auto=format&fit=crop&w=300&q=80' },
+        pkgIconUrl: { type: String, default: '' },
+        apiProductSku: { type: String, default: '' },
+        isGiftCardPin: { type: Boolean, default: false },
+        backupPinVault: [{ type: String }]
     }],
     // 🗂️ Configuración editable de la sección Juegos de Recarga y Gift Cards y sus Filtros
     catalogSectionConfig: {
@@ -1396,10 +1409,33 @@ app.post('/api/orders/create', orderLimiter, verificarTokenOpcional, async (req,
             const idPkgBuscado = String(packageId || '').trim();
             const nombrePkgBuscado = String(req.body.packageName || '').trim().toLowerCase();
 
-            const pkg = (productoDB.packages || []).find(p =>
+            let pkg = (productoDB.packages || []).find(p =>
                 String(p.packageId || p.id || '').trim() === idPkgBuscado ||
                 (nombrePkgBuscado && String(p.name || '').trim().toLowerCase() === nombrePkgBuscado)
             );
+
+            // Si es un Paquete Único de Oferta creado desde el Editor de Loot Relámpago:
+            const ofertaMatch = (settings.flashOffers || []).find(of =>
+                String(of.slug || '').trim().toLowerCase() === slugBuscado &&
+                (String(of.pkgId || '').trim() === idPkgBuscado ||
+                 (nombrePkgBuscado && String(of.title || '').trim().toLowerCase() === nombrePkgBuscado))
+            );
+
+            if (ofertaMatch) {
+                pkg = {
+                    packageId: ofertaMatch.pkgId || idPkgBuscado,
+                    name: ofertaMatch.title,
+                    priceUSD: Number(ofertaMatch.usd),
+                    costUSD: Number(ofertaMatch.costUSD || (pkg ? pkg.costUSD : 0) || 0),
+                    tokemsPrice: Number(ofertaMatch.tokemsPrice || ofertaMatch.usd),
+                    apiProviderName: (pkg && pkg.apiProviderName) || 'DEFAULT_API',
+                    apiProductSku: ofertaMatch.apiProductSku || (pkg ? pkg.apiProductSku : '') || ofertaMatch.pkgId,
+                    isGiftCardPin: ofertaMatch.isGiftCardPin !== undefined ? Boolean(ofertaMatch.isGiftCardPin) : Boolean(pkg && pkg.isGiftCardPin),
+                    backupPinVault: Array.isArray(ofertaMatch.backupPinVault) ? ofertaMatch.backupPinVault : [],
+                    inStock: true
+                };
+            }
+
             if (!pkg || pkg.inStock === false) return res.status(400).json({ error: 'Paquete agotado o no disponible.' });
 
             nombreProducto = productoDB.name;
@@ -2131,12 +2167,11 @@ app.post('/api/worker/claim-order', verificarTrabajadorOAdmin, async (req, res) 
         }
 
         if (action === 'RELEASE') {
+            if (!isOwner) {
+                return res.status(403).json({ error: 'Acción exclusiva del Dueño: Los trabajadores no pueden devolver órdenes a la cola.' });
+            }
             const ordenActual = await Order.findOne({ orderId: idLimpio });
             if (!ordenActual) return res.status(404).json({ error: 'Orden no encontrada.' });
-
-            if (!isOwner && ordenActual.claimedByWorker && ordenActual.claimedByWorker !== staffEmail) {
-                return res.status(403).json({ error: 'Solo el operador que apartó la orden o el Dueño pueden liberarla.' });
-            }
 
             ordenActual.claimedByWorker = '';
             ordenActual.claimedByName = '';
@@ -2343,8 +2378,8 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
     }
 });
 
-// 🗑️ ELIMINAR ORDEN DEFINITIVAMENTE (Se descuenta de estadísticas y del historial del cliente)
-app.post('/api/worker/delete-order', verificarTrabajadorOAdmin, async (req, res) => {
+// 🗑️ ELIMINAR ORDEN DEFINITIVAMENTE (Exclusivo para el Dueño)
+app.post('/api/worker/delete-order', verificarSoloAdmin, async (req, res) => {
     try {
         const { orderId } = req.body;
         if (!orderId) return res.status(400).json({ error: 'Falta el ID de la orden.' });
@@ -2494,6 +2529,7 @@ app.post('/api/admin/settings', verificarSoloAdmin, async (req, res) => {
             announcementText,
             hideAnnouncement,
             heroConfig,
+            flashSectionConfig,
             flashOffers,
             catalogSectionConfig,
             navigationConfig
@@ -2510,7 +2546,14 @@ app.post('/api/admin/settings', verificarSoloAdmin, async (req, res) => {
         if (announcementText !== undefined) settings.announcementText = announcementText;
         if (typeof hideAnnouncement === 'boolean') settings.hideAnnouncement = hideAnnouncement;
         if (heroConfig && typeof heroConfig === 'object') settings.heroConfig = heroConfig;
-        if (Array.isArray(flashOffers)) settings.flashOffers = flashOffers;
+        if (flashSectionConfig && typeof flashSectionConfig === 'object') {
+            settings.flashSectionConfig = flashSectionConfig;
+            settings.markModified('flashSectionConfig');
+        }
+        if (Array.isArray(flashOffers)) {
+            settings.flashOffers = flashOffers;
+            settings.markModified('flashOffers');
+        }
         if (catalogSectionConfig && typeof catalogSectionConfig === 'object') {
             settings.catalogSectionConfig = catalogSectionConfig;
             settings.markModified('catalogSectionConfig');
