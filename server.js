@@ -1878,35 +1878,88 @@ app.post('/api/tickets/reply', verificarTokenOpcional, async (req, res) => {
     }
 });
 
-// 3. Tomar / Asignar un Ticket (Trabajador o Dueño)
+// 3. Apartar, Liberar o Tomar Control de un Ticket (Candado Atómico igual que la Cola de Recargas)
 app.post('/api/tickets/claim', verificarTrabajadorOAdmin, async (req, res) => {
     try {
-        const { ticketId } = req.body;
+        const { ticketId, action = 'CLAIM' } = req.body; // 'CLAIM' | 'RELEASE' | 'FORCE_TAKE'
         const idLimpio = String(ticketId || '').trim().toUpperCase();
         const staffEmail = req.staffUser.email.toLowerCase();
         const staffName = req.staffUser.accountName || staffEmail.split('@')[0];
+        const isOwner = req.effectiveRole === 'admin';
 
-        const ticket = await SupportTicket.findOneAndUpdate(
-            { ticketId: idLimpio },
-            {
-                $set: {
-                    assignedWorker: staffEmail,
-                    assignedWorkerName: staffName,
-                    status: 'EN_REVISION'
-                }
-            },
-            { new: true }
-        );
-        if (!ticket) return res.status(404).json({ error: 'Ticket no encontrado.' });
+        if (action === 'CLAIM') {
+            const ticketApartado = await SupportTicket.findOneAndUpdate(
+                {
+                    ticketId: idLimpio,
+                    $or: [
+                        { assignedWorker: '' },
+                        { assignedWorker: null },
+                        { assignedWorker: { $exists: false } },
+                        { assignedWorker: staffEmail }
+                    ]
+                },
+                {
+                    $set: {
+                        assignedWorker: staffEmail,
+                        assignedWorkerName: staffName,
+                        status: 'EN_REVISION'
+                    }
+                },
+                { new: true }
+            );
 
-        const pres = activeTicketPresence.get(idLimpio) || {};
-        pres.staffLastSeen = Date.now();
-        pres.staffName = staffName;
-        activeTicketPresence.set(idLimpio, pres);
+            if (!ticketApartado) {
+                const existente = await SupportTicket.findOne({ ticketId: idLimpio }).select('assignedWorker assignedWorkerName').lean();
+                if (!existente) return res.status(404).json({ error: 'El ticket ya no existe.' });
+                return res.status(409).json({
+                    error: `⚠️ Este ticket acaba de ser apartado por ${existente.assignedWorkerName || existente.assignedWorker}.`
+                });
+            }
 
-        return res.json({ success: true, ticket, presence: obtenerPresenciaTicket(idLimpio) });
+            const pres = activeTicketPresence.get(idLimpio) || {};
+            pres.staffLastSeen = Date.now();
+            pres.staffName = staffName;
+            activeTicketPresence.set(idLimpio, pres);
+
+            return res.json({ success: true, ticket: ticketApartado, presence: obtenerPresenciaTicket(idLimpio) });
+        }
+
+        if (action === 'RELEASE') {
+            const ticketActual = await SupportTicket.findOne({ ticketId: idLimpio });
+            if (!ticketActual) return res.status(404).json({ error: 'Ticket no encontrado.' });
+
+            if (!isOwner && ticketActual.assignedWorker && ticketActual.assignedWorker !== staffEmail) {
+                return res.status(403).json({ error: 'Solo el operador que apartó el ticket o el Dueño pueden liberarlo.' });
+            }
+
+            ticketActual.assignedWorker = '';
+            ticketActual.assignedWorkerName = '';
+            ticketActual.status = 'ABIERTO';
+            await ticketActual.save();
+
+            return res.json({ success: true, ticket: ticketActual, presence: obtenerPresenciaTicket(idLimpio) });
+        }
+
+        if (action === 'FORCE_TAKE') {
+            if (!isOwner) return res.status(403).json({ error: 'Acción exclusiva del Dueño.' });
+            const ticketTomado = await SupportTicket.findOneAndUpdate(
+                { ticketId: idLimpio },
+                {
+                    $set: {
+                        assignedWorker: staffEmail,
+                        assignedWorkerName: staffName,
+                        status: 'EN_REVISION'
+                    }
+                },
+                { new: true }
+            );
+            if (!ticketTomado) return res.status(404).json({ error: 'Ticket no encontrado.' });
+            return res.json({ success: true, ticket: ticketTomado, presence: obtenerPresenciaTicket(idLimpio) });
+        }
+
+        return res.status(400).json({ error: 'Acción inválida.' });
     } catch (error) {
-        return res.status(500).json({ error: 'Error al tomar el ticket.' });
+        return res.status(500).json({ error: 'Error al procesar el apartado del ticket.' });
     }
 });
 
@@ -1997,7 +2050,16 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
 
         const [orders, ticketsAbiertos, pendientesSinApartarCount, workersList] = await Promise.all([
             Order.find(query).sort({ fecha: -1 }).limit(250).select('-costUSD').lean(),
-            SupportTicket.find().sort({ updatedAt: -1 }).limit(80).lean(),
+            SupportTicket.find(
+                isOwner
+                    ? {}
+                    : {
+                        $or: [
+                            { status: 'ABIERTO', $or: [{ assignedWorker: '' }, { assignedWorker: null }, { assignedWorker: { $exists: false } }] },
+                            { assignedWorker: workerEmail }
+                        ]
+                    }
+            ).sort({ updatedAt: -1 }).limit(120).lean(),
             Order.countDocuments({
                 status: 'EN_PROCESO',
                 $or: [{ claimedByWorker: '' }, { claimedByWorker: null }, { claimedByWorker: { $exists: false } }]
