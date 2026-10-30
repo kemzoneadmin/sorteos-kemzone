@@ -430,28 +430,36 @@ OrderSchema.index({ status: 1, fecha: -1 });
 OrderSchema.index({ paymentReference: 1, fecha: -1 });
 const Order = mongoose.model('Order', OrderSchema, 'kz_orders');
 
-// 🎫 2.5 SISTEMA DE TICKETS DE ERRORES Y SOPORTE (CLIENTES <-> TRABAJADORES)
+// 🎫 2.5 SISTEMA DE TICKETS DE ERRORES Y SOPORTE (CON CHAT EN VIVO Y AUTO-OPTIMIZACIÓN)
 const SupportTicketSchema = new mongoose.Schema({
     ticketId: { type: String, required: true, unique: true, uppercase: true, index: true },
     orderId: { type: String, default: '', uppercase: true, index: true },
     deviceId: { type: String, required: true, index: true },
     userEmail: { type: String, default: '', lowercase: true, trim: true, index: true },
+    userName: { type: String, default: '' },
     userWhatsapp: { type: String, default: '' },
     subject: { type: String, required: true },
-    category: { 
-        type: String, 
-        enum: ['ERROR_REFERENCIA', 'ID_EQUIVOCADO', 'CODIGO_INVALIDO', 'DEMORA_RECARGA', 'OTRO'], 
-        default: 'OTRO' 
-    },
+    category: { type: String, default: 'Consulta General', trim: true }, // Motivo 100% escribible
+    gameName: { type: String, default: '' },
+    paymentMethod: { type: String, default: '' },
+    paymentReference: { type: String, default: '' },
+    playerUid: { type: String, default: '' },
     status: { type: String, enum: ['ABIERTO', 'EN_REVISION', 'RESUELTO', 'CERRADO'], default: 'ABIERTO', index: true },
     assignedWorker: { type: String, default: '' },
+    assignedWorkerName: { type: String, default: '' },
+    resolvedBy: { type: String, default: '' },
+    resolvedAt: { type: Date, default: null },
     messages: [{
         senderRole: { type: String, enum: ['client', 'worker', 'admin'], required: true },
         senderName: { type: String, required: true },
-        text: { type: String, required: true },
+        text: { type: String, default: '' },
+        attachmentUrl: { type: String, default: '' },
         timestamp: { type: Date, default: Date.now }
     }]
 }, { timestamps: true });
+
+// 🚀 Índice TTL en MongoDB: borra automáticamente los tickets RESUELTOS después de 10 días para que jamás pesen en la base de datos
+SupportTicketSchema.index({ resolvedAt: 1 }, { expireAfterSeconds: 864000 });
 const SupportTicket = mongoose.model('SupportTicket', SupportTicketSchema, 'support_tickets');
 
 // 🔒 CLIENTE APIFY PARA LA ZONA DE SORTEOS KZ
@@ -1692,31 +1700,91 @@ app.post('/api/client/save-game-profile', verificarTokenOpcional, async (req, re
 });
 
 // =================================================================
-// 🎫 ENDPOINTS DE TICKETS DE SOPORTE (CLIENTES Y TRABAJADORES)
+// 🎫 ENDPOINTS DE TICKETS Y CHAT EN VIVO (OPTIMIZADO EN RAM + MONGODB)
 // =================================================================
+const activeTicketPresence = new Map(); // Guarda quién está en línea o escribiendo sin gastar disco en MongoDB
+
+function obtenerPresenciaTicket(ticketId) {
+    const now = Date.now();
+    const p = activeTicketPresence.get(ticketId) || {};
+    return {
+        clientOnline: Boolean(p.clientLastSeen && (now - p.clientLastSeen < 18000)),
+        clientTyping: Boolean(p.clientTypingUntil && now < p.clientTypingUntil),
+        staffOnline: Boolean(p.staffLastSeen && (now - p.staffLastSeen < 18000)),
+        staffTyping: Boolean(p.staffTypingUntil && now < p.staffTypingUntil),
+        staffName: p.staffName || ''
+    };
+}
+
+// Limpieza automática de memoria RAM cada 10 minutos
+setInterval(() => {
+    const limite = Date.now() - 120000;
+    for (const [k, v] of activeTicketPresence.entries()) {
+        if ((v.clientLastSeen || 0) < limite && (v.staffLastSeen || 0) < limite) {
+            activeTicketPresence.delete(k);
+        }
+    }
+}, 600000);
+
+// 1. Crear nuevo Ticket y abrir conversación
 app.post('/api/tickets/create', verificarTokenOpcional, async (req, res) => {
     try {
-        const { orderId, deviceId, userEmail, userWhatsapp, subject, category, messageText } = req.body;
-        if (!subject || !messageText) return res.status(400).json({ error: 'Escribe el asunto y el detalle de tu problema.' });
+        const {
+            orderId,
+            deviceId,
+            userEmail,
+            userName,
+            userWhatsapp,
+            subject,
+            category,
+            gameName,
+            paymentMethod,
+            paymentReference,
+            playerUid,
+            messageText,
+            attachmentUrl
+        } = req.body;
+
+        const motivoLimpio = (category || 'Consulta General').trim();
+        const asuntoLimpio = (subject || motivoLimpio || 'Soporte de Pedido').trim();
+        const textoInicial = (messageText || '').trim();
+
+        if (!motivoLimpio && !textoInicial) {
+            return res.status(400).json({ error: 'Por favor escribe el motivo y los detalles de tu consulta.' });
+        }
 
         const ticketId = 'TK-' + crypto.randomInt(10000, 99999).toString();
         const identificador = (userEmail || deviceId || 'invitado').trim().toLowerCase();
+        const nombreMostrar = (userName || (userEmail ? userEmail.split('@')[0] : 'Cliente')).trim();
 
         const nuevoTicket = await new SupportTicket({
             ticketId,
-            orderId: (orderId || '').trim().toUpperCase(),
+            orderId: (orderId || '').trim().toUpperCase().replace(/^#/, ''),
             deviceId: identificador,
             userEmail: userEmail ? userEmail.trim().toLowerCase() : '',
+            userName: nombreMostrar,
             userWhatsapp: (userWhatsapp || '').trim(),
-            subject: subject.trim(),
-            category: category || 'OTRO',
+            subject: asuntoLimpio,
+            category: motivoLimpio,
+            gameName: (gameName || '').trim(),
+            paymentMethod: (paymentMethod || '').trim(),
+            paymentReference: (paymentReference || '').trim(),
+            playerUid: (playerUid || '').trim(),
             status: 'ABIERTO',
             messages: [{
                 senderRole: 'client',
-                senderName: userEmail || 'Cliente',
-                text: messageText.trim()
+                senderName: nombreMostrar,
+                text: textoInicial || `Motivo: ${motivoLimpio}`,
+                attachmentUrl: attachmentUrl || ''
             }]
         }).save();
+
+        // Auto-optimización silenciosa: purga tickets resueltos de hace más de 10 días
+        const hace10Dias = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000);
+        SupportTicket.deleteMany({
+            status: { $in: ['RESUELTO', 'CERRADO'] },
+            updatedAt: { $lt: hace10Dias }
+        }).catch(() => {});
 
         return res.json({ success: true, ticket: nuevoTicket });
     } catch (error) {
@@ -1724,33 +1792,177 @@ app.post('/api/tickets/create', verificarTokenOpcional, async (req, res) => {
     }
 });
 
+// 2. Enviar mensaje o adjunto en el Chat (Cliente o Trabajador/Dueño) y Finalizar como Resuelto
 app.post('/api/tickets/reply', verificarTokenOpcional, async (req, res) => {
     try {
-        const { ticketId, text, newStatus } = req.body;
-        if (!ticketId || !text) return res.status(400).json({ error: 'Falta el mensaje.' });
+        const { ticketId, text, attachmentUrl, newStatus, senderNameCustom } = req.body;
+        if (!ticketId) return res.status(400).json({ error: 'Falta el ID del ticket.' });
 
-        const ticket = await SupportTicket.findOne({ ticketId: ticketId.trim().toUpperCase() });
+        const idLimpio = ticketId.trim().toUpperCase();
+        const ticket = await SupportTicket.findOne({ ticketId: idLimpio });
         if (!ticket) return res.status(404).json({ error: 'Ticket no encontrado.' });
 
         let senderRole = 'client';
-        let senderName = ticket.userEmail || 'Cliente';
+        let senderName = ticket.userName || (ticket.userEmail ? ticket.userEmail.split('@')[0] : 'Cliente');
 
         if (req.user && req.user.email) {
             const rol = determinarRolDeUsuario(req.user.email, req.user.role);
             if (rol === 'worker' || rol === 'admin') {
                 senderRole = rol;
-                senderName = `Soporte Kem!Zone (${req.user.email.split('@')[0]})`;
-                ticket.status = newStatus || 'EN_REVISION';
-                ticket.assignedWorker = req.user.email;
+                const staffAlias = senderNameCustom || req.user.email.split('@')[0];
+                senderName = `${staffAlias} (Soporte Kem!Zone)`;
+                if (!ticket.assignedWorker) {
+                    ticket.assignedWorker = req.user.email.toLowerCase();
+                    ticket.assignedWorkerName = staffAlias;
+                }
             }
         }
 
-        ticket.messages.push({ senderRole, senderName, text: text.trim() });
-        await ticket.save();
+        // Si el ticket ya estaba resuelto y el cliente intenta escribir, se bloquea para cuidar la BD
+        if (senderRole === 'client' && (ticket.status === 'RESUELTO' || ticket.status === 'CERRADO')) {
+            return res.status(403).json({ error: 'Este ticket ya fue finalizado como resuelto. Si necesitas más ayuda, abre un nuevo ticket.' });
+        }
 
-        return res.json({ success: true, ticket });
+        const msgTxt = (text || '').trim();
+        const imgAdjunta = (attachmentUrl || '').trim();
+
+        if (msgTxt || imgAdjunta) {
+            // Limita a máximo 80 mensajes por ticket para proteger el tamaño del documento en MongoDB
+            if (ticket.messages.length >= 80) {
+                ticket.messages.shift();
+            }
+            ticket.messages.push({
+                senderRole,
+                senderName,
+                text: msgTxt || (imgAdjunta ? '📎 Archivo adjunto enviado' : ''),
+                attachmentUrl: imgAdjunta
+            });
+        }
+
+        if (senderRole === 'worker' || senderRole === 'admin') {
+            if (newStatus === 'RESUELTO' || newStatus === 'CERRADO') {
+                ticket.status = 'RESUELTO';
+                ticket.resolvedBy = senderName;
+                ticket.resolvedAt = new Date();
+                // Optimización: al resolver el problema, limpia imágenes pesadas intermedias si hay muchas para ahorrar RAM y espacio en MongoDB
+                if (ticket.messages.length > 6) {
+                    for (let i = 1; i < ticket.messages.length - 2; i++) {
+                        if (ticket.messages[i].attachmentUrl && ticket.messages[i].attachmentUrl.length > 50000) {
+                            ticket.messages[i].attachmentUrl = '';
+                        }
+                    }
+                }
+            } else if (newStatus === 'ABIERTO') {
+                ticket.status = 'ABIERTO';
+                ticket.resolvedAt = null;
+            } else {
+                ticket.status = 'EN_REVISION';
+                ticket.resolvedAt = null;
+            }
+        }
+
+        // Apagar indicador de "escribiendo..." al enviar el mensaje
+        const pres = activeTicketPresence.get(idLimpio) || {};
+        if (senderRole === 'client') pres.clientTypingUntil = 0;
+        else pres.staffTypingUntil = 0;
+        activeTicketPresence.set(idLimpio, pres);
+
+        await ticket.save();
+        return res.json({
+            success: true,
+            ticket,
+            presence: obtenerPresenciaTicket(idLimpio)
+        });
     } catch (error) {
         return res.status(500).json({ error: 'Error enviando respuesta al ticket.' });
+    }
+});
+
+// 3. Tomar / Asignar un Ticket (Trabajador o Dueño)
+app.post('/api/tickets/claim', verificarTrabajadorOAdmin, async (req, res) => {
+    try {
+        const { ticketId } = req.body;
+        const idLimpio = String(ticketId || '').trim().toUpperCase();
+        const staffEmail = req.staffUser.email.toLowerCase();
+        const staffName = req.staffUser.accountName || staffEmail.split('@')[0];
+
+        const ticket = await SupportTicket.findOneAndUpdate(
+            { ticketId: idLimpio },
+            {
+                $set: {
+                    assignedWorker: staffEmail,
+                    assignedWorkerName: staffName,
+                    status: 'EN_REVISION'
+                }
+            },
+            { new: true }
+        );
+        if (!ticket) return res.status(404).json({ error: 'Ticket no encontrado.' });
+
+        const pres = activeTicketPresence.get(idLimpio) || {};
+        pres.staffLastSeen = Date.now();
+        pres.staffName = staffName;
+        activeTicketPresence.set(idLimpio, pres);
+
+        return res.json({ success: true, ticket, presence: obtenerPresenciaTicket(idLimpio) });
+    } catch (error) {
+        return res.status(500).json({ error: 'Error al tomar el ticket.' });
+    }
+});
+
+// 4. Latido en Vivo de Chat: Devuelve mensajes nuevos y estado "en línea / escribiendo..." (0 escrituras en MongoDB)
+app.post('/api/tickets/live-sync', verificarTokenOpcional, async (req, res) => {
+    try {
+        const { ticketId, role, isTyping, staffName } = req.body;
+        const idLimpio = String(ticketId || '').trim().toUpperCase();
+        if (!idLimpio) return res.status(400).json({ error: 'Falta ticketId' });
+
+        const now = Date.now();
+        const pres = activeTicketPresence.get(idLimpio) || {};
+
+        if (role === 'worker' || role === 'admin') {
+            pres.staffLastSeen = now;
+            if (staffName) pres.staffName = staffName;
+            pres.staffTypingUntil = isTyping ? (now + 4500) : 0;
+        } else {
+            pres.clientLastSeen = now;
+            pres.clientTypingUntil = isTyping ? (now + 4500) : 0;
+        }
+        activeTicketPresence.set(idLimpio, pres);
+
+        const ticket = await SupportTicket.findOne({ ticketId: idLimpio }).lean();
+        if (!ticket) return res.status(404).json({ error: 'Ticket no encontrado.' });
+
+        return res.json({
+            success: true,
+            ticket,
+            presence: obtenerPresenciaTicket(idLimpio)
+        });
+    } catch (error) {
+        return res.status(500).json({ error: 'Error sincronizando chat.' });
+    }
+});
+
+// 5. Eliminar un ticket o limpiar todos los resueltos (Optimización de Base de Datos)
+app.post('/api/tickets/cleanup', verificarTrabajadorOAdmin, async (req, res) => {
+    try {
+        const { action, ticketId } = req.body;
+        if (action === 'DELETE_ONE' && ticketId) {
+            await SupportTicket.deleteOne({ ticketId: String(ticketId).trim().toUpperCase() });
+            activeTicketPresence.delete(String(ticketId).trim().toUpperCase());
+            return res.json({ success: true, message: `Ticket #${ticketId} eliminado de la base de datos.` });
+        }
+        if (action === 'PURGE_RESOLVED') {
+            const resultado = await SupportTicket.deleteMany({ status: { $in: ['RESUELTO', 'CERRADO'] } });
+            return res.json({
+                success: true,
+                deletedCount: resultado.deletedCount || 0,
+                message: `Se liberaron ${resultado.deletedCount || 0} tickets resueltos de MongoDB.`
+            });
+        }
+        return res.status(400).json({ error: 'Acción inválida.' });
+    } catch (error) {
+        return res.status(500).json({ error: 'Error limpiando tickets.' });
     }
 });
 
@@ -1785,7 +1997,7 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
 
         const [orders, ticketsAbiertos, pendientesSinApartarCount, workersList] = await Promise.all([
             Order.find(query).sort({ fecha: -1 }).limit(250).select('-costUSD').lean(),
-            SupportTicket.find({ status: { $in: ['ABIERTO', 'EN_REVISION'] } }).sort({ updatedAt: -1 }).limit(50).lean(),
+            SupportTicket.find().sort({ updatedAt: -1 }).limit(80).lean(),
             Order.countDocuments({
                 status: 'EN_PROCESO',
                 $or: [{ claimedByWorker: '' }, { claimedByWorker: null }, { claimedByWorker: { $exists: false } }]
