@@ -1592,12 +1592,34 @@ app.get('/api/client/account-overview', verificarTokenOpcional, async (req, res)
         return res.json({
             success: true,
             tokems: usuario ? usuario.tokems : 0,
+            whatsapp: usuario ? (usuario.whatsapp || '') : '',
             savedProfiles: usuario ? (usuario.savedProfiles || []) : [],
             orders,
             tickets
         });
     } catch (error) {
         return res.status(500).json({ error: 'Error obteniendo los datos de tu cuenta.' });
+    }
+});
+
+// 📱 Guardar el número de WhatsApp oficial del cliente en su cuenta de MongoDB
+app.post('/api/client/save-whatsapp', verificarTokenOpcional, async (req, res) => {
+    try {
+        const { email, whatsapp } = req.body;
+        const correoTarget = (req.user && req.user.email) ? req.user.email.toLowerCase() : (email || '').trim().toLowerCase();
+        if (!correoTarget) return res.status(401).json({ error: 'Inicia sesión para guardar tu WhatsApp.' });
+
+        const wsLimpio = String(whatsapp || '').trim();
+        const usuario = await User.findOneAndUpdate(
+            { email: correoTarget },
+            { $set: { whatsapp: wsLimpio } },
+            { new: true }
+        );
+        if (!usuario) return res.status(404).json({ error: 'Usuario no encontrado.' });
+
+        return res.json({ success: true, whatsapp: usuario.whatsapp });
+    } catch (error) {
+        return res.status(500).json({ error: 'Error guardando tu WhatsApp.' });
     }
 });
 
