@@ -1062,7 +1062,6 @@ async function registrarAlertaCentralOne(settingsDoc, alertaObj, mapaVinculadosP
     } catch (e) {}
 }
 
-// 🧠 ALGORITMO INTELIGENTE DE COMBINACIÓN DE TARJETAS (BENEFICIO DEL CLIENTE + DETECTOR DE DISPONIBILIDAD)
 function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, baseCardsPool, catalogCache = null) {
     const metaUSD = Number(targetClientUSD) || 0;
     if (metaUSD <= 0) return { hasSolution: false, reason: 'Meta USD inválida' };
@@ -1096,7 +1095,6 @@ function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, ba
             const itemCO = (c.centralOneProductId && mapaCO_Id[c.centralOneProductId]) ||
                            (c.centralOneSku && mapaCO_Sku[String(c.centralOneSku).trim().toUpperCase()]);
             if (!itemCO) {
-                // Fue retirada/eliminada del catálogo de Central One
                 enStockReal = false;
             } else {
                 enStockReal = Boolean(itemCO.in_stock && itemCO.status === 'active');
@@ -1117,6 +1115,7 @@ function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, ba
             ...c,
             effectiveClientUSD: effUsd,
             costUSD: costoReal,
+            costPerDollar: costoReal / effUsd,
             availableStock: stockDisp
         });
     }
@@ -1128,18 +1127,36 @@ function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, ba
         };
     }
 
-    // Ordenar candidatas por mejor eficiencia (menor costo por cada $1 entregado al cliente)
-    candidatas.sort((a, b) => (a.costUSD / a.effectiveClientUSD) - (b.costUSD / b.effectiveClientUSD));
+    const menorCartaUSD = Math.min(...candidatas.map(c => c.effectiveClientUSD));
+    if (metaUSD < menorCartaUSD * 0.85) {
+        return {
+            hasSolution: false,
+            reason: `La tarjeta menor en bóveda da $${menorCartaUSD.toFixed(2)} USD (supera la meta de $${metaUSD.toFixed(2)} USD). Agrega una tarjeta menor en la bóveda.`
+        };
+    }
+
+    // Ordenar por mejor eficiencia (menor costo por cada $1 entregado) y de mayor a menor denominación
+    candidatas.sort((a, b) => {
+        if (Math.abs(a.costPerDollar - b.costPerDollar) > 0.015) {
+            return a.costPerDollar - b.costPerDollar;
+        }
+        return b.effectiveClientUSD - a.effectiveClientUSD;
+    });
+
+    const n = candidatas.length;
+    const pisoMinimoUSD = metaUSD * 0.992;
+    const techoMaximoUSD = metaUSD <= 15 ? (metaUSD * 1.35) : (metaUSD + Math.max(6.0, metaUSD * 0.20));
+    const maxCartasPermitidas = Math.min(30, Math.max(10, Math.ceil(metaUSD / Math.max(0.5, menorCartaUSD)) + 2));
+    const mejorRatioCosto = Math.min(...candidatas.map(c => c.costPerDollar));
 
     const solucionesValidas = [];
-    const n = candidatas.length;
-    const maxCartas = 8;
-    // Techo máximo permitido para no encarecer el paquete innecesariamente (más ajustado en montos grandes)
-    const techoMaximoUSD = metaUSD <= 15 ? (metaUSD * 1.35) : (metaUSD + Math.max(5.5, metaUSD * 0.22));
-    // Piso mínimo: garantiza que el cliente reciba al menos el monto prometido (tolerancia 0.5% por redondeo cambiario)
-    const pisoMinimoUSD = metaUSD * 0.995;
+    let mejorCostoMicroHallado = Infinity;
+    let nodosExplorados = 0;
 
     function explorar(startIndex, cartasUsadas, conteoPorIndice, sumaClienteUSD, sumaCostoMicro) {
+        nodosExplorados++;
+        if (nodosExplorados > 4500) return;
+
         if (cartasUsadas > 0 && sumaClienteUSD >= pisoMinimoUSD && sumaClienteUSD <= techoMaximoUSD) {
             const diffMeta = sumaClienteUSD - metaUSD;
             const itemsCombo = [];
@@ -1159,6 +1176,10 @@ function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, ba
                 etiquetas.push(`${qty}x ${card.name} ($${(card.effectiveClientUSD * qty).toFixed(2)})`);
             });
 
+            if (sumaCostoMicro < mejorCostoMicroHallado) {
+                mejorCostoMicroHallado = sumaCostoMicro;
+            }
+
             solucionesValidas.push({
                 hasSolution: true,
                 totalCards: cartasUsadas,
@@ -1170,12 +1191,16 @@ function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, ba
                 summaryText: etiquetas.join(' + '),
                 items: itemsCombo
             });
-            // Si ya alcanzamos o superamos el monto del paquete en esta rama, no hace falta seguir sumando más tarjetas encima
             return;
         }
 
-        if (cartasUsadas >= maxCartas) return;
-        if (solucionesValidas.length >= 250) return;
+        if (cartasUsadas >= maxCartasPermitidas) return;
+
+        const faltaUSD = Math.max(0, pisoMinimoUSD - sumaClienteUSD);
+        const costoMinimoRestanteMicro = Math.round(faltaUSD * mejorRatioCosto * 10000);
+        if (sumaCostoMicro + costoMinimoRestanteMicro > mejorCostoMicroHallado + 1000) {
+            return;
+        }
 
         for (let i = startIndex; i < n; i++) {
             const card = candidatas[i];
@@ -1206,12 +1231,8 @@ function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, ba
         };
     }
 
-    // Ordenar priorizando:
-    // 1° Menor costo total (lo que le da al cliente el mejor precio final respetando tu ganancia fija)
-    // 2° A igualdad de costo (diferencia <= $0.04 USD), mayor saldo recibido por el cliente (beneficio extra para el cliente)
-    // 3° Menor cantidad de códigos a canjear
     solucionesValidas.sort((a, b) => {
-        if (Math.abs(a.totalCostMicro - b.totalCostMicro) > 400) {
+        if (Math.abs(a.totalCostMicro - b.totalCostMicro) > 350) {
             return a.totalCostMicro - b.totalCostMicro;
         }
         if (Math.abs(b.totalClientUSD - a.totalClientUSD) >= 0.05) {
