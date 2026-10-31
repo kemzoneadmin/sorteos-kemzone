@@ -911,28 +911,152 @@ function obtenerHeadersCentralOne(extraHeaders = {}) {
     };
 }
 
-async function registrarAlertaCentralOne(settingsDoc, alertaObj) {
+// 🔍 Obtiene el mapa exacto de todos los UUIDs y SKUs de Central One que tienes vinculados en tu tienda
+async function obtenerMapaVinculadosTiendaKZ(settingsDoc = null) {
+    const byId = new Map();
+    const bySku = new Map();
+    try {
+        if (!settingsDoc) {
+            settingsDoc = await StoreSettings.findOne({ key: 'main_settings' })
+                .select('arbitrageBaseCards flashOffers')
+                .lean();
+        }
+        const productos = await CatalogProduct.find()
+            .select('slug name packages altPackages')
+            .lean();
+
+        const registrarVinculo = (coId, sku, meta) => {
+            const idClean = String(coId || '').trim();
+            const skuClean = String(sku || '').trim().toUpperCase();
+            if (idClean) byId.set(idClean, meta);
+            if (skuClean) bySku.set(skuClean, meta);
+        };
+
+        for (const p of (productos || [])) {
+            for (const pk of (p.packages || [])) {
+                if (pk.centralOneProductId || pk.apiProductSku) {
+                    registrarVinculo(pk.centralOneProductId, pk.apiProductSku, {
+                        storeSlug: p.slug,
+                        storeProductName: p.name,
+                        storePackageId: pk.packageId,
+                        storePackageName: pk.name,
+                        label: `${p.name} ➔ ${pk.name}`
+                    });
+                }
+            }
+            for (const pk of (p.altPackages || [])) {
+                if (pk.centralOneProductId || pk.apiProductSku) {
+                    registrarVinculo(pk.centralOneProductId, pk.apiProductSku, {
+                        storeSlug: p.slug,
+                        storeProductName: p.name,
+                        storePackageId: pk.packageId,
+                        storePackageName: `${pk.name} (Alt)`,
+                        label: `${p.name} ➔ ${pk.name} (Alt)`
+                    });
+                }
+            }
+        }
+
+        for (const c of (settingsDoc?.arbitrageBaseCards || [])) {
+            if (c.centralOneProductId || c.centralOneSku) {
+                registrarVinculo(c.centralOneProductId, c.centralOneSku, {
+                    storeSlug: `pool_${c.platformGroup || 'steam'}`,
+                    storeProductName: `Pool Algoritmo (${(c.platformGroup || 'steam').toUpperCase()})`,
+                    storePackageId: c.cardId,
+                    storePackageName: c.name,
+                    label: `Pool ${(c.platformGroup || 'steam').toUpperCase()} ➔ ${c.name}`
+                });
+            }
+        }
+
+        for (const of of (settingsDoc?.flashOffers || [])) {
+            if (of.centralOneProductId || of.apiProductSku) {
+                registrarVinculo(of.centralOneProductId, of.apiProductSku, {
+                    storeSlug: of.slug || 'loot',
+                    storeProductName: of.game || 'Loot Relámpago',
+                    storePackageId: of.pkgId,
+                    storePackageName: of.title,
+                    label: `Oferta ${of.game || ''} ➔ ${of.title}`
+                });
+            }
+        }
+    } catch (e) {}
+    return { byId, bySku };
+}
+
+async function registrarAlertaCentralOne(settingsDoc, alertaObj, mapaVinculadosPre = null) {
     try {
         if (!settingsDoc) settingsDoc = await StoreSettings.findOne({ key: 'main_settings' });
         if (!settingsDoc) return;
         if (!Array.isArray(settingsDoc.centralOneAlerts)) settingsDoc.centralOneAlerts = [];
 
+        const prodId = String(alertaObj.productId || '').trim();
+        const skuUpper = String(alertaObj.sku || '').trim().toUpperCase();
+        const tiposDeCatalogo = ['PRICE_UP', 'PRICE_DOWN', 'OUT_OF_STOCK', 'BACK_IN_STOCK', 'REMOVED_FROM_CATALOG'];
+
+        let vinculoInfo = null;
+        if (prodId || skuUpper || tiposDeCatalogo.includes(alertaObj.type)) {
+            const mapaVinc = mapaVinculadosPre || await obtenerMapaVinculadosTiendaKZ(settingsDoc);
+            vinculoInfo = (prodId && mapaVinc.byId.get(prodId)) || (skuUpper && mapaVinc.bySku.get(skuUpper)) || null;
+
+            // 🔒 Si es un cambio de precio/stock del catálogo de Central One pero NO está vinculado a ningún producto tuyo, se ignora
+            if (!vinculoInfo && tiposDeCatalogo.includes(alertaObj.type)) {
+                return;
+            }
+        }
+
+        // Clave única fija por producto/paquete para que NUNCA haya alertas repetidas del mismo ítem
+        const fixedKey = prodId || skuUpper || alertaObj.fixedKey || `${alertaObj.type}_${alertaObj.title || ''}`;
+
+        // Purgar de paso cualquier alerta vieja de productos no vinculados
+        const idxExistente = settingsDoc.centralOneAlerts.findIndex(a =>
+            (prodId && a.productId === prodId) ||
+            (skuUpper && String(a.sku || '').toUpperCase() === skuUpper) ||
+            (a.fixedKey && a.fixedKey === fixedKey)
+        );
+
+        const nuevoEventoHistorial = {
+            type: alertaObj.type || 'INFO',
+            severity: alertaObj.severity || 'INFO',
+            title: alertaObj.title || '',
+            detail: alertaObj.detail || '',
+            oldPrice: alertaObj.oldPrice || '',
+            newPrice: alertaObj.newPrice || '',
+            date: new Date()
+        };
+
+        let historialPrevio = [];
+        if (idxExistente !== -1) {
+            const prevAlert = settingsDoc.centralOneAlerts[idxExistente];
+            historialPrevio = Array.isArray(prevAlert.historyLog) ? prevAlert.historyLog : [];
+            settingsDoc.centralOneAlerts.splice(idxExistente, 1);
+        }
+
+        historialPrevio.unshift(nuevoEventoHistorial);
+        if (historialPrevio.length > 10) historialPrevio = historialPrevio.slice(0, 10);
+
         settingsDoc.centralOneAlerts.unshift({
             alertId: 'al_' + Date.now().toString(36) + '_' + Math.random().toString(36).substring(2, 6),
+            fixedKey,
             type: alertaObj.type || 'INFO',
             severity: alertaObj.severity || 'INFO',
             title: alertaObj.title || 'Aviso de Proveedor API',
             detail: alertaObj.detail || '',
             sku: alertaObj.sku || '',
-            productId: alertaObj.productId || '',
+            productId: prodId,
+            storeSlug: vinculoInfo ? vinculoInfo.storeSlug : (alertaObj.storeSlug || ''),
+            storeProductName: vinculoInfo ? vinculoInfo.storeProductName : (alertaObj.storeProductName || ''),
+            storePackageName: vinculoInfo ? vinculoInfo.storePackageName : (alertaObj.storePackageName || ''),
+            linkedLabel: vinculoInfo ? vinculoInfo.label : (alertaObj.linkedLabel || ''),
             oldPrice: alertaObj.oldPrice || '',
             newPrice: alertaObj.newPrice || '',
+            historyLog: historialPrevio,
             read: false,
             createdAt: new Date()
         });
 
-        if (settingsDoc.centralOneAlerts.length > 120) {
-            settingsDoc.centralOneAlerts = settingsDoc.centralOneAlerts.slice(0, 120);
+        if (settingsDoc.centralOneAlerts.length > 200) {
+            settingsDoc.centralOneAlerts = settingsDoc.centralOneAlerts.slice(0, 200);
         }
         settingsDoc.markModified('centralOneAlerts');
     } catch (e) {}
@@ -1245,39 +1369,73 @@ async function sincronizarTodoConCentralOne(forzar = false) {
     }
 
     try {
-        const [resBalance, resCatalog, resCoverage] = await Promise.allSettled([
-            axios.get(`${CENTRAL_ONE_BASE_URL}/balance`, { headers, timeout: 12000 }),
-            axios.get(`${CENTRAL_ONE_BASE_URL}/catalog`, { headers, timeout: 15000 }),
-            axios.get(`${CENTRAL_ONE_BASE_URL}/player/validate/coverage`, { headers, timeout: 12000 })
+        const [resBalance, resCatalog, resCoverage, mapaVinculados] = await Promise.all([
+            axios.get(`${CENTRAL_ONE_BASE_URL}/balance`, { headers, timeout: 12000 }).catch(e => ({ _err: e })),
+            axios.get(`${CENTRAL_ONE_BASE_URL}/catalog`, { headers, timeout: 15000 }).catch(e => ({ _err: e })),
+            axios.get(`${CENTRAL_ONE_BASE_URL}/player/validate/coverage`, { headers, timeout: 12000 }).catch(e => ({ _err: e })),
+            obtenerMapaVinculadosTiendaKZ(settings)
         ]);
 
         if (!settings.centralOneSync) settings.centralOneSync = {};
 
-        if (resBalance.status === 'fulfilled' && resBalance.value?.data) {
-            const b = resBalance.value.data;
+        // 🧹 Purgar alertas antiguas de productos que NO están vinculados en tu tienda y deduplicar por SKU/ProductId
+        if (Array.isArray(settings.centralOneAlerts) && settings.centralOneAlerts.length > 0) {
+            const tiposCat = ['PRICE_UP', 'PRICE_DOWN', 'OUT_OF_STOCK', 'BACK_IN_STOCK', 'REMOVED_FROM_CATALOG'];
+            const vistosSet = new Set();
+            const alertasLimpias = [];
+
+            for (const al of settings.centralOneAlerts) {
+                const pId = String(al.productId || '').trim();
+                const sUp = String(al.sku || '').trim().toUpperCase();
+                const vinc = (pId && mapaVinculados.byId.get(pId)) || (sUp && mapaVinculados.bySku.get(sUp));
+
+                if (tiposCat.includes(al.type) && !vinc) continue; // Descarta basura de juegos no vinculados
+
+                const claveUnica = pId || sUp || al.fixedKey || `${al.type}_${al.title}`;
+                if (vistosSet.has(claveUnica)) continue; // Evita duplicados del mismo producto
+                vistosSet.add(claveUnica);
+
+                if (vinc) {
+                    al.storeSlug = vinc.storeSlug;
+                    al.storeProductName = vinc.storeProductName;
+                    al.storePackageName = vinc.storePackageName;
+                    al.linkedLabel = vinc.label;
+                }
+                alertasLimpias.push(al);
+            }
+            settings.centralOneAlerts = alertasLimpias;
+            settings.markModified('centralOneAlerts');
+        }
+
+        if (!resBalance._err && resBalance.data) {
+            const b = resBalance.data;
             settings.centralOneSync.availableBalance = String(b.available_balance || '0.0000');
             settings.centralOneSync.heldBalance = String(b.held_balance || '0.0000');
             settings.centralOneSync.totalBalance = String(b.total_balance || '0.0000');
             settings.centralOneSync.currency = b.currency || 'USD';
             settings.centralOneSync.apiConnected = true;
             settings.centralOneSync.lastError = '';
-        } else if (resBalance.status === 'rejected') {
-            const errCode = resBalance.reason?.response?.data?.error?.code || resBalance.reason?.message || 'Error de conexión';
+        } else if (resBalance._err) {
+            const errCode = resBalance._err?.response?.data?.error?.code || resBalance._err?.message || 'Error de conexión';
             settings.centralOneSync.lastError = `Balance API: ${errCode}`;
         }
 
-        if (resCatalog.status === 'fulfilled' && Array.isArray(resCatalog.value?.data?.items)) {
-            const nuevosItems = resCatalog.value.data.items;
+        if (!resCatalog._err && Array.isArray(resCatalog.data?.items)) {
+            const nuevosItems = resCatalog.data.items;
             const viejosMap = {};
             (settings.centralOneCatalogCache || []).forEach(oldIt => {
                 if (oldIt && oldIt.product_id) viejosMap[oldIt.product_id] = oldIt;
             });
 
-            // Comparar cambios de precio, stock o eliminados si ya teníamos un catálogo previo
             if (Object.keys(viejosMap).length > 0) {
                 const nuevosIdsSet = new Set(nuevosItems.map(x => x.product_id));
 
                 for (const item of nuevosItems) {
+                    const skuUp = String(item.sku || '').trim().toUpperCase();
+                    const vinc = mapaVinculados.byId.get(item.product_id) || mapaVinculados.bySku.get(skuUp);
+                    // Solo evaluar alertas si este SKU está vinculado a un paquete o tarjeta tuya
+                    if (!vinc) continue;
+
                     const prev = viejosMap[item.product_id];
                     if (!prev) continue;
 
@@ -1288,13 +1446,13 @@ async function sincronizarTodoConCentralOne(forzar = false) {
                         await registrarAlertaCentralOne(settings, {
                             type: subio ? 'PRICE_UP' : 'PRICE_DOWN',
                             severity: subio ? 'WARN' : 'OK',
-                            title: `${subio ? '📈 Subió' : '📉 Bajó'} costo en proveedor: ${item.name}`,
-                            detail: `SKU ${item.sku}: pasó de $${formatear4Decimales(pViejo)} a $${formatear4Decimales(pNuevo)} USD. Tus precios con ganancia fija se reajustaron solos.`,
+                            title: `${subio ? '📈 Subió' : '📉 Bajó'} costo en [${vinc.label}]`,
+                            detail: `Proveedor (${item.name} • SKU ${item.sku}): pasó de $${formatear4Decimales(pViejo)} a $${formatear4Decimales(pNuevo)} USD. Precio de venta recalculado con tu ganancia fija.`,
                             sku: item.sku,
                             productId: item.product_id,
                             oldPrice: formatear4Decimales(pViejo),
                             newPrice: formatear4Decimales(pNuevo)
-                        });
+                        }, mapaVinculados);
                     }
 
                     const stockNuevo = Boolean(item.in_stock && item.status === 'active');
@@ -1303,35 +1461,35 @@ async function sincronizarTodoConCentralOne(forzar = false) {
                         await registrarAlertaCentralOne(settings, {
                             type: 'OUT_OF_STOCK',
                             severity: 'CRIT',
-                            title: `🚫 Producto agotado en Central One: ${item.name}`,
-                            detail: `El SKU ${item.sku} cambió a in_stock: false. El algoritmo usará tarjetas de respaldo si aplica.`,
+                            title: `🚫 Sin stock en proveedor: [${vinc.label}]`,
+                            detail: `El SKU ${item.sku} (${item.name}) cambió a in_stock: false en Central One.`,
                             sku: item.sku,
                             productId: item.product_id
-                        });
+                        }, mapaVinculados);
                     } else if (!stockViejo && stockNuevo) {
                         await registrarAlertaCentralOne(settings, {
                             type: 'BACK_IN_STOCK',
                             severity: 'OK',
-                            title: `🟢 Volvió el stock en Central One: ${item.name}`,
-                            detail: `El SKU ${item.sku} está nuevamente disponible ($${formatear4Decimales(pNuevo)} USD).`,
+                            title: `🟢 Volvió el stock: [${vinc.label}]`,
+                            detail: `El SKU ${item.sku} (${item.name}) está nuevamente disponible ($${formatear4Decimales(pNuevo)} USD).`,
                             sku: item.sku,
                             productId: item.product_id
-                        });
+                        }, mapaVinculados);
                     }
                 }
 
-                // Detectar productos que salieron de tu catálogo
-                for (const oldId of Object.keys(viejosMap)) {
-                    if (!nuevosIdsSet.has(oldId)) {
-                        const oldIt = viejosMap[oldId];
+                // Detectar si algún producto VINCULADO fue retirado del catálogo de Central One
+                for (const [vincId, vincMeta] of mapaVinculados.byId.entries()) {
+                    if (viejosMap[vincId] && !nuevosIdsSet.has(vincId)) {
+                        const oldIt = viejosMap[vincId];
                         await registrarAlertaCentralOne(settings, {
                             type: 'REMOVED_FROM_CATALOG',
                             severity: 'CRIT',
-                            title: `❌ Producto retirado/suspendido del catálogo: ${oldIt.name}`,
-                            detail: `El producto ${oldIt.sku} (${oldId}) ya no aparece habilitado en tu catálogo de Central One.`,
+                            title: `❌ Retirado/Suspendido en proveedor: [${vincMeta.label}]`,
+                            detail: `El producto ${oldIt.sku} (${oldIt.name}) ya no aparece habilitado en tu catálogo de Central One.`,
                             sku: oldIt.sku,
-                            productId: oldId
-                        });
+                            productId: vincId
+                        }, mapaVinculados);
                     }
                 }
             }
@@ -1343,8 +1501,8 @@ async function sincronizarTodoConCentralOne(forzar = false) {
             settings.markModified('centralOneCatalogCache');
         }
 
-        if (resCoverage.status === 'fulfilled' && resCoverage.value?.data) {
-            settings.centralOneCoverageCache = resCoverage.value.data;
+        if (!resCoverage._err && resCoverage.data) {
+            settings.centralOneCoverageCache = resCoverage.data;
             settings.markModified('centralOneCoverageCache');
         }
 
