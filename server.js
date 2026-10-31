@@ -1062,67 +1062,120 @@ async function registrarAlertaCentralOne(settingsDoc, alertaObj, mapaVinculadosP
     } catch (e) {}
 }
 
-// 🧠 ALGORITMO INTELIGENTE DE COMBINACIÓN DE TARJETAS (Ej: Vietnam 132.500 VND x2 vs USA $10)
-function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, baseCardsPool) {
+// 🧠 ALGORITMO INTELIGENTE DE COMBINACIÓN DE TARJETAS (BENEFICIO DEL CLIENTE + DETECTOR DE DISPONIBILIDAD)
+function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, baseCardsPool, catalogCache = null) {
     const metaUSD = Number(targetClientUSD) || 0;
     if (metaUSD <= 0) return { hasSolution: false, reason: 'Meta USD inválida' };
 
-    const candidatas = (baseCardsPool || []).filter(c =>
-        c.active !== false &&
-        c.inStock !== false &&
-        String(c.platformGroup || 'steam').toLowerCase() === String(platformGroup || 'steam').toLowerCase() &&
-        Number(c.effectiveClientUSD) > 0 &&
-        Number(c.costUSD) > 0 &&
-        (c.availableStock === null || c.availableStock === undefined || Number(c.availableStock) > 0)
-    );
+    const mapaCO_Id = {};
+    const mapaCO_Sku = {};
+    const tieneCacheAPI = Array.isArray(catalogCache) && catalogCache.length > 0;
+    if (tieneCacheAPI) {
+        for (let i = 0; i < catalogCache.length; i++) {
+            const it = catalogCache[i];
+            if (it.product_id) mapaCO_Id[it.product_id] = it;
+            if (it.sku) mapaCO_Sku[String(it.sku).trim().toUpperCase()] = it;
+        }
+    }
+
+    const candidatas = [];
+    for (const c of (baseCardsPool || [])) {
+        if (c.active === false) continue;
+        if (String(c.platformGroup || 'steam').toLowerCase() !== String(platformGroup || 'steam').toLowerCase()) continue;
+
+        let effUsd = Number(c.effectiveClientUSD);
+        if (!effUsd || effUsd <= 0) {
+            effUsd = Number(((Number(c.faceValueOrigin) || 0) * (Number(c.conversionRateToUSD) || 0)).toFixed(4));
+        }
+        let costoReal = Number(c.costUSD || 0);
+        let enStockReal = c.inStock !== false;
+        let stockDisp = (c.availableStock !== null && c.availableStock !== undefined) ? Number(c.availableStock) : null;
+
+        // Verificar en vivo contra el catálogo de Central One si la tarjeta sigue existiendo y tiene stock
+        if (tieneCacheAPI && (c.centralOneProductId || c.centralOneSku)) {
+            const itemCO = (c.centralOneProductId && mapaCO_Id[c.centralOneProductId]) ||
+                           (c.centralOneSku && mapaCO_Sku[String(c.centralOneSku).trim().toUpperCase()]);
+            if (!itemCO) {
+                // Fue retirada/eliminada del catálogo de Central One
+                enStockReal = false;
+            } else {
+                enStockReal = Boolean(itemCO.in_stock && itemCO.status === 'active');
+                if (itemCO.reseller_price !== null && Number(itemCO.reseller_price) > 0) {
+                    costoReal = Number(itemCO.reseller_price);
+                }
+                if (itemCO.available_stock !== undefined && itemCO.available_stock !== null) {
+                    stockDisp = Number(itemCO.available_stock);
+                }
+            }
+        }
+
+        if (!enStockReal) continue;
+        if (stockDisp !== null && stockDisp <= 0) continue;
+        if (effUsd <= 0 || costoReal <= 0) continue;
+
+        candidatas.push({
+            ...c,
+            effectiveClientUSD: effUsd,
+            costUSD: costoReal,
+            availableStock: stockDisp
+        });
+    }
 
     if (candidatas.length === 0) {
         return {
             hasSolution: false,
-            reason: `No hay tarjetas base activas con stock en el pool de ${(platformGroup || 'steam').toUpperCase()}.`
+            reason: `No hay tarjetas base activas y con stock disponible en la Bóveda de ${(platformGroup || 'steam').toUpperCase()}.`
         };
     }
 
+    // Ordenar candidatas por mejor eficiencia (menor costo por cada $1 entregado al cliente)
+    candidatas.sort((a, b) => (a.costUSD / a.effectiveClientUSD) - (b.costUSD / b.effectiveClientUSD));
+
     const solucionesValidas = [];
     const n = candidatas.length;
-    const maxCartas = 4; // Busca combinaciones de 1, 2, 3 o hasta 4 códigos para no saturar al cliente
+    const maxCartas = 8;
+    // Techo máximo permitido para no encarecer el paquete innecesariamente (más ajustado en montos grandes)
+    const techoMaximoUSD = metaUSD <= 15 ? (metaUSD * 1.35) : (metaUSD + Math.max(5.5, metaUSD * 0.22));
+    // Piso mínimo: garantiza que el cliente reciba al menos el monto prometido (tolerancia 0.5% por redondeo cambiario)
+    const pisoMinimoUSD = metaUSD * 0.995;
 
     function explorar(startIndex, cartasUsadas, conteoPorIndice, sumaClienteUSD, sumaCostoMicro) {
-        if (cartasUsadas > 0) {
+        if (cartasUsadas > 0 && sumaClienteUSD >= pisoMinimoUSD && sumaClienteUSD <= techoMaximoUSD) {
             const diffMeta = sumaClienteUSD - metaUSD;
-            // Aceptamos combinaciones que entreguen al menos el 98.5% del valor prometido y hasta un +45% máximo
-            if (sumaClienteUSD >= metaUSD * 0.985 && sumaClienteUSD <= metaUSD * 1.45) {
-                const itemsCombo = [];
-                const etiquetas = [];
-                Object.entries(conteoPorIndice).forEach(([idxStr, qty]) => {
-                    const card = candidatas[Number(idxStr)];
-                    itemsCombo.push({
-                        cardId: card.cardId,
-                        centralOneProductId: card.centralOneProductId || '',
-                        sku: card.centralOneSku || '',
-                        name: card.name,
-                        quantity: qty,
-                        unitCostUSD: Number(card.costUSD),
-                        unitClientUSD: Number(card.effectiveClientUSD),
-                        originText: `${card.faceValueOrigin} ${card.originCurrency}`
-                    });
-                    etiquetas.push(`${qty}x ${card.name} ($${(card.effectiveClientUSD * qty).toFixed(2)})`);
+            const itemsCombo = [];
+            const etiquetas = [];
+            Object.entries(conteoPorIndice).forEach(([idxStr, qty]) => {
+                const card = candidatas[Number(idxStr)];
+                itemsCombo.push({
+                    cardId: card.cardId,
+                    centralOneProductId: card.centralOneProductId || '',
+                    sku: card.centralOneSku || '',
+                    name: card.name,
+                    quantity: qty,
+                    unitCostUSD: Number(card.costUSD),
+                    unitClientUSD: Number(card.effectiveClientUSD),
+                    originText: `${card.faceValueOrigin} ${card.originCurrency}`
                 });
+                etiquetas.push(`${qty}x ${card.name} ($${(card.effectiveClientUSD * qty).toFixed(2)})`);
+            });
 
-                solucionesValidas.push({
-                    hasSolution: true,
-                    totalCards: cartasUsadas,
-                    totalClientUSD: Number(sumaClienteUSD.toFixed(2)),
-                    totalCostUSD: deMicro4(sumaCostoMicro),
-                    totalCostMicro: sumaCostoMicro,
-                    bonusClientUSD: Number(Math.max(0, diffMeta).toFixed(2)),
-                    summaryText: etiquetas.join(' + '),
-                    items: itemsCombo
-                });
-            }
+            solucionesValidas.push({
+                hasSolution: true,
+                totalCards: cartasUsadas,
+                totalClientUSD: Number(sumaClienteUSD.toFixed(2)),
+                totalCostUSD: deMicro4(sumaCostoMicro),
+                totalCostMicro: sumaCostoMicro,
+                bonusClientUSD: Number(Math.max(0, diffMeta).toFixed(2)),
+                overshootUSD: Math.max(0, diffMeta),
+                summaryText: etiquetas.join(' + '),
+                items: itemsCombo
+            });
+            // Si ya alcanzamos o superamos el monto del paquete en esta rama, no hace falta seguir sumando más tarjetas encima
+            return;
         }
 
         if (cartasUsadas >= maxCartas) return;
+        if (solucionesValidas.length >= 250) return;
 
         for (let i = startIndex; i < n; i++) {
             const card = candidatas[i];
@@ -1130,7 +1183,7 @@ function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, ba
             if (card.availableStock !== null && card.availableStock !== undefined && yaUsadasDeEsta + 1 > Number(card.availableStock)) {
                 continue;
             }
-            if (sumaClienteUSD + Number(card.effectiveClientUSD) > metaUSD * 1.48) {
+            if (sumaClienteUSD + Number(card.effectiveClientUSD) > techoMaximoUSD) {
                 continue;
             }
             const nuevoConteo = { ...conteoPorIndice, [i]: yaUsadasDeEsta + 1 };
@@ -1153,12 +1206,15 @@ function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, ba
         };
     }
 
-    // Ordenar: 1° Menor costo total para ti, 2° Mayor saldo entregado al cliente, 3° Menos códigos a canjear
+    // Ordenar priorizando:
+    // 1° Menor costo total (lo que le da al cliente el mejor precio final respetando tu ganancia fija)
+    // 2° A igualdad de costo (diferencia <= $0.04 USD), mayor saldo recibido por el cliente (beneficio extra para el cliente)
+    // 3° Menor cantidad de códigos a canjear
     solucionesValidas.sort((a, b) => {
-        if (Math.abs(a.totalCostMicro - b.totalCostMicro) > 200) { // Diferencia > $0.02 USD
+        if (Math.abs(a.totalCostMicro - b.totalCostMicro) > 400) {
             return a.totalCostMicro - b.totalCostMicro;
         }
-        if (b.totalClientUSD !== a.totalClientUSD) {
+        if (Math.abs(b.totalClientUSD - a.totalClientUSD) >= 0.05) {
             return b.totalClientUSD - a.totalClientUSD;
         }
         return a.totalCards - b.totalCards;
@@ -1167,6 +1223,7 @@ function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, ba
     return solucionesValidas[0];
 }
 
+// 🔄 RECALCULADOR GLOBAL DE PRECIOS POR GANANCIA FIJA + ALGORITMO + FLYERS CANVA
 async function recalcularPreciosYAlgoritmoTiendaKZ(settingsDoc = null, targetSlugOnly = null) {
     try {
         if (!settingsDoc) settingsDoc = await StoreSettings.findOne({ key: 'main_settings' });
@@ -1181,7 +1238,7 @@ async function recalcularPreciosYAlgoritmoTiendaKZ(settingsDoc = null, targetSlu
             if (item.sku) mapaCO_PorSku[String(item.sku).trim().toUpperCase()] = item;
         }
 
-        // 1. Actualizar costos y stock de las Tarjetas Base del Pool de Arbitraje
+        // 1. Actualizar costos, stock y detectar si alguna Tarjeta Base fue retirada de Central One
         let huboCambioPool = false;
         const poolCards = settingsDoc.arbitrageBaseCards || [];
         for (let i = 0; i < poolCards.length; i++) {
@@ -1191,24 +1248,34 @@ async function recalcularPreciosYAlgoritmoTiendaKZ(settingsDoc = null, targetSlu
                 card.effectiveClientUSD = effUsd;
                 huboCambioPool = true;
             }
-            const itemCO = (card.centralOneProductId && mapaCO_PorId[card.centralOneProductId]) ||
-                           (card.centralOneSku && mapaCO_PorSku[String(card.centralOneSku).trim().toUpperCase()]);
-            if (itemCO) {
-                const nuevoCosto = itemCO.reseller_price !== null ? Number(itemCO.reseller_price) : card.costUSD;
-                const nuevoInStock = Boolean(itemCO.in_stock && itemCO.status === 'active');
-                if (nuevoCosto > 0 && Math.abs(card.costUSD - nuevoCosto) > 0.0001) {
-                    card.costUSD = nuevoCosto;
-                    card.lastPriceUpdateAt = new Date();
+            if (catalogoCO.length > 0 && (card.centralOneProductId || card.centralOneSku)) {
+                const itemCO = (card.centralOneProductId && mapaCO_PorId[card.centralOneProductId]) ||
+                               (card.centralOneSku && mapaCO_Sku_Lookup(mapaCO_PorSku, card.centralOneSku));
+                if (itemCO) {
+                    const nuevoCosto = itemCO.reseller_price !== null ? Number(itemCO.reseller_price) : card.costUSD;
+                    const nuevoInStock = Boolean(itemCO.in_stock && itemCO.status === 'active');
+                    if (nuevoCosto > 0 && Math.abs(card.costUSD - nuevoCosto) > 0.0001) {
+                        card.costUSD = nuevoCosto;
+                        card.lastPriceUpdateAt = new Date();
+                        huboCambioPool = true;
+                    }
+                    if (card.inStock !== nuevoInStock) {
+                        card.inStock = nuevoInStock;
+                        huboCambioPool = true;
+                    }
+                    card.availableStock = itemCO.available_stock !== undefined ? itemCO.available_stock : null;
+                } else if (card.inStock !== false) {
+                    // Si estaba vinculada a Central One y ya no existe en el catálogo del proveedor, marcar sin stock
+                    card.inStock = false;
                     huboCambioPool = true;
                 }
-                if (card.inStock !== nuevoInStock) {
-                    card.inStock = nuevoInStock;
-                    huboCambioPool = true;
-                }
-                card.availableStock = itemCO.available_stock !== undefined ? itemCO.available_stock : null;
             }
         }
         if (huboCambioPool) settingsDoc.markModified('arbitrageBaseCards');
+
+        function mapaCO_Sku_Lookup(mapa, skuRaw) {
+            return mapa[String(skuRaw || '').trim().toUpperCase()];
+        }
 
         // 2. Recorrer solo el producto editado (si se indicó targetSlugOnly) o todos en paralelo
         const filtroProd = targetSlugOnly ? { slug: String(targetSlugOnly).trim().toLowerCase() } : {};
