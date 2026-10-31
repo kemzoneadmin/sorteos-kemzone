@@ -321,11 +321,29 @@ uidLabel: { type: String, default: 'ID de Jugador (UID)' },
     isFlashOffer: { type: Boolean, default: false },
     flashDiscountText: { type: String, default: '' },
     active: { type: Boolean, default: true },
+    // ⚡ MODO ALTERNATIVO DE PRECIOS, PAQUETES Y TEXTOS (CAMBIO EN 1 CLIC)
+    useAltPricing: { type: Boolean, default: false },
+    altDescription: { type: String, default: '' },
+    altInstructions: { type: String, default: '' },
     sortOrder: { type: Number, default: 0 },
     packages: [{
         packageId: { type: String, required: true },
         name: { type: String, required: true },
-        tabGroup: { type: String, default: 'principales' }, // 'principales' (Diamantes/Monedas) o 'especiales' (Paquetes/Pases)
+        tabGroup: { type: String, default: 'principales' },
+        priceUSD: { type: Number, required: true },
+        costUSD: { type: Number, default: 0 },
+        tokemsPrice: { type: Number, required: true },
+        apiProviderName: { type: String, default: 'DEFAULT_API' },
+        apiProductSku: { type: String, default: '' },
+        imageUrl: { type: String, default: '' },
+        isGiftCardPin: { type: Boolean, default: false },
+        backupPinVault: [{ type: String }],
+        inStock: { type: Boolean, default: true }
+    }],
+    altPackages: [{
+        packageId: { type: String, required: true },
+        name: { type: String, required: true },
+        tabGroup: { type: String, default: 'principales' },
         priceUSD: { type: Number, required: true },
         costUSD: { type: Number, default: 0 },
         tokemsPrice: { type: Number, required: true },
@@ -848,7 +866,10 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
 
     // 2. Revisar primero si tú cargaste códigos PIN en la Bóveda de Respaldo del paquete
     if (productoDB && Array.isArray(productoDB.packages)) {
-        const pkg = productoDB.packages.find(p => p.packageId === orden.packageId);
+        const listaVault = (productoDB.useAltPricing && Array.isArray(productoDB.altPackages) && productoDB.altPackages.length > 0)
+            ? productoDB.altPackages
+            : productoDB.packages;
+        const pkg = (listaVault || []).find(p => p.packageId === orden.packageId);
         if (pkg && Array.isArray(pkg.backupPinVault) && pkg.backupPinVault.length > 0) {
             const pinExtraido = pkg.backupPinVault.shift(); // Toma el primer PIN disponible y lo borra del stock
             await productoDB.save();
@@ -1258,12 +1279,15 @@ app.post('/api/reset-password', authLimiter, async (req, res) => {
 // 🏪 ENDPOINTS PÚBLICOS DE LA TIENDA KEM!ZONE (CATÁLOGO Y COMPRAS)
 // =================================================================
 
-// 1. Cargar toda la tienda inicial (Tasa del día, Banners, Catálogo Multinivel y Métodos de Pago)
+// 1. Cargar toda la tienda inicial (Incluye estado activo y precios alternativos sin exponer costos ni bóvedas)
 app.get('/api/store/bootstrap', async (req, res) => {
     try {
         const [settings, products, paymentMethods] = await Promise.all([
             StoreSettings.findOne({ key: 'main_settings' }).lean(),
-            CatalogProduct.find({ active: true }).sort({ sortOrder: 1, createdAt: 1 }).select('-packages.costUSD -packages.backupPinVault').lean(),
+            CatalogProduct.find()
+                .sort({ sortOrder: 1, createdAt: 1 })
+                .select('-packages.costUSD -packages.backupPinVault -altPackages.costUSD -altPackages.backupPinVault')
+                .lean(),
             PaymentMethod.find({ active: true }).sort({ sortOrder: 1 }).lean()
         ]);
 
@@ -1286,7 +1310,6 @@ app.post('/api/orders/verify-player', async (req, res) => {
             return res.status(400).json({ error: 'Ingresa un ID de jugador válido.' });
         }
 
-        // Si tienes configurada una URL de verificación de ID en Railway (PROVIDER_VERIFY_URL)
         if (process.env.PROVIDER_VERIFY_URL && process.env.PROVIDER_API_KEY) {
             try {
                 const resp = await axios.post(process.env.PROVIDER_VERIFY_URL, {
@@ -1308,7 +1331,6 @@ app.post('/api/orders/verify-player', async (req, res) => {
             } catch (e) {}
         }
 
-        // Si el juego o la API no soporta mostrar el apodo en vivo, devuelve tu mensaje exacto:
         return res.json({
             success: true,
             verified: false,
@@ -1406,13 +1428,25 @@ app.post('/api/orders/create', orderLimiter, verificarTokenOpcional, async (req,
             costoEnTokems = cantTokems;
         } else {
             const slugBuscado = String(productSlug || '').trim().toLowerCase();
-            productoDB = await CatalogProduct.findOne({ slug: slugBuscado, active: true });
+            productoDB = await CatalogProduct.findOne({ slug: slugBuscado });
             if (!productoDB) return res.status(404).json({ error: 'Producto no encontrado.' });
+
+            // 🔒 Bloqueo de seguridad si el producto está desactivado
+            if (productoDB.active === false) {
+                return res.status(403).json({
+                    error: `Por el momento ${productoDB.name} no está en funcionamiento. Mantente atento en el catálogo cuando se vuelva a activar.`
+                });
+            }
 
             const idPkgBuscado = String(packageId || '').trim();
             const nombrePkgBuscado = String(req.body.packageName || '').trim().toLowerCase();
 
-            let pkg = (productoDB.packages || []).find(p =>
+            // ⚡ Detectar si el producto tiene activada la casilla de Precios Alternativos
+            const listaPaquetesActiva = (productoDB.useAltPricing && Array.isArray(productoDB.altPackages) && productoDB.altPackages.length > 0)
+                ? productoDB.altPackages
+                : (productoDB.packages || []);
+
+            let pkg = listaPaquetesActiva.find(p =>
                 String(p.packageId || p.id || '').trim() === idPkgBuscado ||
                 (nombrePkgBuscado && String(p.name || '').trim().toLowerCase() === nombrePkgBuscado)
             );
@@ -1439,7 +1473,11 @@ app.post('/api/orders/create', orderLimiter, verificarTokenOpcional, async (req,
                 };
             }
 
-            if (!pkg || pkg.inStock === false) return res.status(400).json({ error: 'Paquete agotado o no disponible.' });
+            if (!pkg || pkg.inStock === false) {
+                return res.status(400).json({
+                    error: 'Por el momento este paquete no está en funcionamiento o se encuentra temporalmente desactivado.'
+                });
+            }
 
             nombreProducto = productoDB.name;
             nombrePaquete = pkg.name;
@@ -2611,7 +2649,11 @@ app.post('/api/admin/product/save', verificarSoloAdmin, async (req, res) => {
             regionsList: Array.isArray(productData.regionsList) ? productData.regionsList : [],
             requiresInternalLogin: Boolean(productData.requiresInternalLogin),
             active: productData.active !== false,
-            packages: Array.isArray(productData.packages) ? productData.packages : []
+            useAltPricing: Boolean(productData.useAltPricing),
+            altDescription: productData.altDescription !== undefined ? String(productData.altDescription) : '',
+            altInstructions: productData.altInstructions !== undefined ? String(productData.altInstructions) : '',
+            packages: Array.isArray(productData.packages) ? productData.packages : [],
+            altPackages: Array.isArray(productData.altPackages) ? productData.altPackages : []
         };
 
         let productoExistente = null;
