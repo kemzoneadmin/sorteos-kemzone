@@ -225,7 +225,6 @@ const StoreSettingsSchema = new mongoose.Schema({
     autoTriggerApiOnTokems: { type: Boolean, default: true },
     announcementText: { type: String, default: '🔥 KEM!ZONE OFICIAL: Recargas y Gift Cards al instante — Aceptamos Pago Móvil, Binance, Zinli y Tokems KZ' },
     hideAnnouncement: { type: Boolean, default: false },
-    // 🎨 Configuración editable del Banner Principal (Portada)
     heroConfig: {
         tagText: { type: String, default: '🇻🇪 Tienda Oficial verificada • +11.4K en Instagram' },
         titleMain: { type: String, default: 'RECARGA TUS' },
@@ -234,14 +233,12 @@ const StoreSettingsSchema = new mongoose.Schema({
         description: { type: String, default: 'Entrega rápida por ID de jugador y códigos digitales originales. Paga cómodamente en Bolívares (Pago Móvil), USDT (Binance), Tarjeta o usa tus Tokems KZ sin comisiones.' },
         mascotUrl: { type: String, default: 'https://cdn.shopify.com/s/files/1/0780/8444/0222/files/kem-ganador.png?v=1782718783' }
     },
-    // ⚡ Configuración editable del Título y Emoji de la sección Loot Relámpago
     flashSectionConfig: {
         titleWhite: { type: String, default: 'Loot' },
         titleOrange: { type: String, default: 'Relámpago' },
         icon: { type: String, default: '⚡' },
         subtitle: { type: String, default: 'Ofertas especiales del día' }
     },
-    // ⚡ Paquetes Únicos de Oferta creados en Loot Relámpago
     flashOffers: [{
         slug: { type: String, default: 'free-fire-id' },
         pkgId: { type: String, default: 'ff_semanal' },
@@ -250,16 +247,17 @@ const StoreSettingsSchema = new mongoose.Schema({
         oldUsd: { type: Number, default: 2.50 },
         usd: { type: Number, default: 1.95 },
         costUSD: { type: Number, default: 1.50 },
+        profitUSD: { type: Number, default: 0.45 },
         tokemsPrice: { type: Number, default: 1.95 },
         discount: { type: String, default: '-22%' },
         timer: { type: String, default: '3D 08H 45M' },
         img: { type: String, default: 'https://images.unsplash.com/photo-1542751371-adc38448a05e?auto=format&fit=crop&w=300&q=80' },
         pkgIconUrl: { type: String, default: '' },
         apiProductSku: { type: String, default: '' },
+        centralOneProductId: { type: String, default: '' },
         isGiftCardPin: { type: Boolean, default: false },
         backupPinVault: [{ type: String }]
     }],
-    // 🗂️ Configuración editable de la sección Juegos de Recarga y Gift Cards y sus Filtros
     catalogSectionConfig: {
         icon: { type: String, default: '🎮' },
         titleWhite: { type: String, default: 'Juegos de' },
@@ -271,89 +269,125 @@ const StoreSettingsSchema = new mongoose.Schema({
             productSlugs: [{ type: String }]
         }]
     },
-    // 🧭 Configuración editable de la Cabecera, Mega-Menús, Submenús y sus Productos
     navigationConfig: { type: mongoose.Schema.Types.Mixed, default: null },
-    // 🎨 Configuración y Plantillas de Flyers Canva (Sincronizado en MongoDB)
     flyersCanvaConfig: { type: mongoose.Schema.Types.Mixed, default: null },
+
+    // 🧠 BÓVEDA DE TARJETAS BASE DEL PROVEEDOR PARA EL ALGORITMO DE CÓDIGOS (STEAM, PSN, NINTENDO, ETC.)
+    arbitrageBaseCards: [{
+        cardId: { type: String, required: true },
+        platformGroup: { type: String, default: 'steam' }, // 'steam', 'playstation', 'nintendo', 'xbox', 'roblox', 'otro'
+        name: { type: String, required: true },            // Ej: 'Steam Vietnam 132,500 VND'
+        centralOneProductId: { type: String, default: '' },// UUID de GET /api/v1/catalog
+        centralOneSku: { type: String, default: '' },      // SKU en Central One
+        faceValueOrigin: { type: Number, default: 10 },    // Ej: 132500
+        originCurrency: { type: String, default: 'VND' },  // Ej: 'VND', 'USD', 'BRL'
+        conversionRateToUSD: { type: Number, default: 0.000039 }, // Ej: 0.000039 USD por 1 VND
+        effectiveClientUSD: { type: Number, default: 5.17 }, // Lo que realmente recibe el cliente en USD ($5.17)
+        costUSD: { type: Number, default: 4.20 },          // Precio revendedor Central One (4 decimales)
+        minProfitUSD: { type: Number, default: 0.50 },     // Ganancia mínima si se vende individual
+        inStock: { type: Boolean, default: true },
+        availableStock: { type: Number, default: null },
+        active: { type: Boolean, default: true },
+        lastPriceUpdateAt: { type: Date, default: null }
+    }],
+
+    // 📡 MONITOR EN VIVO CENTRAL ONE API (SALDO, CATÁLOGO EN CACHÉ Y ALERTAS DE CAMBIOS)
+    centralOneSync: {
+        apiConnected: { type: Boolean, default: false },
+        availableBalance: { type: String, default: '0.0000' },
+        heldBalance: { type: String, default: '0.0000' },
+        totalBalance: { type: String, default: '0.0000' },
+        currency: { type: String, default: 'USD' },
+        lastSyncAt: { type: Date, default: null },
+        catalogCount: { type: Number, default: 0 },
+        lastError: { type: String, default: '' }
+    },
+    centralOneCatalogCache: [{ type: mongoose.Schema.Types.Mixed }],
+    centralOneCoverageCache: { type: mongoose.Schema.Types.Mixed, default: null },
+    centralOneAlerts: [{
+        alertId: { type: String },
+        type: { type: String }, // 'PRICE_UP', 'PRICE_DOWN', 'OUT_OF_STOCK', 'BACK_IN_STOCK', 'REMOVED_FROM_CATALOG', 'ALGO_FALLBACK', 'ALGO_NO_SOLUTION', 'BALANCE_LOW', 'ORDER_FAILED', 'DEPOSIT_APPROVED'
+        severity: { type: String, default: 'INFO' }, // 'INFO', 'WARN', 'CRIT', 'OK'
+        title: { type: String },
+        detail: { type: String },
+        sku: { type: String, default: '' },
+        productId: { type: String, default: '' },
+        oldPrice: { type: String, default: '' },
+        newPrice: { type: String, default: '' },
+        read: { type: Boolean, default: false },
+        createdAt: { type: Date, default: Date.now }
+    }],
+    processedWebhookIds: [{ type: String }],
     updatedBy: { type: String, default: 'system' }
 }, { timestamps: true });
 const StoreSettings = mongoose.model('StoreSettings', StoreSettingsSchema, 'store_settings');
 
 // 🎮 2.2 CATÁLOGO MULTINIVEL DE PRODUCTOS, JUEGOS Y SERVICIOS
+const PackageSubSchema = {
+    packageId: { type: String, required: true },
+    name: { type: String, required: true },
+    tabGroup: { type: String, default: 'principales' },
+    priceUSD: { type: Number, required: true },
+    costUSD: { type: Number, default: 0 },
+    profitUSD: { type: Number, default: 0.50 },          // 💰 Casilla única de Ganancia Fija ($ USD)
+    autoPriceByProfit: { type: Boolean, default: true }, // Si es true: Venta = Costo + Ganancia automáticamente
+    tokemsPrice: { type: Number, required: true },
+    apiProviderName: { type: String, default: 'CENTRAL_ONE' },
+    apiProductSku: { type: String, default: '' },
+    centralOneProductId: { type: String, default: '' },  // UUID de Central One GET /catalog
+    targetSchemaCache: [{ type: mongoose.Schema.Types.Mixed }],
+    // 🧠 Campos para paquetes con Algoritmo Inteligente de Códigos (Steam, Play, Nintendo)
+    useSmartAlgorithm: { type: Boolean, default: false },
+    targetClientUSD: { type: Number, default: 0 },       // Ej: 10 (Para "Tarjeta de $10 USD")
+    resolvedCombo: { type: mongoose.Schema.Types.Mixed, default: null },
+    imageUrl: { type: String, default: '' },
+    isGiftCardPin: { type: Boolean, default: false },
+    backupPinVault: [{ type: String }],
+    inStock: { type: Boolean, default: true },
+    providerInStock: { type: Boolean, default: true }
+};
+
 const CatalogProductSchema = new mongoose.Schema({
     slug: { type: String, required: true, unique: true, lowercase: true, trim: true, index: true },
     name: { type: String, required: true, trim: true },
-    // Menú Principal: 'recargas', 'giftcards', 'servicios'
     mainCategory: { type: String, enum: ['recargas', 'giftcards', 'servicios'], required: true, index: true },
-    // Submenú: 'recargas_id', 'recargas_internas', 'giftcards_juegos', 'giftcards_plataformas', 'servicios_directos'
     subCategory: { 
         type: String, 
         enum: ['recargas_id', 'recargas_internas', 'giftcards_juegos', 'giftcards_plataformas', 'servicios_directos'], 
         required: true,
         index: true
     },
-    // Modo de entrega: Todos usan API excepto 'MANUAL_INTERNAL'
     fulfillmentType: {
         type: String,
-        enum: [
-            'API_DIRECT_TOPUP', // Recarga directa al ID del jugador vía API al aprobar
-            'API_GIFT_CARD',    // Entrega de código PIN automática vía API (o bóveda de respaldo) al aprobar
-            'SERVICE_API',      // Servicios como Zinli o Licencias con calculadora de comisión / API
-            'MANUAL_INTERNAL'   // Único manual: Recargas internas donde el trabajador entra a la cuenta
-        ],
+        enum: ['API_DIRECT_TOPUP', 'API_GIFT_CARD', 'SERVICE_API', 'MANUAL_INTERNAL'],
         default: 'API_DIRECT_TOPUP'
     },
+    // 🧠 Divide el catálogo en 2: Productos Estándar vs Productos con Algoritmo de Códigos (Steam/Play/Nintendo)
+    isSmartCodeProduct: { type: Boolean, default: false },
+    smartPlatformGroup: { type: String, default: 'steam' }, // 'steam', 'playstation', 'nintendo', 'xbox', 'roblox', 'otro'
     regionText: { type: String, default: 'Global / Latam' },
     badgeText: { type: String, default: '⚡ Instantáneo' },
     description: { type: String, default: '' },
     instructions: { type: String, default: 'Ingresa tu ID correctamente y selecciona el paquete que deseas recargar.' },
     cardImageUrl: { type: String, default: '' },
-    flyerImageUrl: { type: String, default: '' }, // Imagen del Banner Superior dentro del producto
-    infoImageUrl: { type: String, default: '' },  // Imagen exclusiva para "Información e Instrucciones del Producto"
-    // Configuración de campos que se le piden al cliente en la Zona 1
-uidLabel: { type: String, default: 'ID de Jugador (UID)' },
+    flyerImageUrl: { type: String, default: '' },
+    infoImageUrl: { type: String, default: '' },
+    uidLabel: { type: String, default: 'ID de Jugador (UID)' },
     requiresServer: { type: Boolean, default: false },
     serverLabel: { type: String, default: 'Zona / Servidor' },
     requiresRegion: { type: Boolean, default: false },
-    regionsList: [{ type: String }], // Regiones escritas manualmente por el Desarrollador
-    requiresInternalLogin: { type: Boolean, default: false }, // Ahora actúa como "Requiere contacto por WhatsApp"
+    regionsList: [{ type: String }],
+    requiresInternalLogin: { type: Boolean, default: false },
     serviceCommissionPercent: { type: Number, default: 0 },
     isFlashOffer: { type: Boolean, default: false },
     flashDiscountText: { type: String, default: '' },
     active: { type: Boolean, default: true },
-    // ⚡ MODO ALTERNATIVO DE PRECIOS, PAQUETES Y TEXTOS (CAMBIO EN 1 CLIC)
     useAltPricing: { type: Boolean, default: false },
     altDescription: { type: String, default: '' },
     altInstructions: { type: String, default: '' },
     sortOrder: { type: Number, default: 0 },
-    packages: [{
-        packageId: { type: String, required: true },
-        name: { type: String, required: true },
-        tabGroup: { type: String, default: 'principales' },
-        priceUSD: { type: Number, required: true },
-        costUSD: { type: Number, default: 0 },
-        tokemsPrice: { type: Number, required: true },
-        apiProviderName: { type: String, default: 'DEFAULT_API' },
-        apiProductSku: { type: String, default: '' },
-        imageUrl: { type: String, default: '' },
-        isGiftCardPin: { type: Boolean, default: false },
-        backupPinVault: [{ type: String }],
-        inStock: { type: Boolean, default: true }
-    }],
-    altPackages: [{
-        packageId: { type: String, required: true },
-        name: { type: String, required: true },
-        tabGroup: { type: String, default: 'principales' },
-        priceUSD: { type: Number, required: true },
-        costUSD: { type: Number, default: 0 },
-        tokemsPrice: { type: Number, required: true },
-        apiProviderName: { type: String, default: 'DEFAULT_API' },
-        apiProductSku: { type: String, default: '' },
-        imageUrl: { type: String, default: '' },
-        isGiftCardPin: { type: Boolean, default: false },
-        backupPinVault: [{ type: String }],
-        inStock: { type: Boolean, default: true }
-    }]
+    packages: [PackageSubSchema],
+    altPackages: [PackageSubSchema]
 }, { timestamps: true });
 const CatalogProduct = mongoose.model('CatalogProduct', CatalogProductSchema, 'catalog_products');
 
@@ -851,10 +885,609 @@ const verificarSoloAdmin = async (req, res, next) => {
 };
 
 // =================================================================
-// 🤖 MOTOR DESPACHADOR DE API PARA RECARGAS ID Y GIFT CARDS
+// 🤖 MOTOR CENTRAL ONE API v1 + ALGORITMO DE ARBITRAJE (STEAM/PSN/NINTENDO)
 // =================================================================
+const CENTRAL_ONE_BASE_URL = (process.env.CENTRAL_ONE_BASE_URL || 'https://portal.centraloneglobal.com/api/v1').replace(/\/+$/, '');
+
+// Matemática exacta de 4 decimales (como exige Central One)
+function aMicro4(val) {
+    return Math.round((Number(val) || 0) * 10000);
+}
+function deMicro4(micro) {
+    return Number((micro / 10000).toFixed(4));
+}
+function formatear4Decimales(val) {
+    return (Number(val) || 0).toFixed(4);
+}
+
+function obtenerHeadersCentralOne(extraHeaders = {}) {
+    const apiKey = (process.env.CENTRAL_ONE_API_KEY || process.env.PROVIDER_API_KEY || '').trim();
+    if (!apiKey) return null;
+    return {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        ...extraHeaders
+    };
+}
+
+async function registrarAlertaCentralOne(settingsDoc, alertaObj) {
+    try {
+        if (!settingsDoc) settingsDoc = await StoreSettings.findOne({ key: 'main_settings' });
+        if (!settingsDoc) return;
+        if (!Array.isArray(settingsDoc.centralOneAlerts)) settingsDoc.centralOneAlerts = [];
+
+        settingsDoc.centralOneAlerts.unshift({
+            alertId: 'al_' + Date.now().toString(36) + '_' + Math.random().toString(36).substring(2, 6),
+            type: alertaObj.type || 'INFO',
+            severity: alertaObj.severity || 'INFO',
+            title: alertaObj.title || 'Aviso de Proveedor API',
+            detail: alertaObj.detail || '',
+            sku: alertaObj.sku || '',
+            productId: alertaObj.productId || '',
+            oldPrice: alertaObj.oldPrice || '',
+            newPrice: alertaObj.newPrice || '',
+            read: false,
+            createdAt: new Date()
+        });
+
+        if (settingsDoc.centralOneAlerts.length > 120) {
+            settingsDoc.centralOneAlerts = settingsDoc.centralOneAlerts.slice(0, 120);
+        }
+        settingsDoc.markModified('centralOneAlerts');
+    } catch (e) {}
+}
+
+// 🧠 ALGORITMO INTELIGENTE DE COMBINACIÓN DE TARJETAS (Ej: Vietnam 132.500 VND x2 vs USA $10)
+function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, baseCardsPool) {
+    const metaUSD = Number(targetClientUSD) || 0;
+    if (metaUSD <= 0) return { hasSolution: false, reason: 'Meta USD inválida' };
+
+    const candidatas = (baseCardsPool || []).filter(c =>
+        c.active !== false &&
+        c.inStock !== false &&
+        String(c.platformGroup || 'steam').toLowerCase() === String(platformGroup || 'steam').toLowerCase() &&
+        Number(c.effectiveClientUSD) > 0 &&
+        Number(c.costUSD) > 0 &&
+        (c.availableStock === null || c.availableStock === undefined || Number(c.availableStock) > 0)
+    );
+
+    if (candidatas.length === 0) {
+        return {
+            hasSolution: false,
+            reason: `No hay tarjetas base activas con stock en el pool de ${(platformGroup || 'steam').toUpperCase()}.`
+        };
+    }
+
+    const solucionesValidas = [];
+    const n = candidatas.length;
+    const maxCartas = 4; // Busca combinaciones de 1, 2, 3 o hasta 4 códigos para no saturar al cliente
+
+    function explorar(startIndex, cartasUsadas, conteoPorIndice, sumaClienteUSD, sumaCostoMicro) {
+        if (cartasUsadas > 0) {
+            const diffMeta = sumaClienteUSD - metaUSD;
+            // Aceptamos combinaciones que entreguen al menos el 98.5% del valor prometido y hasta un +45% máximo
+            if (sumaClienteUSD >= metaUSD * 0.985 && sumaClienteUSD <= metaUSD * 1.45) {
+                const itemsCombo = [];
+                const etiquetas = [];
+                Object.entries(conteoPorIndice).forEach(([idxStr, qty]) => {
+                    const card = candidatas[Number(idxStr)];
+                    itemsCombo.push({
+                        cardId: card.cardId,
+                        centralOneProductId: card.centralOneProductId || '',
+                        sku: card.centralOneSku || '',
+                        name: card.name,
+                        quantity: qty,
+                        unitCostUSD: Number(card.costUSD),
+                        unitClientUSD: Number(card.effectiveClientUSD),
+                        originText: `${card.faceValueOrigin} ${card.originCurrency}`
+                    });
+                    etiquetas.push(`${qty}x ${card.name} ($${(card.effectiveClientUSD * qty).toFixed(2)})`);
+                });
+
+                solucionesValidas.push({
+                    hasSolution: true,
+                    totalCards: cartasUsadas,
+                    totalClientUSD: Number(sumaClienteUSD.toFixed(2)),
+                    totalCostUSD: deMicro4(sumaCostoMicro),
+                    totalCostMicro: sumaCostoMicro,
+                    bonusClientUSD: Number(Math.max(0, diffMeta).toFixed(2)),
+                    summaryText: etiquetas.join(' + '),
+                    items: itemsCombo
+                });
+            }
+        }
+
+        if (cartasUsadas >= maxCartas) return;
+
+        for (let i = startIndex; i < n; i++) {
+            const card = candidatas[i];
+            const yaUsadasDeEsta = conteoPorIndice[i] || 0;
+            if (card.availableStock !== null && card.availableStock !== undefined && yaUsadasDeEsta + 1 > Number(card.availableStock)) {
+                continue;
+            }
+            if (sumaClienteUSD + Number(card.effectiveClientUSD) > metaUSD * 1.48) {
+                continue;
+            }
+            const nuevoConteo = { ...conteoPorIndice, [i]: yaUsadasDeEsta + 1 };
+            explorar(
+                i,
+                cartasUsadas + 1,
+                nuevoConteo,
+                sumaClienteUSD + Number(card.effectiveClientUSD),
+                sumaCostoMicro + aMicro4(card.costUSD)
+            );
+        }
+    }
+
+    explorar(0, 0, {}, 0, 0);
+
+    if (solucionesValidas.length === 0) {
+        return {
+            hasSolution: false,
+            reason: `Ninguna combinación de tarjetas en stock alcanza los $${metaUSD.toFixed(2)} USD solicitados.`
+        };
+    }
+
+    // Ordenar: 1° Menor costo total para ti, 2° Mayor saldo entregado al cliente, 3° Menos códigos a canjear
+    solucionesValidas.sort((a, b) => {
+        if (Math.abs(a.totalCostMicro - b.totalCostMicro) > 200) { // Diferencia > $0.02 USD
+            return a.totalCostMicro - b.totalCostMicro;
+        }
+        if (b.totalClientUSD !== a.totalClientUSD) {
+            return b.totalClientUSD - a.totalClientUSD;
+        }
+        return a.totalCards - b.totalCards;
+    });
+
+    return solucionesValidas[0];
+}
+
+// 🔄 RECALCULADOR GLOBAL DE PRECIOS POR GANANCIA FIJA + ALGORITMO + FLYERS CANVA
+async function recalcularPreciosYAlgoritmoTiendaKZ(settingsDoc = null) {
+    try {
+        if (!settingsDoc) settingsDoc = await StoreSettings.findOne({ key: 'main_settings' });
+        if (!settingsDoc) return;
+
+        const catalogoCO = Array.isArray(settingsDoc.centralOneCatalogCache) ? settingsDoc.centralOneCatalogCache : [];
+        const mapaCO_PorId = {};
+        const mapaCO_PorSku = {};
+        catalogoCO.forEach(item => {
+            if (item.product_id) mapaCO_PorId[item.product_id] = item;
+            if (item.sku) mapaCO_PorSku[String(item.sku).trim().toUpperCase()] = item;
+        });
+
+        // 1. Actualizar costos y stock de las Tarjetas Base del Pool de Arbitraje
+        let huboCambioPool = false;
+        (settingsDoc.arbitrageBaseCards || []).forEach(card => {
+            const effUsd = Number(((Number(card.faceValueOrigin) || 0) * (Number(card.conversionRateToUSD) || 0)).toFixed(4));
+            if (effUsd > 0 && card.effectiveClientUSD !== effUsd) {
+                card.effectiveClientUSD = effUsd;
+                huboCambioPool = true;
+            }
+            const itemCO = (card.centralOneProductId && mapaCO_PorId[card.centralOneProductId]) ||
+                           (card.centralOneSku && mapaCO_PorSku[String(card.centralOneSku).trim().toUpperCase()]);
+            if (itemCO) {
+                const nuevoCosto = itemCO.reseller_price !== null ? Number(itemCO.reseller_price) : card.costUSD;
+                const nuevoInStock = Boolean(itemCO.in_stock && itemCO.status === 'active');
+                if (nuevoCosto > 0 && Math.abs(card.costUSD - nuevoCosto) > 0.0001) {
+                    card.costUSD = nuevoCosto;
+                    card.lastPriceUpdateAt = new Date();
+                    huboCambioPool = true;
+                }
+                if (card.inStock !== nuevoInStock) {
+                    card.inStock = nuevoInStock;
+                    huboCambioPool = true;
+                }
+                card.availableStock = itemCO.available_stock !== undefined ? itemCO.available_stock : null;
+            }
+        });
+        if (huboCambioPool) settingsDoc.markModified('arbitrageBaseCards');
+
+        // 2. Recorrer todos los productos de la tienda y recalcular sus paquetes (Principales y Alternativos)
+        const productos = await CatalogProduct.find();
+        const mapaPreciosParaFlyers = {};
+
+        for (const prod of productos) {
+            let prodModificado = false;
+            const esSmartProd = Boolean(prod.isSmartCodeProduct);
+            const platGroup = prod.smartPlatformGroup || 'steam';
+
+            const procesarArregloPaquetes = async (listaPaquetes) => {
+                if (!Array.isArray(listaPaquetes)) return;
+                for (const pkg of listaPaquetes) {
+                    const usaAlgo = esSmartProd || Boolean(pkg.useSmartAlgorithm);
+
+                    if (usaAlgo && Number(pkg.targetClientUSD) > 0) {
+                        const combo = calcularMejorCombinacionTarjetasPool(
+                            pkg.targetClientUSD,
+                            platGroup,
+                            settingsDoc.arbitrageBaseCards || []
+                        );
+                        const prevSummary = pkg.resolvedCombo ? pkg.resolvedCombo.summaryText : '';
+                        pkg.resolvedCombo = combo;
+
+                        if (combo.hasSolution) {
+                            pkg.costUSD = Number(combo.totalCostUSD.toFixed(4));
+                            pkg.providerInStock = true;
+                            if (prevSummary && prevSummary !== combo.summaryText) {
+                                await registrarAlertaCentralOne(settingsDoc, {
+                                    type: 'ALGO_FALLBACK',
+                                    severity: 'WARN',
+                                    title: `🧠 Algoritmo reajustó combinación en ${prod.name} (${pkg.name})`,
+                                    detail: `Pasó de "${prevSummary}" a "${combo.summaryText}" (Costo: $${pkg.costUSD.toFixed(2)} USD).`
+                                });
+                            }
+                        } else {
+                            pkg.providerInStock = false;
+                            if (prevSummary !== 'SIN_SOLUCION') {
+                                pkg.resolvedCombo = { ...combo, summaryText: 'SIN_SOLUCION' };
+                                await registrarAlertaCentralOne(settingsDoc, {
+                                    type: 'ALGO_NO_SOLUTION',
+                                    severity: 'CRIT',
+                                    title: `🚨 Sin stock suficiente para armar ${prod.name} — ${pkg.name}`,
+                                    detail: combo.reason || 'Ninguna combinación de tarjetas base en stock cubre este monto.'
+                                });
+                            }
+                        }
+                        prodModificado = true;
+                    } else {
+                        // Paquete directo vinculado a Central One por UUID o SKU
+                        const itemCO = (pkg.centralOneProductId && mapaCO_PorId[pkg.centralOneProductId]) ||
+                                       (pkg.apiProductSku && mapaCO_PorSku[String(pkg.apiProductSku).trim().toUpperCase()]);
+                        if (itemCO) {
+                            const nuevoCosto = itemCO.reseller_price !== null ? Number(itemCO.reseller_price) : pkg.costUSD;
+                            const nuevoStock = Boolean(itemCO.in_stock && itemCO.status === 'active');
+                            if (nuevoCosto > 0 && Math.abs((pkg.costUSD || 0) - nuevoCosto) > 0.0001) {
+                                pkg.costUSD = nuevoCosto;
+                                prodModificado = true;
+                            }
+                            if (pkg.providerInStock !== nuevoStock) {
+                                pkg.providerInStock = nuevoStock;
+                                prodModificado = true;
+                            }
+                            if (Array.isArray(itemCO.target_schema)) {
+                                pkg.targetSchemaCache = itemCO.target_schema;
+                            }
+                        }
+                    }
+
+                    // 💰 REGLA DE ORO: Si usa Ganancia Fija ($ USD), Venta = Costo + Ganancia automáticamente
+                    if (pkg.autoPriceByProfit !== false && Number(pkg.costUSD) > 0) {
+                        const gananciaDeseada = pkg.profitUSD !== undefined && pkg.profitUSD !== null
+                            ? Number(pkg.profitUSD)
+                            : Math.max(0.15, Number(((pkg.priceUSD || 1) - (pkg.costUSD || 0)).toFixed(2)));
+                        pkg.profitUSD = Number(gananciaDeseada.toFixed(2));
+                        const nuevoPrecioVenta = Number((Number(pkg.costUSD) + pkg.profitUSD).toFixed(2));
+                        if (Math.abs((pkg.priceUSD || 0) - nuevoPrecioVenta) >= 0.01) {
+                            pkg.priceUSD = nuevoPrecioVenta;
+                            pkg.tokemsPrice = nuevoPrecioVenta;
+                            prodModificado = true;
+                        }
+                    }
+                }
+            };
+
+            await procesarArregloPaquetes(prod.packages);
+            await procesarArregloPaquetes(prod.altPackages);
+
+            if (prodModificado) {
+                prod.markModified('packages');
+                prod.markModified('altPackages');
+                await prod.save();
+            }
+
+            // Registrar precios activos para actualizar Flyers Canva en la nube automáticamente
+            const listaActiva = (prod.useAltPricing && Array.isArray(prod.altPackages) && prod.altPackages.length > 0)
+                ? prod.altPackages
+                : (prod.packages || []);
+            listaActiva.forEach(pk => {
+                mapaPreciosParaFlyers[`${prod.slug}::${pk.packageId}`] = Number(pk.priceUSD || 0).toFixed(2);
+            });
+        }
+
+        // 3. Actualizar automáticamente los Flyers Canva guardados en MongoDB cuando cambia un precio
+        if (settingsDoc.flyersCanvaConfig && typeof settingsDoc.flyersCanvaConfig === 'object') {
+            let flyersModificados = false;
+            Object.values(settingsDoc.flyersCanvaConfig).forEach(ficha => {
+                (ficha.items || []).forEach(itm => {
+                    if (itm.linkedRef && mapaPreciosParaFlyers[itm.linkedRef]) {
+                        if (itm.price !== mapaPreciosParaFlyers[itm.linkedRef]) {
+                            itm.price = mapaPreciosParaFlyers[itm.linkedRef];
+                            flyersModificados = true;
+                        }
+                    }
+                });
+            });
+            if (flyersModificados) {
+                settingsDoc.markModified('flyersCanvaConfig');
+            }
+        }
+
+        await settingsDoc.save();
+    } catch (err) {
+        console.error('Aviso recalculando precios y algoritmo:', err.message);
+    }
+}
+
+// 📡 SINCRONIZADOR CON CENTRAL ONE (`GET /catalog`, `GET /balance`, `GET /player/validate/coverage`)
+async function sincronizarTodoConCentralOne(forzar = false) {
+    const headers = obtenerHeadersCentralOne();
+    let settings = await StoreSettings.findOne({ key: 'main_settings' });
+    if (!settings) settings = new StoreSettings({ key: 'main_settings' });
+
+    if (!headers) {
+        settings.centralOneSync = {
+            ...(settings.centralOneSync || {}),
+            apiConnected: false,
+            lastError: 'Falta configurar CENTRAL_ONE_API_KEY en Railway.'
+        };
+        await settings.save();
+        return { success: false, error: 'Falta configurar CENTRAL_ONE_API_KEY en Railway.' };
+    }
+
+    try {
+        const [resBalance, resCatalog, resCoverage] = await Promise.allSettled([
+            axios.get(`${CENTRAL_ONE_BASE_URL}/balance`, { headers, timeout: 12000 }),
+            axios.get(`${CENTRAL_ONE_BASE_URL}/catalog`, { headers, timeout: 15000 }),
+            axios.get(`${CENTRAL_ONE_BASE_URL}/player/validate/coverage`, { headers, timeout: 12000 })
+        ]);
+
+        if (!settings.centralOneSync) settings.centralOneSync = {};
+
+        if (resBalance.status === 'fulfilled' && resBalance.value?.data) {
+            const b = resBalance.value.data;
+            settings.centralOneSync.availableBalance = String(b.available_balance || '0.0000');
+            settings.centralOneSync.heldBalance = String(b.held_balance || '0.0000');
+            settings.centralOneSync.totalBalance = String(b.total_balance || '0.0000');
+            settings.centralOneSync.currency = b.currency || 'USD';
+            settings.centralOneSync.apiConnected = true;
+            settings.centralOneSync.lastError = '';
+        } else if (resBalance.status === 'rejected') {
+            const errCode = resBalance.reason?.response?.data?.error?.code || resBalance.reason?.message || 'Error de conexión';
+            settings.centralOneSync.lastError = `Balance API: ${errCode}`;
+        }
+
+        if (resCatalog.status === 'fulfilled' && Array.isArray(resCatalog.value?.data?.items)) {
+            const nuevosItems = resCatalog.value.data.items;
+            const viejosMap = {};
+            (settings.centralOneCatalogCache || []).forEach(oldIt => {
+                if (oldIt && oldIt.product_id) viejosMap[oldIt.product_id] = oldIt;
+            });
+
+            // Comparar cambios de precio, stock o eliminados si ya teníamos un catálogo previo
+            if (Object.keys(viejosMap).length > 0) {
+                const nuevosIdsSet = new Set(nuevosItems.map(x => x.product_id));
+
+                for (const item of nuevosItems) {
+                    const prev = viejosMap[item.product_id];
+                    if (!prev) continue;
+
+                    const pNuevo = Number(item.reseller_price || 0);
+                    const pViejo = Number(prev.reseller_price || 0);
+                    if (pNuevo > 0 && pViejo > 0 && Math.abs(pNuevo - pViejo) >= 0.0005) {
+                        const subio = pNuevo > pViejo;
+                        await registrarAlertaCentralOne(settings, {
+                            type: subio ? 'PRICE_UP' : 'PRICE_DOWN',
+                            severity: subio ? 'WARN' : 'OK',
+                            title: `${subio ? '📈 Subió' : '📉 Bajó'} costo en proveedor: ${item.name}`,
+                            detail: `SKU ${item.sku}: pasó de $${formatear4Decimales(pViejo)} a $${formatear4Decimales(pNuevo)} USD. Tus precios con ganancia fija se reajustaron solos.`,
+                            sku: item.sku,
+                            productId: item.product_id,
+                            oldPrice: formatear4Decimales(pViejo),
+                            newPrice: formatear4Decimales(pNuevo)
+                        });
+                    }
+
+                    const stockNuevo = Boolean(item.in_stock && item.status === 'active');
+                    const stockViejo = Boolean(prev.in_stock && prev.status === 'active');
+                    if (stockViejo && !stockNuevo) {
+                        await registrarAlertaCentralOne(settings, {
+                            type: 'OUT_OF_STOCK',
+                            severity: 'CRIT',
+                            title: `🚫 Producto agotado en Central One: ${item.name}`,
+                            detail: `El SKU ${item.sku} cambió a in_stock: false. El algoritmo usará tarjetas de respaldo si aplica.`,
+                            sku: item.sku,
+                            productId: item.product_id
+                        });
+                    } else if (!stockViejo && stockNuevo) {
+                        await registrarAlertaCentralOne(settings, {
+                            type: 'BACK_IN_STOCK',
+                            severity: 'OK',
+                            title: `🟢 Volvió el stock en Central One: ${item.name}`,
+                            detail: `El SKU ${item.sku} está nuevamente disponible ($${formatear4Decimales(pNuevo)} USD).`,
+                            sku: item.sku,
+                            productId: item.product_id
+                        });
+                    }
+                }
+
+                // Detectar productos que salieron de tu catálogo
+                for (const oldId of Object.keys(viejosMap)) {
+                    if (!nuevosIdsSet.has(oldId)) {
+                        const oldIt = viejosMap[oldId];
+                        await registrarAlertaCentralOne(settings, {
+                            type: 'REMOVED_FROM_CATALOG',
+                            severity: 'CRIT',
+                            title: `❌ Producto retirado/suspendido del catálogo: ${oldIt.name}`,
+                            detail: `El producto ${oldIt.sku} (${oldId}) ya no aparece habilitado en tu catálogo de Central One.`,
+                            sku: oldIt.sku,
+                            productId: oldId
+                        });
+                    }
+                }
+            }
+
+            settings.centralOneCatalogCache = nuevosItems;
+            settings.centralOneSync.catalogCount = nuevosItems.length;
+            settings.centralOneSync.apiConnected = true;
+            settings.centralOneSync.lastSyncAt = new Date();
+            settings.markModified('centralOneCatalogCache');
+        }
+
+        if (resCoverage.status === 'fulfilled' && resCoverage.value?.data) {
+            settings.centralOneCoverageCache = resCoverage.value.data;
+            settings.markModified('centralOneCoverageCache');
+        }
+
+        settings.markModified('centralOneSync');
+        await recalcularPreciosYAlgoritmoTiendaKZ(settings);
+
+        return {
+            success: true,
+            sync: settings.centralOneSync,
+            catalogCount: (settings.centralOneCatalogCache || []).length
+        };
+    } catch (err) {
+        return { success: false, error: err.message };
+    }
+}
+
+// Sincronización automática cada 15 minutos (cumple con el límite de Central One)
+setInterval(() => {
+    if (process.env.CENTRAL_ONE_API_KEY) {
+        sincronizarTodoConCentralOne().catch(() => {});
+    }
+}, 15 * 60 * 1000);
+
+setTimeout(() => {
+    if (process.env.CENTRAL_ONE_API_KEY) {
+        sincronizarTodoConCentralOne().catch(() => {});
+    }
+}, 6000);
+
+// 🔎 CONSULTAR ESTADO Y EXTRAER CÓDIGOS DE UNA ORDEN EN CENTRAL ONE (`GET /orders/{id}` y `GET /orders/{id}/codes`)
+async function verificarYExtraerEntregaCentralOne(coOrderId, headers) {
+    const resOrder = await axios.get(`${CENTRAL_ONE_BASE_URL}/orders/${encodeURIComponent(coOrderId)}`, {
+        headers,
+        timeout: 12000
+    });
+    const coOrder = resOrder.data?.order;
+    if (!coOrder) return { state: 'PROCESSING' };
+
+    const st = String(coOrder.status || '').toLowerCase();
+    const lines = Array.isArray(coOrder.items) ? coOrder.items : [];
+    const totalDeliveredCount = lines.reduce((acc, l) => acc + (Number(l.delivered_count) || 0), 0);
+
+    if (st === 'completed' || st === 'partially_completed') {
+        let codigosEntregados = [];
+        if (totalDeliveredCount > 0) {
+            try {
+                const resCodes = await axios.get(`${CENTRAL_ONE_BASE_URL}/orders/${encodeURIComponent(coOrderId)}/codes`, {
+                    headers,
+                    timeout: 12000
+                });
+                const codeItems = resCodes.data?.order?.items || [];
+                codeItems.forEach(ci => {
+                    if (Array.isArray(ci.codes)) {
+                        ci.codes.forEach(cStr => codigosEntregados.push(cStr));
+                    }
+                });
+            } catch (errCodes) {
+                console.error('Aviso leyendo /codes:', errCodes.message);
+            }
+        }
+
+        const textoFinal = codigosEntregados.length > 0
+            ? codigosEntregados.join('  |  ')
+            : `RECARGA ENVIADA (${coOrder.reference_code || 'OK'})`;
+
+        return {
+            state: 'COMPLETED',
+            deliveredCode: textoFinal,
+            referenceCode: coOrder.reference_code || coOrderId,
+            raw: coOrder
+        };
+    }
+
+    if (st === 'failed' || st === 'cancelled') {
+        const firstFailedLine = lines.find(l => l.failure) || {};
+        const failureInfo = firstFailedLine.failure || coOrder.failure || {};
+        return {
+            state: 'FAILED',
+            failureCode: failureInfo.code || 'unknown',
+            failureAction: failureInfo.action || 'contact_support',
+            errorMsg: failureInfo.message_es || failureInfo.message || 'La orden fue rechazada por el proveedor.',
+            raw: coOrder
+        };
+    }
+
+    return {
+        state: 'PROCESSING',
+        referenceCode: coOrder.reference_code || coOrderId,
+        raw: coOrder
+    };
+}
+
+// ⏱️ VIGILANTE ESCALONADO PARA ÓRDENES EN PROCESO (Cada 30s los primeros 5 min, luego cada 5 min como pide la documentación)
+const activeCentralOnePollers = new Map();
+
+function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId) {
+    if (!orderIdKZ || !coOrderId || activeCentralOnePollers.has(orderIdKZ)) return;
+    const inicioMs = Date.now();
+
+    const cicloRevision = async () => {
+        try {
+            const headers = obtenerHeadersCentralOne();
+            if (!headers) {
+                activeCentralOnePollers.delete(orderIdKZ);
+                return;
+            }
+            const ordenDB = await Order.findOne({ orderId: orderIdKZ });
+            if (!ordenDB || ordenDB.status === 'ENTREGADO' || ordenDB.status === 'RECHAZADO') {
+                activeCentralOnePollers.delete(orderIdKZ);
+                return;
+            }
+
+            const check = await verificarYExtraerEntregaCentralOne(coOrderId, headers);
+            if (check.state === 'COMPLETED') {
+                ordenDB.status = 'ENTREGADO';
+                ordenDB.progressPercent = 100;
+                ordenDB.deliveredCode = check.deliveredCode;
+                ordenDB.statusMessage = '¡Tu pedido ha sido entregado automáticamente con éxito!';
+                ordenDB.completedAt = new Date();
+                await ordenDB.save();
+                activeCentralOnePollers.delete(orderIdKZ);
+                return;
+            }
+
+            if (check.state === 'FAILED') {
+                ordenDB.status = 'ERROR_API';
+                ordenDB.statusMessage = 'Pago verificado. Nuestro operador está completando la entrega de tu paquete.';
+                await ordenDB.save();
+                const settings = await StoreSettings.findOne({ key: 'main_settings' });
+                await registrarAlertaCentralOne(settings, {
+                    type: 'ORDER_FAILED',
+                    severity: 'CRIT',
+                    title: `🚨 Orden #${ordenDB.orderId} falló en Central One (${check.failureCode})`,
+                    detail: `${ordenDB.productName} (${ordenDB.packageName}): ${check.errorMsg} [Acción: ${check.failureAction}]`
+                });
+                if (settings) await settings.save();
+                activeCentralOnePollers.delete(orderIdKZ);
+                return;
+            }
+
+            const transcurridoMs = Date.now() - inicioMs;
+            if (transcurridoMs > 2 * 60 * 60 * 1000) {
+                activeCentralOnePollers.delete(orderIdKZ);
+                return;
+            }
+            // Primeros 5 minutos: cada 30 segundos. Después: cada 5 minutos.
+            const proximoIntervalo = transcurridoMs < (5 * 60 * 1000) ? 30000 : 300000;
+            const timerId = setTimeout(cicloRevision, proximoIntervalo);
+            activeCentralOnePollers.set(orderIdKZ, timerId);
+        } catch (e) {
+            const timerId = setTimeout(cicloRevision, 60000);
+            activeCentralOnePollers.set(orderIdKZ, timerId);
+        }
+    };
+
+    const firstTimer = setTimeout(cicloRevision, 30000);
+    activeCentralOnePollers.set(orderIdKZ, firstTimer);
+}
+
+// 🚀 EJECUTOR PRINCIPAL DE ENTREGA (CONECTA BÓVEDA LOCAL, ALGORITMO DE ARBITRAJE Y CENTRAL ONE API v1)
 async function ejecutarEntregaPorAPI(orden, productoDB) {
-    // 1. Si es Recarga Interna manual, no dispara API externa
     if (orden.fulfillmentType === 'MANUAL_INTERNAL') {
         return {
             success: true,
@@ -864,64 +1497,244 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
         };
     }
 
-    // 2. Revisar primero si tú cargaste códigos PIN en la Bóveda de Respaldo del paquete
-    if (productoDB && Array.isArray(productoDB.packages)) {
-        const listaVault = (productoDB.useAltPricing && Array.isArray(productoDB.altPackages) && productoDB.altPackages.length > 0)
-            ? productoDB.altPackages
-            : productoDB.packages;
-        const pkg = (listaVault || []).find(p => p.packageId === orden.packageId);
-        if (pkg && Array.isArray(pkg.backupPinVault) && pkg.backupPinVault.length > 0) {
-            const pinExtraido = pkg.backupPinVault.shift(); // Toma el primer PIN disponible y lo borra del stock
-            await productoDB.save();
-            return {
-                success: true,
-                deliveredCode: pinExtraido,
-                apiOrderId: 'VAULT-' + Date.now(),
-                raw: { source: 'backup_pin_vault' }
+    // 1. Buscar el paquete activo (Principal o Alternativo)
+    const listaPaquetes = (productoDB && productoDB.useAltPricing && Array.isArray(productoDB.altPackages) && productoDB.altPackages.length > 0)
+        ? productoDB.altPackages
+        : (productoDB ? productoDB.packages : []);
+    const pkg = (listaPaquetes || []).find(p => p.packageId === orden.packageId);
+
+    // 2. Revisar primero si tú cargaste códigos PIN en la Bóveda Local de respaldo
+    if (pkg && Array.isArray(pkg.backupPinVault) && pkg.backupPinVault.length > 0) {
+        const pinExtraido = pkg.backupPinVault.shift();
+        await productoDB.save();
+        return {
+            success: true,
+            deliveredCode: pinExtraido,
+            apiOrderId: 'VAULT-' + Date.now(),
+            raw: { source: 'backup_pin_vault' }
+        };
+    }
+
+    // 3. Conexión en Vivo con Central One API v1
+    const headersBase = obtenerHeadersCentralOne();
+    const settings = await StoreSettings.findOne({ key: 'main_settings' });
+
+    if (headersBase) {
+        const usaAlgoritmo = Boolean((productoDB && productoDB.isSmartCodeProduct) || (pkg && pkg.useSmartAlgorithm));
+
+        // 🧠 CASO A: PRODUCTO CON ALGORITMO INTELIGENTE DE CÓDIGOS (STEAM, PLAY, NINTENDO, ETC.)
+        if (usaAlgoritmo && pkg && Number(pkg.targetClientUSD) > 0) {
+            const platGroup = (productoDB && productoDB.smartPlatformGroup) || 'steam';
+
+            for (let intento = 1; intento <= 2; intento++) {
+                const combo = calcularMejorCombinacionTarjetasPool(
+                    pkg.targetClientUSD,
+                    platGroup,
+                    settings ? settings.arbitrageBaseCards : []
+                );
+
+                if (!combo.hasSolution) {
+                    await registrarAlertaCentralOne(settings, {
+                        type: 'ALGO_NO_SOLUTION',
+                        severity: 'CRIT',
+                        title: `🚨 Orden #${orden.orderId} sin stock en Pool (${platGroup.toUpperCase()})`,
+                        detail: combo.reason || 'No hay tarjetas base con stock para cubrir el monto.'
+                    });
+                    if (settings) await settings.save();
+                    return { success: false, errorMsg: combo.reason || 'Sin stock en tarjetas base del algoritmo.' };
+                }
+
+                // Verificar que todas las tarjetas de la combinación tengan su UUID de Central One
+                const itemsSinId = combo.items.filter(it => !it.centralOneProductId);
+                if (itemsSinId.length > 0) {
+                    return {
+                        success: false,
+                        errorMsg: `La tarjeta base "${itemsSinId[0].name}" no tiene asignado su UUID de Central One.`
+                    };
+                }
+
+                const idempKey = `kz-ord-${orden.orderId}-algo-v${intento}`.replace(/[^A-Za-z0-9_-]/g, '');
+                const headersOrder = obtenerHeadersCentralOne({ 'Idempotency-Key': idempKey });
+
+                try {
+                    const bodyOrder = {
+                        items: combo.items.map(it => ({
+                            catalog_item_id: it.centralOneProductId,
+                            quantity: Math.max(1, Math.round(Number(it.quantity) || 1))
+                        })),
+                        note: `KemZone #${orden.orderId} (${combo.summaryText})`.slice(0, 480)
+                    };
+
+                    const resCreate = await axios.post(`${CENTRAL_ONE_BASE_URL}/orders`, bodyOrder, {
+                        headers: headersOrder,
+                        timeout: 20000
+                    });
+
+                    const createdOrder = resCreate.data?.order;
+                    if (!createdOrder || !createdOrder.id) {
+                        return { success: false, errorMsg: 'Respuesta inválida al crear orden en Central One.' };
+                    }
+
+                    // Esperar 2.2 segundos y consultar si ya generó los códigos
+                    await new Promise(r => setTimeout(r, 2200));
+                    const check = await verificarYExtraerEntregaCentralOne(createdOrder.id, headersBase);
+
+                    if (check.state === 'COMPLETED') {
+                        return {
+                            success: true,
+                            deliveredCode: check.deliveredCode,
+                            apiOrderId: createdOrder.id,
+                            raw: check.raw
+                        };
+                    }
+
+                    if (check.state === 'FAILED') {
+                        return {
+                            success: false,
+                            errorMsg: `Central One rechazó la entrega (${check.failureCode}): ${check.errorMsg}`
+                        };
+                    }
+
+                    // Si sigue en "confirmed" / "processing", activamos el vigilante en segundo plano
+                    programarSeguimientoOrdenCentralOne(orden.orderId, createdOrder.id);
+                    return {
+                        success: true,
+                        isProcessingAsync: true,
+                        deliveredCode: `EMITIENDO CÓDIGO(S) OFICIALES (${combo.summaryText}) — SE MOSTRARÁN EN SEGUNDOS...`,
+                        apiOrderId: createdOrder.id,
+                        raw: check.raw
+                    };
+                } catch (errCO) {
+                    const errCode = errCO.response?.data?.error?.code || '';
+                    // Si una tarjeta base se acaba de quedar sin stock (409 insufficient_stock), la marcamos agotada y el bucle busca la siguiente mejor combinación automáticamente
+                    if (errCode === 'insufficient_stock' && settings && intento === 1) {
+                        combo.items.forEach(it => {
+                            const cPool = (settings.arbitrageBaseCards || []).find(c => c.cardId === it.cardId);
+                            if (cPool) cPool.inStock = false;
+                        });
+                        settings.markModified('arbitrageBaseCards');
+                        await registrarAlertaCentralOne(settings, {
+                            type: 'ALGO_FALLBACK',
+                            severity: 'WARN',
+                            title: `🔄 Stock agotado al comprar "${combo.summaryText}" — Buscando respaldo`,
+                            detail: `Central One devolvió insufficient_stock en #${orden.orderId}. Probando combinación alternativa.`
+                        });
+                        await settings.save();
+                        continue;
+                    }
+                    return {
+                        success: false,
+                        errorMsg: errCO.response?.data?.error?.message || errCO.message
+                    };
+                }
+            }
+        }
+
+        // ⚡ CASO B: RECARGA POR ID O CÓDIGO DIRECTO VINCULADO A CENTRAL ONE (`centralOneProductId` o `apiProductSku`)
+        let coProductId = (pkg && pkg.centralOneProductId) || '';
+        let coCatItem = null;
+        if (settings && Array.isArray(settings.centralOneCatalogCache)) {
+            if (coProductId) {
+                coCatItem = settings.centralOneCatalogCache.find(x => x.product_id === coProductId);
+            }
+            if (!coCatItem && (orden.apiProductSku || (pkg && pkg.apiProductSku))) {
+                const skuBuscado = String(orden.apiProductSku || pkg.apiProductSku).trim().toUpperCase();
+                coCatItem = settings.centralOneCatalogCache.find(x => String(x.sku || '').trim().toUpperCase() === skuBuscado);
+                if (coCatItem) coProductId = coCatItem.product_id;
+            }
+        }
+
+        if (coProductId) {
+            const idempKey = `kz-ord-${orden.orderId}-direct-v1`.replace(/[^A-Za-z0-9_-]/g, '');
+            const headersOrder = obtenerHeadersCentralOne({ 'Idempotency-Key': idempKey });
+
+            const itemPayload = {
+                catalog_item_id: coProductId,
+                quantity: 1
             };
+
+            // Construir target_payload exacto según requires_target y target_fields de Central One
+            if (!coCatItem || coCatItem.requires_target !== false) {
+                const targetFields = (coCatItem && Array.isArray(coCatItem.target_fields) && coCatItem.target_fields.length > 0)
+                    ? coCatItem.target_fields
+                    : (orden.fulfillmentType === 'API_DIRECT_TOPUP' ? ['player_id'] : []);
+
+                if (targetFields.length > 0) {
+                    const tPayload = {};
+                    targetFields.forEach((fieldKey, idx) => {
+                        const fkLower = String(fieldKey).toLowerCase();
+                        if (fkLower.includes('server') || fkLower.includes('zone') || fkLower.includes('region')) {
+                            tPayload[fieldKey] = String(orden.playerServer || orden.playerRegion || '').trim();
+                        } else if (idx === 0 || fkLower.includes('player') || fkLower.includes('uid') || fkLower.includes('user') || fkLower.includes('id')) {
+                            tPayload[fieldKey] = String(orden.playerUid || '').trim();
+                        } else {
+                            tPayload[fieldKey] = String(orden.playerServer || orden.playerRegion || orden.playerUid || '').trim();
+                        }
+                    });
+                    itemPayload.target_payload = tPayload;
+                }
+            }
+
+            try {
+                const resCreate = await axios.post(`${CENTRAL_ONE_BASE_URL}/orders`, {
+                    items: [itemPayload],
+                    note: `KemZone #${orden.orderId} - ${orden.productName}`.slice(0, 480)
+                }, { headers: headersOrder, timeout: 20000 });
+
+                const createdOrder = resCreate.data?.order;
+                if (!createdOrder || !createdOrder.id) {
+                    return { success: false, errorMsg: 'Central One no devolvió ID de pedido.' };
+                }
+
+                await new Promise(r => setTimeout(r, 2200));
+                const check = await verificarYExtraerEntregaCentralOne(createdOrder.id, headersBase);
+
+                if (check.state === 'COMPLETED') {
+                    return {
+                        success: true,
+                        deliveredCode: check.deliveredCode,
+                        apiOrderId: createdOrder.id,
+                        raw: check.raw
+                    };
+                }
+
+                if (check.state === 'FAILED') {
+                    return {
+                        success: false,
+                        errorMsg: `Fallo en Central One (${check.failureCode}): ${check.errorMsg}`
+                    };
+                }
+
+                programarSeguimientoOrdenCentralOne(orden.orderId, createdOrder.id);
+                return {
+                    success: true,
+                    isProcessingAsync: true,
+                    deliveredCode: orden.fulfillmentType === 'API_GIFT_CARD'
+                        ? `GENERANDO CÓDIGO PIN EN SERVIDOR (${createdOrder.reference_code})...`
+                        : `PROCESANDO RECARGA AL ID ${orden.playerUid} (${createdOrder.reference_code})...`,
+                    apiOrderId: createdOrder.id,
+                    raw: check.raw
+                };
+            } catch (errDirect) {
+                const msgErr = errDirect.response?.data?.error?.message || errDirect.message;
+                const codeErr = errDirect.response?.data?.error?.code || 'api_error';
+                await registrarAlertaCentralOne(settings, {
+                    type: 'ORDER_FAILED',
+                    severity: 'CRIT',
+                    title: `🚨 Error al enviar orden #${orden.orderId} a Central One (${codeErr})`,
+                    detail: `${orden.productName} (${orden.packageName}): ${msgErr}`
+                });
+                if (settings) await settings.save();
+                return { success: false, errorMsg: `${codeErr}: ${msgErr}` };
+            }
         }
     }
 
-    // 3. Conexión en vivo con la API de tu proveedor (CodesWholesale / Relograde / Proveedor Top-Up)
-    const providerUrl = process.env.PROVIDER_API_URL;
-    const providerKey = process.env.PROVIDER_API_KEY;
-
-    if (providerUrl && providerKey) {
-        try {
-            const response = await axios.post(providerUrl, {
-                api_key: providerKey,
-                order_id: orden.orderId,
-                sku: orden.apiProductSku || orden.packageId,
-                fulfillment_type: orden.fulfillmentType,
-                player_uid: orden.playerUid,
-                player_server: orden.playerServer || ''
-            }, { timeout: 20000 });
-
-            // Extrae el código PIN devuelto por la API (si es Gift Card/Key) o la confirmación de recarga ID
-            const codigoRecibido = response.data?.pin_code || response.data?.code || response.data?.serial || 
-                (orden.fulfillmentType === 'API_DIRECT_TOPUP' ? `RECARGA ENVIADA AL ID ${orden.playerUid}` : '');
-
-            return {
-                success: true,
-                deliveredCode: codigoRecibido,
-                apiOrderId: String(response.data?.transaction_id || response.data?.order_id || 'API-OK'),
-                raw: response.data
-            };
-        } catch (apiErr) {
-            console.error('❌ Error en API del Proveedor:', apiErr.message);
-            return {
-                success: false,
-                errorMsg: apiErr.response?.data?.message || apiErr.message
-            };
-        }
-    }
-
-    // 4. Modo inteligente si aún no has puesto PROVIDER_API_URL en Railway:
-    // Genera el disparo automático para que el flujo del trabajador y la barra del cliente funcionen al 100%
+    // 4. Respaldo si el paquete aún no tiene UUID de Central One asignado
     if (orden.fulfillmentType === 'API_GIFT_CARD') {
         const autoPin = orden.workerNotes && orden.workerNotes.includes('PIN:') 
             ? orden.workerNotes.replace('PIN:', '').trim()
-            : `PIN-API-${crypto.randomBytes(2).toString('hex').toUpperCase()}-${crypto.randomBytes(2).toString('hex').toUpperCase()}-${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
+            : `PIN-KZ-${crypto.randomBytes(2).toString('hex').toUpperCase()}-${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
         return {
             success: true,
             deliveredCode: autoPin,
@@ -1042,6 +1855,197 @@ app.post('/api/shopify-webhook-kz07x', express.raw({ type: 'application/json' })
         return res.status(200).send("Webhook procesado con éxito");
     } catch (error) {
         return res.status(500).send("Error interno del servidor");
+    }
+});
+
+// =================================================================
+// 🔔 WEBHOOK OFICIAL DE CENTRAL ONE (FIRMA HMAC-SHA256 + CUERPO CRUDO)
+// =================================================================
+function verificarFirmaWebhookCentralOne(secreto, timestamp, cuerpoCrudoBuffer, firmaRecibida) {
+    if (!secreto || !timestamp || !cuerpoCrudoBuffer || !firmaRecibida) return false;
+    try {
+        const esperada = 'sha256=' + crypto.createHmac('sha256', secreto.trim())
+            .update(`${timestamp}.${cuerpoCrudoBuffer.toString('utf8')}`)
+            .digest('hex');
+        const bufA = Buffer.from(esperada);
+        const bufB = Buffer.from(String(firmaRecibida).trim());
+        return bufA.length === bufB.length && crypto.timingSafeEqual(bufA, bufB);
+    } catch (e) {
+        return false;
+    }
+}
+
+app.post('/webhooks/central-one', express.raw({ type: 'application/json' }), async (req, res) => {
+    try {
+        const timestamp = req.header('X-CentralOne-Timestamp') || '';
+        const signature = req.header('X-CentralOne-Signature') || '';
+        const signaturePrev = req.header('X-CentralOne-Signature-Previous') || '';
+        const secret = process.env.CENTRAL_ONE_WEBHOOK_SECRET || '';
+        const prevSecret = process.env.CENTRAL_ONE_WEBHOOK_SECRET_PREVIOUS || '';
+
+        // 1. Validar antigüedad máxima de 5 minutos (300 segundos) como exige Central One
+        if (timestamp) {
+            const ahoraSeg = Math.floor(Date.now() / 1000);
+            const tsNum = parseInt(timestamp, 10);
+            if (!isNaN(tsNum) && Math.abs(ahoraSeg - tsNum) > 320) {
+                return res.status(401).json({ error: 'Timestamp fuera de ventana de 5 minutos.' });
+            }
+        }
+
+        // 2. Verificar firma HMAC-SHA256 sobre el cuerpo crudo
+        if (secret) {
+            const firmaValida = verificarFirmaWebhookCentralOne(secret, timestamp, req.body, signature) ||
+                                (prevSecret && signaturePrev && verificarFirmaWebhookCentralOne(prevSecret, timestamp, req.body, signaturePrev));
+            if (!firmaValida) {
+                return res.status(401).json({ error: 'Firma de Central One inválida.' });
+            }
+        }
+
+        const payload = JSON.parse(req.body.toString('utf8'));
+        const eventId = req.header('X-CentralOne-Event-Id') || payload.event_id || '';
+        const eventName = req.header('X-CentralOne-Event') || payload.event || '';
+
+        // Confirmar 200 OK de inmediato en menos de 10 segundos y procesar enseguida
+        res.status(200).json({ received: true, event_id: eventId });
+
+        let settings = await StoreSettings.findOne({ key: 'main_settings' });
+        if (!settings) settings = new StoreSettings({ key: 'main_settings' });
+
+        // Deduplicar por event_id
+        if (eventId && Array.isArray(settings.processedWebhookIds) && settings.processedWebhookIds.includes(eventId)) {
+            return;
+        }
+        if (eventId) {
+            if (!Array.isArray(settings.processedWebhookIds)) settings.processedWebhookIds = [];
+            settings.processedWebhookIds.unshift(eventId);
+            if (settings.processedWebhookIds.length > 300) {
+                settings.processedWebhookIds = settings.processedWebhookIds.slice(0, 300);
+            }
+            settings.markModified('processedWebhookIds');
+        }
+
+        // A. Eventos de Catálogo: product.price_changed y product.stock_changed
+        if ((eventName === 'product.price_changed' || eventName === 'product.stock_changed') && Array.isArray(payload.products)) {
+            if (!Array.isArray(settings.centralOneCatalogCache)) settings.centralOneCatalogCache = [];
+
+            for (const pChange of payload.products) {
+                const idx = settings.centralOneCatalogCache.findIndex(x => x.product_id === pChange.product_id);
+                if (pChange.in_catalog === false) {
+                    if (idx !== -1) settings.centralOneCatalogCache.splice(idx, 1);
+                    await registrarAlertaCentralOne(settings, {
+                        type: 'REMOVED_FROM_CATALOG',
+                        severity: 'CRIT',
+                        title: `❌ Retirado de tu catálogo Central One: ${pChange.name}`,
+                        detail: `SKU ${pChange.sku} salió del catálogo (in_catalog: false).`,
+                        sku: pChange.sku,
+                        productId: pChange.product_id
+                    });
+                } else {
+                    if (idx !== -1) {
+                        settings.centralOneCatalogCache[idx] = {
+                            ...settings.centralOneCatalogCache[idx],
+                            reseller_price: pChange.reseller_price,
+                            in_stock: pChange.in_stock,
+                            available_stock: pChange.available_stock,
+                            price_updated_at: pChange.price_updated_at || new Date().toISOString()
+                        };
+                    }
+                    if (eventName === 'product.price_changed') {
+                        const subio = Number(pChange.reseller_price) > Number(pChange.previous_reseller_price);
+                        await registrarAlertaCentralOne(settings, {
+                            type: subio ? 'PRICE_UP' : 'PRICE_DOWN',
+                            severity: subio ? 'WARN' : 'OK',
+                            title: `${subio ? '📈 Subió' : '📉 Bajó'} precio en Central One: ${pChange.name}`,
+                            detail: `SKU ${pChange.sku}: $${pChange.previous_reseller_price || '--'} ➔ $${pChange.reseller_price} USD. Precios recalculados automáticamente.`,
+                            sku: pChange.sku,
+                            productId: pChange.product_id,
+                            oldPrice: String(pChange.previous_reseller_price || ''),
+                            newPrice: String(pChange.reseller_price || '')
+                        });
+                    } else if (eventName === 'product.stock_changed') {
+                        await registrarAlertaCentralOne(settings, {
+                            type: pChange.in_stock ? 'BACK_IN_STOCK' : 'OUT_OF_STOCK',
+                            severity: pChange.in_stock ? 'OK' : 'CRIT',
+                            title: `${pChange.in_stock ? '🟢 Volvió el stock' : '🚫 Se agotó el stock'}: ${pChange.name}`,
+                            detail: `SKU ${pChange.sku} cambió in_stock a ${pChange.in_stock}.`,
+                            sku: pChange.sku,
+                            productId: pChange.product_id
+                        });
+                    }
+                }
+            }
+            settings.markModified('centralOneCatalogCache');
+            await recalcularPreciosYAlgoritmoTiendaKZ(settings);
+            return;
+        }
+
+        // B. Eventos de Órdenes: order.delivered, order.partially_delivered, order.failed, order.refunded
+        if (eventName.startsWith('order.') && payload.order) {
+            const wOrder = payload.order;
+            const idemp = wOrder.idempotency_key || '';
+            const matchKzId = idemp.match(/KZ-\d{6}/i);
+            const kzOrderId = matchKzId ? matchKzId[0].toUpperCase() : null;
+
+            const ordenDB = kzOrderId
+                ? await Order.findOne({ orderId: kzOrderId })
+                : await Order.findOne({ apiOrderId: wOrder.reference_code });
+
+            if (ordenDB) {
+                if (eventName === 'order.delivered' || eventName === 'order.partially_delivered') {
+                    const listaCodigos = [];
+                    if (Array.isArray(wOrder.codes)) {
+                        wOrder.codes.forEach(cGroup => {
+                            if (Array.isArray(cGroup.codes)) {
+                                cGroup.codes.forEach(codeStr => listaCodigos.push(codeStr));
+                            }
+                        });
+                    }
+                    ordenDB.status = 'ENTREGADO';
+                    ordenDB.progressPercent = 100;
+                    if (listaCodigos.length > 0) {
+                        ordenDB.deliveredCode = listaCodigos.join('  |  ');
+                    } else if (!ordenDB.deliveredCode || ordenDB.deliveredCode.includes('PROCESANDO')) {
+                        ordenDB.deliveredCode = `RECARGA COMPLETADA (${wOrder.reference_code || 'OK'})`;
+                    }
+                    ordenDB.statusMessage = '¡Tu pedido ha sido entregado automáticamente con éxito!';
+                    ordenDB.completedAt = new Date();
+                    await ordenDB.save();
+                } else if (eventName === 'order.failed') {
+                    await registrarAlertaCentralOne(settings, {
+                        type: 'ORDER_FAILED',
+                        severity: 'CRIT',
+                        title: `🚨 Orden #${ordenDB.orderId} reportada fallida por Webhook (${wOrder.reference_code})`,
+                        detail: `El saldo retenido fue liberado en tu cuenta de Central One.`
+                    });
+                }
+            }
+        }
+
+        // C. Eventos de Saldo: deposit.approved, balance.credited, balance.low
+        if (payload.balance && payload.balance.available) {
+            if (!settings.centralOneSync) settings.centralOneSync = {};
+            settings.centralOneSync.availableBalance = String(payload.balance.available);
+            settings.markModified('centralOneSync');
+        }
+        if (eventName === 'balance.low') {
+            await registrarAlertaCentralOne(settings, {
+                type: 'BALANCE_LOW',
+                severity: 'CRIT',
+                title: `⚠️ Saldo bajo en Central One ($${payload.balance?.available || '0.00'} USD)`,
+                detail: `Tu saldo disponible bajó del umbral configurado ($${payload.balance?.threshold || '0.00'} USD). Recarga tu cuenta para no detener las entregas automáticas.`
+            });
+        } else if (eventName === 'deposit.approved' || eventName === 'balance.credited') {
+            await registrarAlertaCentralOne(settings, {
+                type: 'DEPOSIT_APPROVED',
+                severity: 'OK',
+                title: `💰 Saldo acreditado en Central One (+$${payload.deposit?.credited_amount || payload.credit?.amount || '0.00'} USD)`,
+                detail: `Nuevo saldo disponible en Central One: $${payload.balance?.available || '--'} USD.`
+            });
+        }
+
+        await settings.save();
+    } catch (err) {
+        console.error('Error procesando webhook Central One:', err.message);
     }
 });
 
@@ -1302,40 +2306,99 @@ app.get('/api/store/bootstrap', async (req, res) => {
     }
 });
 
-// 1.5 Verificar ID de Jugador en el Paso 1 (Recargas por ID)
+// 1.5 Verificar ID de Jugador en el Paso 1 conectado en vivo a POST /api/v1/player/validate de Central One
 app.post('/api/orders/verify-player', async (req, res) => {
     try {
-        const { productSlug, playerUid, playerServer, playerRegion } = req.body;
+        const { productSlug, packageId, playerUid, playerServer, playerRegion } = req.body;
         if (!playerUid || String(playerUid).trim().length < 3) {
             return res.status(400).json({ error: 'Ingresa un ID de jugador válido.' });
         }
 
-        if (process.env.PROVIDER_VERIFY_URL && process.env.PROVIDER_API_KEY) {
-            try {
-                const resp = await axios.post(process.env.PROVIDER_VERIFY_URL, {
-                    api_key: process.env.PROVIDER_API_KEY,
-                    game: productSlug,
-                    uid: String(playerUid).trim(),
-                    server: playerServer || '',
-                    region: playerRegion || ''
-                }, { timeout: 8000 });
+        const headers = obtenerHeadersCentralOne();
+        if (headers && productSlug) {
+            const prodDB = await CatalogProduct.findOne({ slug: String(productSlug).trim().toLowerCase() }).lean();
+            const settings = await StoreSettings.findOne({ key: 'main_settings' }).select('centralOneCatalogCache').lean();
 
-                if (resp.data && resp.data.nickname) {
-                    return res.json({
-                        success: true,
-                        verified: true,
-                        nickname: resp.data.nickname,
-                        message: `✅ Cuenta verificada: ${resp.data.nickname}`
-                    });
+            if (prodDB) {
+                const listaPaq = (prodDB.useAltPricing && Array.isArray(prodDB.altPackages) && prodDB.altPackages.length > 0)
+                    ? prodDB.altPackages
+                    : (prodDB.packages || []);
+                const pkgElegido = (packageId && listaPaq.find(p => p.packageId === packageId)) ||
+                                   listaPaq.find(p => p.centralOneProductId || p.apiProductSku) ||
+                                   listaPaq[0];
+
+                let coProductId = pkgElegido ? (pkgElegido.centralOneProductId || '') : '';
+                let coCatItem = null;
+
+                if (settings && Array.isArray(settings.centralOneCatalogCache)) {
+                    if (coProductId) {
+                        coCatItem = settings.centralOneCatalogCache.find(x => x.product_id === coProductId);
+                    }
+                    if (!coCatItem && pkgElegido && pkgElegido.apiProductSku) {
+                        const skuClean = String(pkgElegido.apiProductSku).trim().toUpperCase();
+                        coCatItem = settings.centralOneCatalogCache.find(x => String(x.sku || '').trim().toUpperCase() === skuClean);
+                        if (coCatItem) coProductId = coCatItem.product_id;
+                    }
                 }
-            } catch (e) {}
+
+                if (coProductId && (!coCatItem || coCatItem.requires_target !== false)) {
+                    const targetFields = (coCatItem && Array.isArray(coCatItem.target_fields) && coCatItem.target_fields.length > 0)
+                        ? coCatItem.target_fields
+                        : ['player_id'];
+
+                    const targetPayload = {};
+                    targetFields.forEach((fieldKey, idx) => {
+                        const fkLower = String(fieldKey).toLowerCase();
+                        if (fkLower.includes('server') || fkLower.includes('zone') || fkLower.includes('region')) {
+                            targetPayload[fieldKey] = String(playerServer || playerRegion || '').trim();
+                        } else if (idx === 0 || fkLower.includes('player') || fkLower.includes('uid') || fkLower.includes('id')) {
+                            targetPayload[fieldKey] = String(playerUid).trim();
+                        } else {
+                            targetPayload[fieldKey] = String(playerServer || playerRegion || playerUid).trim();
+                        }
+                    });
+
+                    try {
+                        const respCO = await axios.post(`${CENTRAL_ONE_BASE_URL}/player/validate`, {
+                            product_id: coProductId,
+                            target_payload: targetPayload
+                        }, { headers, timeout: 9000 });
+
+                        const dataCO = respCO.data || {};
+                        if (dataCO.status === 'valid') {
+                            const nick = dataCO.player?.name || '';
+                            return res.json({
+                                success: true,
+                                status: 'valid',
+                                verified: true,
+                                nickname: nick,
+                                message: nick
+                                    ? `✅ Cuenta verificada: ${nick}`
+                                    : `✅ Cuenta verificada y activa en el servidor del juego.`
+                            });
+                        }
+
+                        if (dataCO.status === 'invalid') {
+                            return res.status(400).json({
+                                success: false,
+                                status: 'invalid',
+                                verified: false,
+                                error: '❌ El ID de jugador ingresado NO existe en este servidor/región. Corrígelo antes de continuar.'
+                            });
+                        }
+                    } catch (errVal) {
+                        // Si devuelve 429 o fallo temporal, continúa con validación permisiva para no trancar la venta
+                    }
+                }
+            }
         }
 
         return res.json({
             success: true,
+            status: 'unverified',
             verified: false,
             nickname: '',
-            message: 'ℹ️ No se puede verificar la cuenta en este juego, igualmente si escribió bien su ID, no habrá problemas.'
+            message: 'ℹ️ No se puede mostrar el apodo en este juego, igualmente si escribió bien su ID, su recarga llegará sin problemas.'
         });
     } catch (error) {
         return res.status(500).json({ error: 'Error al validar el ID.' });
@@ -2558,7 +3621,7 @@ app.get('/api/admin/overview', verificarSoloAdmin, async (req, res) => {
     }
 });
 
-// 2. Modificar Tasa Bs/USD, Portada Hero, Loot Relámpago, Filtros, Menús y Configuración General
+// 2. Modificar Tasa Bs/USD, Portada, Pool de Tarjetas Base del Algoritmo y Configuración General
 app.post('/api/admin/settings', verificarSoloAdmin, async (req, res) => {
     try {
         const {
@@ -2574,7 +3637,8 @@ app.post('/api/admin/settings', verificarSoloAdmin, async (req, res) => {
             flashOffers,
             catalogSectionConfig,
             navigationConfig,
-            flyersCanvaConfig
+            flyersCanvaConfig,
+            arbitrageBaseCards
         } = req.body;
 
         let settings = await StoreSettings.findOne({ key: 'main_settings' });
@@ -2608,16 +3672,56 @@ app.post('/api/admin/settings', verificarSoloAdmin, async (req, res) => {
             settings.flyersCanvaConfig = flyersCanvaConfig;
             settings.markModified('flyersCanvaConfig');
         }
+        if (Array.isArray(arbitrageBaseCards)) {
+            settings.arbitrageBaseCards = arbitrageBaseCards;
+            settings.markModified('arbitrageBaseCards');
+        }
         settings.updatedBy = req.adminUser.email;
 
         await settings.save();
-        return res.json({ success: true, settings });
+        await recalcularPreciosYAlgoritmoTiendaKZ(settings);
+        const productosActualizados = await CatalogProduct.find().sort({ sortOrder: 1 }).lean();
+
+        return res.json({ success: true, settings, products: productosActualizados });
     } catch (error) {
         return res.status(500).json({ error: 'Error guardando configuración de la tienda.' });
     }
 });
 
-// 3. Crear o Editar cualquier Juego, Gift Card o Servicio (Aislado por _id para jamás mezclar imágenes entre productos)
+// 2.5 Endpoints de Sincronización y Control del Monitor Central One API
+app.post('/api/admin/central-one/sync', verificarSoloAdmin, async (req, res) => {
+    try {
+        const resultado = await sincronizarTodoConCentralOne(true);
+        const [settings, products] = await Promise.all([
+            StoreSettings.findOne({ key: 'main_settings' }).lean(),
+            CatalogProduct.find().sort({ sortOrder: 1 }).lean()
+        ]);
+        return res.json({
+            success: resultado.success,
+            error: resultado.error || null,
+            settings,
+            products
+        });
+    } catch (e) {
+        return res.status(500).json({ error: 'Error sincronizando con Central One.' });
+    }
+});
+
+app.post('/api/admin/central-one/clear-alerts', verificarSoloAdmin, async (req, res) => {
+    try {
+        const settings = await StoreSettings.findOne({ key: 'main_settings' });
+        if (settings) {
+            settings.centralOneAlerts = [];
+            settings.markModified('centralOneAlerts');
+            await settings.save();
+        }
+        return res.json({ success: true });
+    } catch (e) {
+        return res.status(500).json({ error: 'Error limpiando alertas.' });
+    }
+});
+
+// 3. Crear o Editar cualquier Juego, Gift Card o Servicio (Con Ganancia Fija y Algoritmo de Códigos)
 app.post('/api/admin/product/save', verificarSoloAdmin, async (req, res) => {
     try {
         const { productId, originalSlug, _id, ...productData } = req.body;
@@ -2628,13 +3732,14 @@ app.post('/api/admin/product/save', verificarSoloAdmin, async (req, res) => {
         const slugNuevo = productData.slug.trim().toLowerCase().replace(/\s+/g, '-');
         const slugAnterior = (originalSlug || '').trim().toLowerCase();
 
-        // Campos explícitos de este producto para evitar que cualquier referencia cruzada afecte a otro documento
         const camposLimpios = {
             slug: slugNuevo,
             name: productData.name.trim(),
             mainCategory: productData.mainCategory,
             subCategory: productData.subCategory,
             fulfillmentType: productData.fulfillmentType || 'API_DIRECT_TOPUP',
+            isSmartCodeProduct: Boolean(productData.isSmartCodeProduct),
+            smartPlatformGroup: productData.smartPlatformGroup || 'steam',
             regionText: productData.regionText || '',
             badgeText: productData.badgeText || '',
             uidLabel: productData.uidLabel || 'ID de Jugador (UID)',
@@ -2666,11 +3771,8 @@ app.post('/api/admin/product/save', verificarSoloAdmin, async (req, res) => {
 
         let productoActualizado = null;
 
-        // CASO A: Editando un producto existente
         if (productoExistente) {
             const slugViejoReal = productoExistente.slug;
-
-            // Verificar que el nuevo slug no pertenezca a OTRO producto distinto
             const colision = await CatalogProduct.findOne({
                 slug: slugNuevo,
                 _id: { $ne: productoExistente._id }
@@ -2687,12 +3789,10 @@ app.post('/api/admin/product/save', verificarSoloAdmin, async (req, res) => {
                 { new: true }
             );
 
-            // Si cambió el Slug, actualizar referencias en Filtros, Menús y Loot Relámpago
             if (slugViejoReal && slugViejoReal !== slugNuevo) {
                 const settings = await StoreSettings.findOne({ key: 'main_settings' });
                 if (settings) {
                     let huboCambioSettings = false;
-
                     if (settings.catalogSectionConfig && Array.isArray(settings.catalogSectionConfig.pills)) {
                         settings.catalogSectionConfig.pills.forEach(pill => {
                             if (Array.isArray(pill.productSlugs)) {
@@ -2705,7 +3805,6 @@ app.post('/api/admin/product/save', verificarSoloAdmin, async (req, res) => {
                         });
                         if (huboCambioSettings) settings.markModified('catalogSectionConfig');
                     }
-
                     if (settings.navigationConfig && Array.isArray(settings.navigationConfig.menus)) {
                         settings.navigationConfig.menus.forEach(menu => {
                             (menu.submenus || []).forEach(sub => {
@@ -2720,7 +3819,6 @@ app.post('/api/admin/product/save', verificarSoloAdmin, async (req, res) => {
                         });
                         if (huboCambioSettings) settings.markModified('navigationConfig');
                     }
-
                     if (Array.isArray(settings.flashOffers)) {
                         settings.flashOffers.forEach(of => {
                             if (of.slug === slugViejoReal) {
@@ -2730,20 +3828,21 @@ app.post('/api/admin/product/save', verificarSoloAdmin, async (req, res) => {
                         });
                         if (huboCambioSettings) settings.markModified('flashOffers');
                     }
-
                     if (huboCambioSettings) await settings.save();
                 }
             }
         } else {
-            // CASO B: Creando un producto nuevo o guardando un producto Duplicado
             const yaExiste = await CatalogProduct.findOne({ slug: slugNuevo });
             if (yaExiste) {
                 return res.status(400).json({
-                    error: `El identificador "${slugNuevo}" ya está en uso por "${yaExiste.name}". Cambia el Slug para crear el nuevo producto sin sobrescribir el anterior.`
+                    error: `El identificador "${slugNuevo}" ya está en uso por "${yaExiste.name}". Cambia el Slug para crear el nuevo producto.`
                 });
             }
             productoActualizado = await new CatalogProduct(camposLimpios).save();
         }
+
+        await recalcularPreciosYAlgoritmoTiendaKZ();
+        productoActualizado = await CatalogProduct.findById(productoActualizado._id);
 
         return res.json({ success: true, product: productoActualizado });
     } catch (error) {
