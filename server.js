@@ -2301,11 +2301,12 @@ app.post('/api/reset-password', authLimiter, async (req, res) => {
 // 🏪 ENDPOINTS PÚBLICOS DE LA TIENDA KEM!ZONE (CATÁLOGO Y COMPRAS)
 // =================================================================
 
-// 1. Cargar toda la tienda inicial (Incluye estado activo y precios alternativos sin exponer costos ni bóvedas)
 app.get('/api/store/bootstrap', async (req, res) => {
     try {
         const [settings, products, paymentMethods] = await Promise.all([
-            StoreSettings.findOne({ key: 'main_settings' }).lean(),
+            StoreSettings.findOne({ key: 'main_settings' })
+                .select('-centralOneCatalogCache -centralOneCoverageCache -centralOneAlerts -processedWebhookIds')
+                .lean(),
             CatalogProduct.find()
                 .sort({ sortOrder: 1, createdAt: 1 })
                 .select('-packages.costUSD -packages.backupPinVault -altPackages.costUSD -altPackages.backupPinVault')
@@ -3739,7 +3740,7 @@ app.post('/api/admin/central-one/clear-alerts', verificarSoloAdmin, async (req, 
     }
 });
 
-// 3. Crear o Editar cualquier Juego, Gift Card o Servicio (Con Ganancia Fija y Algoritmo de Códigos)
+// 3. Crear o Editar cualquier Juego, Gift Card o Servicio (Guardado Ultrarrápido)
 app.post('/api/admin/product/save', verificarSoloAdmin, async (req, res) => {
     try {
         const { productId, originalSlug, _id, ...productData } = req.body;
@@ -3749,6 +3750,23 @@ app.post('/api/admin/product/save', verificarSoloAdmin, async (req, res) => {
 
         const slugNuevo = productData.slug.trim().toLowerCase().replace(/\s+/g, '-');
         const slugAnterior = (originalSlug || '').trim().toLowerCase();
+
+        // Asegurar cálculo exacto de Venta = Costo + Ganancia Fija en memoria (0ms) sin descargar los 5,156 productos
+        const normalizarListaPaquetesRapido = (lista) => {
+            if (!Array.isArray(lista)) return [];
+            return lista.map(pkg => {
+                const cUsd = Number(pkg.costUSD || 0);
+                if (pkg.autoPriceByProfit !== false && cUsd > 0) {
+                    const prof = pkg.profitUSD !== undefined && pkg.profitUSD !== null
+                        ? Number(pkg.profitUSD)
+                        : Math.max(0.15, Number(((pkg.priceUSD || 1) - cUsd).toFixed(2)));
+                    pkg.profitUSD = Number(prof.toFixed(2));
+                    pkg.priceUSD = Number((cUsd + pkg.profitUSD).toFixed(2));
+                    pkg.tokemsPrice = pkg.priceUSD;
+                }
+                return pkg;
+            });
+        };
 
         const camposLimpios = {
             slug: slugNuevo,
@@ -3775,92 +3793,123 @@ app.post('/api/admin/product/save', verificarSoloAdmin, async (req, res) => {
             useAltPricing: Boolean(productData.useAltPricing),
             altDescription: productData.altDescription !== undefined ? String(productData.altDescription) : '',
             altInstructions: productData.altInstructions !== undefined ? String(productData.altInstructions) : '',
-            packages: Array.isArray(productData.packages) ? productData.packages : [],
-            altPackages: Array.isArray(productData.altPackages) ? productData.altPackages : []
+            packages: normalizarListaPaquetesRapido(productData.packages),
+            altPackages: normalizarListaPaquetesRapido(productData.altPackages)
         };
 
         let productoExistente = null;
         if (productId && mongoose.Types.ObjectId.isValid(productId)) {
-            productoExistente = await CatalogProduct.findById(productId);
+            productoExistente = await CatalogProduct.findById(productId).select('_id slug name').lean();
         }
         if (!productoExistente && slugAnterior) {
-            productoExistente = await CatalogProduct.findOne({ slug: slugAnterior });
+            productoExistente = await CatalogProduct.findOne({ slug: slugAnterior }).select('_id slug name').lean();
         }
 
         let productoActualizado = null;
 
         if (productoExistente) {
             const slugViejoReal = productoExistente.slug;
-            const colision = await CatalogProduct.findOne({
-                slug: slugNuevo,
-                _id: { $ne: productoExistente._id }
-            });
-            if (colision) {
-                return res.status(400).json({
-                    error: `Ya existe otro producto ("${colision.name}") usando el identificador "${slugNuevo}". Elige un Slug diferente.`
-                });
+            if (slugViejoReal !== slugNuevo) {
+                const colision = await CatalogProduct.findOne({
+                    slug: slugNuevo,
+                    _id: { $ne: productoExistente._id }
+                }).select('_id name').lean();
+                if (colision) {
+                    return res.status(400).json({
+                        error: `Ya existe otro producto ("${colision.name}") usando el identificador "${slugNuevo}". Elige un Slug diferente.`
+                    });
+                }
             }
 
             productoActualizado = await CatalogProduct.findByIdAndUpdate(
                 productoExistente._id,
                 { $set: camposLimpios },
                 { new: true }
-            );
+            ).lean();
 
-            if (slugViejoReal && slugViejoReal !== slugNuevo) {
-                const settings = await StoreSettings.findOne({ key: 'main_settings' });
-                if (settings) {
+            // Actualizar referencias en segundo plano (sin bloquear la respuesta al navegador)
+            setImmediate(async () => {
+                try {
+                    const settings = await StoreSettings.findOne({ key: 'main_settings' })
+                        .select('catalogSectionConfig navigationConfig flashOffers flyersCanvaConfig');
+                    if (!settings) return;
                     let huboCambioSettings = false;
-                    if (settings.catalogSectionConfig && Array.isArray(settings.catalogSectionConfig.pills)) {
-                        settings.catalogSectionConfig.pills.forEach(pill => {
-                            if (Array.isArray(pill.productSlugs)) {
-                                const idx = pill.productSlugs.indexOf(slugViejoReal);
-                                if (idx !== -1) {
-                                    pill.productSlugs[idx] = slugNuevo;
-                                    huboCambioSettings = true;
-                                }
-                            }
-                        });
-                        if (huboCambioSettings) settings.markModified('catalogSectionConfig');
-                    }
-                    if (settings.navigationConfig && Array.isArray(settings.navigationConfig.menus)) {
-                        settings.navigationConfig.menus.forEach(menu => {
-                            (menu.submenus || []).forEach(sub => {
-                                if (Array.isArray(sub.productSlugs)) {
-                                    const idx = sub.productSlugs.indexOf(slugViejoReal);
+
+                    if (slugViejoReal && slugViejoReal !== slugNuevo) {
+                        if (settings.catalogSectionConfig && Array.isArray(settings.catalogSectionConfig.pills)) {
+                            settings.catalogSectionConfig.pills.forEach(pill => {
+                                if (Array.isArray(pill.productSlugs)) {
+                                    const idx = pill.productSlugs.indexOf(slugViejoReal);
                                     if (idx !== -1) {
-                                        sub.productSlugs[idx] = slugNuevo;
+                                        pill.productSlugs[idx] = slugNuevo;
                                         huboCambioSettings = true;
                                     }
                                 }
                             });
-                        });
-                        if (huboCambioSettings) settings.markModified('navigationConfig');
+                            if (huboCambioSettings) settings.markModified('catalogSectionConfig');
+                        }
+                        if (settings.navigationConfig && Array.isArray(settings.navigationConfig.menus)) {
+                            settings.navigationConfig.menus.forEach(menu => {
+                                (menu.submenus || []).forEach(sub => {
+                                    if (Array.isArray(sub.productSlugs)) {
+                                        const idx = sub.productSlugs.indexOf(slugViejoReal);
+                                        if (idx !== -1) {
+                                            sub.productSlugs[idx] = slugNuevo;
+                                            huboCambioSettings = true;
+                                        }
+                                    }
+                                });
+                            });
+                            if (huboCambioSettings) settings.markModified('navigationConfig');
+                        }
+                        if (Array.isArray(settings.flashOffers)) {
+                            settings.flashOffers.forEach(of => {
+                                if (of.slug === slugViejoReal) {
+                                    of.slug = slugNuevo;
+                                    huboCambioSettings = true;
+                                }
+                            });
+                            if (huboCambioSettings) settings.markModified('flashOffers');
+                        }
                     }
-                    if (Array.isArray(settings.flashOffers)) {
-                        settings.flashOffers.forEach(of => {
-                            if (of.slug === slugViejoReal) {
-                                of.slug = slugNuevo;
-                                huboCambioSettings = true;
-                            }
+
+                    // Sincronizar precios de este producto en Flyers Canva en segundo plano
+                    if (settings.flyersCanvaConfig && typeof settings.flyersCanvaConfig === 'object') {
+                        const listaActiva = (camposLimpios.useAltPricing && camposLimpios.altPackages.length > 0)
+                            ? camposLimpios.altPackages
+                            : camposLimpios.packages;
+                        const mapaPrecios = {};
+                        listaActiva.forEach(pk => {
+                            mapaPrecios[`${slugNuevo}::${pk.packageId}`] = Number(pk.priceUSD || 0).toFixed(2);
                         });
-                        if (huboCambioSettings) settings.markModified('flashOffers');
+                        let flyersMod = false;
+                        Object.values(settings.flyersCanvaConfig).forEach(ficha => {
+                            (ficha.items || []).forEach(itm => {
+                                if (itm.linkedRef && mapaPrecios[itm.linkedRef] && itm.price !== mapaPrecios[itm.linkedRef]) {
+                                    itm.price = mapaPrecios[itm.linkedRef];
+                                    flyersMod = true;
+                                }
+                            });
+                        });
+                        if (flyersMod) {
+                            settings.markModified('flyersCanvaConfig');
+                            huboCambioSettings = true;
+                        }
                     }
+
                     if (huboCambioSettings) await settings.save();
-                }
-            }
+                } catch (e) {}
+            });
         } else {
-            const yaExiste = await CatalogProduct.findOne({ slug: slugNuevo });
+            const yaExiste = await CatalogProduct.findOne({ slug: slugNuevo }).select('_id name').lean();
             if (yaExiste) {
                 return res.status(400).json({
                     error: `El identificador "${slugNuevo}" ya está en uso por "${yaExiste.name}". Cambia el Slug para crear el nuevo producto.`
                 });
             }
-            productoActualizado = await new CatalogProduct(camposLimpios).save();
+            const docCreado = await new CatalogProduct(camposLimpios).save();
+            productoActualizado = docCreado.toObject();
         }
-
-        await recalcularPreciosYAlgoritmoTiendaKZ(null, slugNuevo);
-        productoActualizado = await CatalogProduct.findById(productoActualizado._id).lean();
 
         return res.json({ success: true, product: productoActualizado });
     } catch (error) {
