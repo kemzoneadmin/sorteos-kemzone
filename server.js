@@ -1043,8 +1043,7 @@ function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, ba
     return solucionesValidas[0];
 }
 
-// 🔄 RECALCULADOR GLOBAL DE PRECIOS POR GANANCIA FIJA + ALGORITMO + FLYERS CANVA
-async function recalcularPreciosYAlgoritmoTiendaKZ(settingsDoc = null) {
+async function recalcularPreciosYAlgoritmoTiendaKZ(settingsDoc = null, targetSlugOnly = null) {
     try {
         if (!settingsDoc) settingsDoc = await StoreSettings.findOne({ key: 'main_settings' });
         if (!settingsDoc) return;
@@ -1052,14 +1051,17 @@ async function recalcularPreciosYAlgoritmoTiendaKZ(settingsDoc = null) {
         const catalogoCO = Array.isArray(settingsDoc.centralOneCatalogCache) ? settingsDoc.centralOneCatalogCache : [];
         const mapaCO_PorId = {};
         const mapaCO_PorSku = {};
-        catalogoCO.forEach(item => {
+        for (let i = 0; i < catalogoCO.length; i++) {
+            const item = catalogoCO[i];
             if (item.product_id) mapaCO_PorId[item.product_id] = item;
             if (item.sku) mapaCO_PorSku[String(item.sku).trim().toUpperCase()] = item;
-        });
+        }
 
         // 1. Actualizar costos y stock de las Tarjetas Base del Pool de Arbitraje
         let huboCambioPool = false;
-        (settingsDoc.arbitrageBaseCards || []).forEach(card => {
+        const poolCards = settingsDoc.arbitrageBaseCards || [];
+        for (let i = 0; i < poolCards.length; i++) {
+            const card = poolCards[i];
             const effUsd = Number(((Number(card.faceValueOrigin) || 0) * (Number(card.conversionRateToUSD) || 0)).toFixed(4));
             if (effUsd > 0 && card.effectiveClientUSD !== effUsd) {
                 card.effectiveClientUSD = effUsd;
@@ -1081,12 +1083,14 @@ async function recalcularPreciosYAlgoritmoTiendaKZ(settingsDoc = null) {
                 }
                 card.availableStock = itemCO.available_stock !== undefined ? itemCO.available_stock : null;
             }
-        });
+        }
         if (huboCambioPool) settingsDoc.markModified('arbitrageBaseCards');
 
-        // 2. Recorrer todos los productos de la tienda y recalcular sus paquetes (Principales y Alternativos)
-        const productos = await CatalogProduct.find();
+        // 2. Recorrer solo el producto editado (si se indicó targetSlugOnly) o todos en paralelo
+        const filtroProd = targetSlugOnly ? { slug: String(targetSlugOnly).trim().toLowerCase() } : {};
+        const productos = await CatalogProduct.find(filtroProd);
         const mapaPreciosParaFlyers = {};
+        const promesasGuardadoProd = [];
 
         for (const prod of productos) {
             let prodModificado = false;
@@ -1108,9 +1112,16 @@ async function recalcularPreciosYAlgoritmoTiendaKZ(settingsDoc = null) {
                         pkg.resolvedCombo = combo;
 
                         if (combo.hasSolution) {
-                            pkg.costUSD = Number(combo.totalCostUSD.toFixed(4));
-                            pkg.providerInStock = true;
+                            if (Math.abs((pkg.costUSD || 0) - Number(combo.totalCostUSD.toFixed(4))) > 0.0001) {
+                                pkg.costUSD = Number(combo.totalCostUSD.toFixed(4));
+                                prodModificado = true;
+                            }
+                            if (pkg.providerInStock !== true) {
+                                pkg.providerInStock = true;
+                                prodModificado = true;
+                            }
                             if (prevSummary && prevSummary !== combo.summaryText) {
+                                prodModificado = true;
                                 await registrarAlertaCentralOne(settingsDoc, {
                                     type: 'ALGO_FALLBACK',
                                     severity: 'WARN',
@@ -1119,9 +1130,13 @@ async function recalcularPreciosYAlgoritmoTiendaKZ(settingsDoc = null) {
                                 });
                             }
                         } else {
-                            pkg.providerInStock = false;
+                            if (pkg.providerInStock !== false) {
+                                pkg.providerInStock = false;
+                                prodModificado = true;
+                            }
                             if (prevSummary !== 'SIN_SOLUCION') {
                                 pkg.resolvedCombo = { ...combo, summaryText: 'SIN_SOLUCION' };
+                                prodModificado = true;
                                 await registrarAlertaCentralOne(settingsDoc, {
                                     type: 'ALGO_NO_SOLUTION',
                                     severity: 'CRIT',
@@ -1130,9 +1145,7 @@ async function recalcularPreciosYAlgoritmoTiendaKZ(settingsDoc = null) {
                                 });
                             }
                         }
-                        prodModificado = true;
                     } else {
-                        // Paquete directo vinculado a Central One por UUID o SKU
                         const itemCO = (pkg.centralOneProductId && mapaCO_PorId[pkg.centralOneProductId]) ||
                                        (pkg.apiProductSku && mapaCO_PorSku[String(pkg.apiProductSku).trim().toUpperCase()]);
                         if (itemCO) {
@@ -1152,7 +1165,6 @@ async function recalcularPreciosYAlgoritmoTiendaKZ(settingsDoc = null) {
                         }
                     }
 
-                    // 💰 REGLA DE ORO: Si usa Ganancia Fija ($ USD), Venta = Costo + Ganancia automáticamente
                     if (pkg.autoPriceByProfit !== false && Number(pkg.costUSD) > 0) {
                         const gananciaDeseada = pkg.profitUSD !== undefined && pkg.profitUSD !== null
                             ? Number(pkg.profitUSD)
@@ -1174,21 +1186,25 @@ async function recalcularPreciosYAlgoritmoTiendaKZ(settingsDoc = null) {
             if (prodModificado) {
                 prod.markModified('packages');
                 prod.markModified('altPackages');
-                await prod.save();
+                promesasGuardadoProd.push(prod.save());
             }
 
-            // Registrar precios activos para actualizar Flyers Canva en la nube automáticamente
             const listaActiva = (prod.useAltPricing && Array.isArray(prod.altPackages) && prod.altPackages.length > 0)
                 ? prod.altPackages
                 : (prod.packages || []);
-            listaActiva.forEach(pk => {
+            for (let k = 0; k < listaActiva.length; k++) {
+                const pk = listaActiva[k];
                 mapaPreciosParaFlyers[`${prod.slug}::${pk.packageId}`] = Number(pk.priceUSD || 0).toFixed(2);
-            });
+            }
         }
 
-        // 3. Actualizar automáticamente los Flyers Canva guardados en MongoDB cuando cambia un precio
+        if (promesasGuardadoProd.length > 0) {
+            await Promise.all(promesasGuardadoProd);
+        }
+
+        // 3. Actualizar automáticamente los Flyers Canva guardados en MongoDB solo si cambió algún precio vinculado
+        let flyersModificados = false;
         if (settingsDoc.flyersCanvaConfig && typeof settingsDoc.flyersCanvaConfig === 'object') {
-            let flyersModificados = false;
             Object.values(settingsDoc.flyersCanvaConfig).forEach(ficha => {
                 (ficha.items || []).forEach(itm => {
                     if (itm.linkedRef && mapaPreciosParaFlyers[itm.linkedRef]) {
@@ -1204,7 +1220,9 @@ async function recalcularPreciosYAlgoritmoTiendaKZ(settingsDoc = null) {
             }
         }
 
-        await settingsDoc.save();
+        if (huboCambioPool || flyersModificados || !targetSlugOnly) {
+            await settingsDoc.save();
+        }
     } catch (err) {
         console.error('Aviso recalculando precios y algoritmo:', err.message);
     }
@@ -3841,8 +3859,8 @@ app.post('/api/admin/product/save', verificarSoloAdmin, async (req, res) => {
             productoActualizado = await new CatalogProduct(camposLimpios).save();
         }
 
-        await recalcularPreciosYAlgoritmoTiendaKZ();
-        productoActualizado = await CatalogProduct.findById(productoActualizado._id);
+        await recalcularPreciosYAlgoritmoTiendaKZ(null, slugNuevo);
+        productoActualizado = await CatalogProduct.findById(productoActualizado._id).lean();
 
         return res.json({ success: true, product: productoActualizado });
     } catch (error) {
