@@ -1072,17 +1072,16 @@ Order.schema.add({
     algoExecutionState: { type: mongoose.Schema.Types.Mixed, default: null }
 });
 
-// 📏 Escala Exponencial Humana en el Servidor
 function obtenerLimiteHumanoCodigosServer(metaUSD) {
     const m = Number(metaUSD) || 0;
     if (m <= 3.00) return { max: 2, ideal: 1 };
-    if (m <= 6.00) return { max: 3, ideal: 2 };
-    if (m <= 12.00) return { max: 4, ideal: 2 };
-    if (m <= 22.00) return { max: 5, ideal: 3 };
-    if (m <= 35.00) return { max: 7, ideal: 4 };
-    if (m <= 60.00) return { max: 9, ideal: 5 };
-    if (m <= 105.00) return { max: 12, ideal: 6 };
-    return { max: 14, ideal: 7 };
+    if (m <= 6.00) return { max: 2, ideal: 2 };
+    if (m <= 12.00) return { max: 3, ideal: 2 };
+    if (m <= 25.00) return { max: 4, ideal: 3 };
+    if (m <= 40.00) return { max: 5, ideal: 3 };
+    if (m <= 60.00) return { max: 6, ideal: 4 };
+    if (m <= 105.00) return { max: 8, ideal: 5 };
+    return { max: 10, ideal: 6 };
 }
 
 function extraerMetaUsdDeNombrePaqueteServer(pkg) {
@@ -1121,7 +1120,7 @@ function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, ba
 
         let effUsd = Number(c.effectiveClientUSD);
         if (!effUsd || effUsd <= 0) {
-            effUsd = Number(((Number(c.faceValueOrigin) || 0) * (Number(c.conversionRateToUSD) || 0)).toFixed(4));
+            effUsd = Number(((Number(c.faceValueOrigin) || 0) * (Number(cc.conversionRateToUSD) || 0)).toFixed(4));
         }
         let costoReal = Number(c.costUSD || 0);
         let enStockReal = c.inStock !== false;
@@ -1167,7 +1166,7 @@ function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, ba
 
     const { max: maxCartasHumano } = obtenerLimiteHumanoCodigosServer(metaUSD);
 
-    // Si la meta es grande (>= $10 USD) y hay tarjetas grandes, descartar micro-tarjetas para cálculo instantáneo
+    // Si la meta es grande (>= $10 USD) y hay tarjetas medianas/grandes, excluir micro-tarjetas para evitar combinaciones de demasiados códigos
     if (metaUSD >= 10) {
         const umbralMinTarjeta = (metaUSD / maxCartasHumano) * 0.45;
         const candidatasGrandes = candidatas.filter(c => c.effectiveClientUSD >= umbralMinTarjeta);
@@ -1176,12 +1175,12 @@ function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, ba
         }
     }
 
-    // Ordenar de MAYOR a MENOR denominación primero
+    // Ordenar primero por mejor rentabilidad (menor costo por dólar entregado) y luego por denominación mayor
     candidatas.sort((a, b) => {
-        if (Math.abs(b.effectiveClientUSD - a.effectiveClientUSD) > 0.05) {
-            return b.effectiveClientUSD - a.effectiveClientUSD;
+        if (Math.abs(a.costPerDollar - b.costPerDollar) > 0.015) {
+            return a.costPerDollar - b.costPerDollar;
         }
-        return a.costPerDollar - b.costPerDollar;
+        return b.effectiveClientUSD - a.effectiveClientUSD;
     });
 
     const n = candidatas.length;
@@ -1192,23 +1191,31 @@ function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, ba
     if (minimoCodigosNecesarios > maxCartasHumano) {
         return {
             hasSolution: false,
-            reason: `Se requerirían ${minimoCodigosNecesarios} códigos (máx. recomendado para $${metaUSD.toFixed(0)} USD: ${maxCartasHumano} códigos). Agrega una tarjeta de mayor denominación en la Bóveda.`
+            reason: `Se requerirían ${minimoCodigosNecesarios} códigos (máx. permitido para $${metaUSD.toFixed(0)} USD: ${maxCartasHumano} códigos). Agrega una tarjeta de mayor denominación en la Bóveda.`
         };
     }
 
-    // 🔒 REGLA SAGRADA: NUNCA estar por debajo de metaUSD (solo -0.001 por redondeo flotante JS)
+    // 🔒 REGLA #1: NUNCA estar por debajo de metaUSD
     const pisoMinimoUSD = Number((metaUSD - 0.001).toFixed(4));
     const techoMaximoUSD = metaUSD <= 3.50
         ? Math.max(metaUSD * 1.85, menorCartaUSD * 2.05)
         : (metaUSD <= 15 ? (metaUSD * 1.35) : (metaUSD + Math.max(8.0, metaUSD * 0.25)));
 
+    const mejorRatioCosto = Math.min(...candidatas.map(c => c.costPerDollar));
+    const maxCartaGlobalPorIndice = new Array(n);
+    let maxRunning = 0;
+    for (let i = n - 1; i >= 0; i--) {
+        if (candidatas[i].effectiveClientUSD > maxRunning) maxRunning = candidatas[i].effectiveClientUSD;
+        maxCartaGlobalPorIndice[i] = maxRunning;
+    }
+
     const solucionesValidas = [];
-    let mejorExcesoHallado = Infinity;
+    let mejorCostoHalladoMicro = Infinity;
     let nodosExplorados = 0;
 
     function explorar(startIndex, cartasUsadas, conteoPorIndice, sumaClienteUSD, sumaCostoMicro) {
         nodosExplorados++;
-        if (nodosExplorados > 750) return;
+        if (nodosExplorados > 1200) return;
 
         const sumaRedondeada = Number(sumaClienteUSD.toFixed(2));
         if (cartasUsadas > 0 && sumaRedondeada >= pisoMinimoUSD && sumaRedondeada <= techoMaximoUSD) {
@@ -1230,8 +1237,10 @@ function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, ba
                 etiquetas.push(`${qty}x ${card.name} ($${(card.effectiveClientUSD * qty).toFixed(2)})`);
             });
 
-            if (diffMeta < mejorExcesoHallado) {
-                mejorExcesoHallado = diffMeta;
+            // Penalización mínima ($0.015 por tarjeta extra) solo para desempatar si dos combos cuestan exactamente igual
+            const scoreBeneficioMicro = sumaCostoMicro + ((cartasUsadas - 1) * 150);
+            if (scoreBeneficioMicro < mejorCostoHalladoMicro) {
+                mejorCostoHalladoMicro = scoreBeneficioMicro;
             }
 
             solucionesValidas.push({
@@ -1240,6 +1249,7 @@ function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, ba
                 totalClientUSD: sumaRedondeada,
                 totalCostUSD: deMicro4(sumaCostoMicro),
                 totalCostMicro: sumaCostoMicro,
+                scoreBeneficioMicro,
                 bonusClientUSD: diffMeta,
                 overshootUSD: diffMeta,
                 summaryText: etiquetas.join(' + '),
@@ -1250,10 +1260,16 @@ function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, ba
 
         if (cartasUsadas >= maxCartasHumano) return;
 
-        const maxCartaRestanteUSD = candidatas[startIndex] ? candidatas[startIndex].effectiveClientUSD : mayorCartaUSD;
+        const maxCartaRestanteUSD = maxCartaGlobalPorIndice[startIndex] || mayorCartaUSD;
         const faltaUSD = Math.max(0, pisoMinimoUSD - sumaClienteUSD);
         const minCartasFaltantes = Math.ceil(faltaUSD / Math.max(0.1, maxCartaRestanteUSD));
         if (cartasUsadas + minCartasFaltantes > maxCartasHumano) return;
+
+        // Poda por costo: si lo que ya cuesta + el mínimo costo posible para llegar a la meta supera la mejor opción hallada, cortar rama
+        const costoMinimoFaltanteMicro = Math.round(faltaUSD * mejorRatioCosto * 10000);
+        if (sumaCostoMicro + costoMinimoFaltanteMicro > mejorCostoHalladoMicro + 1500) {
+            return;
+        }
 
         for (let i = startIndex; i < n; i++) {
             const card = candidatas[i];
@@ -1263,10 +1279,6 @@ function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, ba
             }
             const nuevaSuma = Number((sumaClienteUSD + Number(card.effectiveClientUSD)).toFixed(4));
             if (nuevaSuma > techoMaximoUSD) {
-                continue;
-            }
-            // Si ya encontramos una solución exacta o muy cercana, no explorar ramas que se pasen por mucho más
-            if (nuevaSuma > metaUSD && (nuevaSuma - metaUSD) > (mejorExcesoHallado + 1.50)) {
                 continue;
             }
             const nuevoConteo = { ...conteoPorIndice, [i]: yaUsadasDeEsta + 1 };
@@ -1289,15 +1301,15 @@ function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, ba
         };
     }
 
-    // Prioridad: 1) Pasarse lo mínimo posible de la meta (o dar la meta exacta), 2) Menor cantidad de códigos, 3) Menor costo
+    // 🏆 PRIORIDAD: 1) MENOR COSTO PARA TI (Tu Beneficio), 2) Menos tarjetas en caso de empate de costo, 3) Menor exceso sobre la meta
     solucionesValidas.sort((a, b) => {
-        if (Math.abs(a.overshootUSD - b.overshootUSD) > 0.05) {
-            return a.overshootUSD - b.overshootUSD;
+        if (Math.abs(a.scoreBeneficioMicro - b.scoreBeneficioMicro) > 100) {
+            return a.scoreBeneficioMicro - b.scoreBeneficioMicro;
         }
         if (a.totalCards !== b.totalCards) {
             return a.totalCards - b.totalCards;
         }
-        return a.totalCostMicro - b.totalCostMicro;
+        return a.overshootUSD - b.overshootUSD;
     });
 
     return solucionesValidas[0];
