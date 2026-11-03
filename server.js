@@ -4361,7 +4361,15 @@ app.post('/api/admin/settings', verificarSoloAdmin, async (req, res) => {
             arbitrageBaseCards
         } = req.body;
 
-        let settings = await StoreSettings.findOne({ key: 'main_settings' });
+        const requiereRecalculoAlgoritmo = Array.isArray(arbitrageBaseCards);
+
+        // Si no estamos recalculando el pool con el caché de Central One, no cargamos los +5,000 SKUs de MongoDB
+        let querySettings = StoreSettings.findOne({ key: 'main_settings' });
+        if (!requiereRecalculoAlgoritmo) {
+            querySettings = querySettings.select('-centralOneCatalogCache -centralOneCoverageCache -processedWebhookIds');
+        }
+
+        let settings = await querySettings;
         if (!settings) settings = new StoreSettings({ key: 'main_settings' });
 
         if (exchangeRateVES !== undefined) settings.exchangeRateVES = Number(exchangeRateVES);
@@ -4398,11 +4406,26 @@ app.post('/api/admin/settings', verificarSoloAdmin, async (req, res) => {
         }
         settings.updatedBy = req.adminUser.email;
 
-        await settings.save();
-        await recalcularPreciosYAlgoritmoTiendaKZ(settings);
-        const productosActualizados = await CatalogProduct.find().sort({ sortOrder: 1 }).lean();
+        let productosActualizados = undefined;
+        if (requiereRecalculoAlgoritmo) {
+            // recalcularPreciosYAlgoritmoTiendaKZ ya ejecuta settings.save() una sola vez al finalizar
+            await recalcularPreciosYAlgoritmoTiendaKZ(settings);
+            productosActualizados = await CatalogProduct.find().sort({ sortOrder: 1 }).lean();
+        } else {
+            await settings.save();
+        }
 
-        return res.json({ success: true, settings, products: productosActualizados });
+        // Enviar respuesta ligera al navegador (sin reenviar los Megabytes de centralOneCatalogCache)
+        const settingsLigero = settings.toObject ? settings.toObject() : { ...settings };
+        delete settingsLigero.centralOneCatalogCache;
+        delete settingsLigero.centralOneCoverageCache;
+        delete settingsLigero.processedWebhookIds;
+
+        return res.json({
+            success: true,
+            settings: settingsLigero,
+            ...(productosActualizados ? { products: productosActualizados } : {})
+        });
     } catch (error) {
         return res.status(500).json({ error: 'Error guardando configuración de la tienda.' });
     }
