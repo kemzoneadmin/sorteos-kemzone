@@ -272,7 +272,7 @@ const StoreSettingsSchema = new mongoose.Schema({
     navigationConfig: { type: mongoose.Schema.Types.Mixed, default: null },
     flyersCanvaConfig: { type: mongoose.Schema.Types.Mixed, default: null },
 
-    // 🧠 BÓVEDA DE TARJETAS BASE DEL PROVEEDOR PARA EL ALGORITMO DE CÓDIGOS (STEAM, PSN, NINTENDO, ETC.)
+// 🧠 BÓVEDA DE TARJETAS BASE DEL PROVEEDOR PARA EL ALGORITMO DE CÓDIGOS (STEAM, PSN, NINTENDO, ETC.)
     arbitrageBaseCards: [{
         cardId: { type: String, required: true },
         platformGroup: { type: String, default: 'steam' }, // 'steam', 'playstation', 'nintendo', 'xbox', 'roblox', 'otro'
@@ -284,7 +284,8 @@ const StoreSettingsSchema = new mongoose.Schema({
         conversionRateToUSD: { type: Number, default: 0.000039 }, // Ej: 0.000039 USD por 1 VND
         effectiveClientUSD: { type: Number, default: 5.17 }, // Lo que realmente recibe el cliente en USD ($5.17)
         costUSD: { type: Number, default: 4.20 },          // Precio revendedor Central One (4 decimales)
-        minProfitUSD: { type: Number, default: 0.50 },     // Ganancia mínima si se vende individual
+        minProfitUSD: { type: Number, default: 0 },        // Ganancia mínima opcional
+        internalCodeStock: [{ type: String }],             // Códigos recuperados listos para reusar
         inStock: { type: Boolean, default: true },
         availableStock: { type: Number, default: null },
         active: { type: Boolean, default: true },
@@ -1062,28 +1063,7 @@ async function registrarAlertaCentralOne(settingsDoc, alertaObj, mapaVinculadosP
     } catch (e) {}
 }
 
-// Extender esquemas con soporte para Stock Interno Recuperado, Reloj de 30 Minutos y Estado Paso a Paso del Algoritmo
-StoreSettings.schema.add({
-    arbitrageBaseCards: [{
-        cardId: { type: String, required: true },
-        platformGroup: { type: String, default: 'steam' },
-        name: { type: String, required: true },
-        centralOneProductId: { type: String, default: '' },
-        centralOneSku: { type: String, default: '' },
-        faceValueOrigin: { type: Number, default: 10 },
-        originCurrency: { type: String, default: 'VND' },
-        conversionRateToUSD: { type: Number, default: 0.000039 },
-        effectiveClientUSD: { type: Number, default: 5.17 },
-        costUSD: { type: Number, default: 4.20 },
-        minProfitUSD: { type: Number, default: 0 },
-        internalCodeStock: [{ type: String }], // 🏦 Códigos recuperados listos para reusar
-        inStock: { type: Boolean, default: true },
-        availableStock: { type: Number, default: null },
-        active: { type: Boolean, default: true },
-        lastPriceUpdateAt: { type: Date, default: null }
-    }]
-});
-
+// Extender esquema de Órdenes con soporte para Reloj de 30 Minutos y Estado Paso a Paso del Algoritmo
 Order.schema.add({
     timerStartedAt: { type: Date, default: Date.now },
     clientChoseToWait: { type: Boolean, default: false },
@@ -1103,6 +1083,18 @@ function obtenerLimiteHumanoCodigosServer(metaUSD) {
     if (m <= 60.00) return { max: 9, ideal: 5 };
     if (m <= 105.00) return { max: 12, ideal: 6 };
     return { max: 14, ideal: 7 };
+}
+
+function extraerMetaUsdDeNombrePaqueteServer(pkg) {
+    if (!pkg) return 0;
+    if (Number(pkg.targetClientUSD) > 0) return Number(pkg.targetClientUSD);
+    const nombre = String(pkg.name || '').trim().replace(/(\d)[,.](\d{3})(?!\d)/g, '$1$2');
+    const match = nombre.match(/(\d+(?:[.,]\d+)?)/);
+    if (match) {
+        const val = parseFloat(match[1].replace(',', '.'));
+        if (!isNaN(val) && val > 0) return val;
+    }
+    return 0;
 }
 
 function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, baseCardsPool, catalogCache = null, excludedCardIds = []) {
@@ -1143,7 +1135,7 @@ function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, ba
                 enStockReal = false;
             } else {
                 enStockReal = Boolean(itemCO.in_stock && itemCO.status === 'active');
-                if (itemCO.reseller_price !== null && Number(itemCO.reseller_price) > 0) {
+                if ((!costoReal || costoReal <= 0) && itemCO.reseller_price !== null && Number(itemCO.reseller_price) > 0) {
                     costoReal = Number(itemCO.reseller_price);
                 }
                 if (itemCO.available_stock !== undefined && itemCO.available_stock !== null) {
@@ -1332,7 +1324,6 @@ async function guardarCodigosRecuperadosEnStockInterno(ordenDB, listaObjetosCodi
             if (guardadosCount > 0) settings.markModified('arbitrageBaseCards');
         }
 
-        // Si era un paquete estándar con bóveda local, guardarlo en backupPinVault
         if (guardadosCount === 0 && Array.isArray(codigosPlanos) && codigosPlanos.length > 0 && ordenDB) {
             const prodDB = await CatalogProduct.findOne({ slug: ordenDB.productSlug });
             if (prodDB) {
@@ -1367,7 +1358,7 @@ async function guardarCodigosRecuperadosEnStockInterno(ordenDB, listaObjetosCodi
 }
 
 // 🔄 RECALCULADOR GLOBAL DE PRECIOS POR GANANCIA FIJA + ALGORITMO + FLYERS CANVA
-async function recalcularPreciosYAlgoritmoTiendaKZ(settingsDoc = null, targetSlugOnly = null) {
+async function recalcularPreciosYAlgoritmoTiendaKZ(settingsDoc = null, targetSlugOnly = null, desdeSyncAPI = false) {
     try {
         if (!settingsDoc) settingsDoc = await StoreSettings.findOne({ key: 'main_settings' });
         if (!settingsDoc) return;
@@ -1385,10 +1376,13 @@ async function recalcularPreciosYAlgoritmoTiendaKZ(settingsDoc = null, targetSlu
         const poolCards = settingsDoc.arbitrageBaseCards || [];
         for (let i = 0; i < poolCards.length; i++) {
             const card = poolCards[i];
-            const effUsd = Number(((Number(card.faceValueOrigin) || 0) * (Number(card.conversionRateToUSD) || 0)).toFixed(4));
-            if (effUsd > 0 && card.effectiveClientUSD !== effUsd) {
-                card.effectiveClientUSD = effUsd;
-                huboCambioPool = true;
+            // Respeta el valor de "Da al Cliente ($ USD)" configurado manualmente; solo lo calcula si está vacío o en 0
+            if (!card.effectiveClientUSD || Number(card.effectiveClientUSD) <= 0) {
+                const effUsdCalc = Number(((Number(card.faceValueOrigin) || 0) * (Number(card.conversionRateToUSD) || 0)).toFixed(2));
+                if (effUsdCalc > 0) {
+                    card.effectiveClientUSD = effUsdCalc;
+                    huboCambioPool = true;
+                }
             }
             if (catalogoCO.length > 0 && (card.centralOneProductId || card.centralOneSku)) {
                 const itemCO = (card.centralOneProductId && mapaCO_PorId[card.centralOneProductId]) ||
@@ -1396,7 +1390,7 @@ async function recalcularPreciosYAlgoritmoTiendaKZ(settingsDoc = null, targetSlu
                 if (itemCO) {
                     const nuevoCosto = itemCO.reseller_price !== null ? Number(itemCO.reseller_price) : card.costUSD;
                     const nuevoInStock = Boolean(itemCO.in_stock && itemCO.status === 'active');
-                    if (nuevoCosto > 0 && Math.abs(card.costUSD - nuevoCosto) > 0.0001) {
+                    if ((desdeSyncAPI || !card.costUSD || Number(card.costUSD) <= 0) && nuevoCosto > 0 && Math.abs((card.costUSD || 0) - nuevoCosto) > 0.0001) {
                         card.costUSD = nuevoCosto;
                         card.lastPriceUpdateAt = new Date();
                         huboCambioPool = true;
@@ -1429,42 +1423,44 @@ async function recalcularPreciosYAlgoritmoTiendaKZ(settingsDoc = null, targetSlu
                 for (const pkg of listaPaquetes) {
                     const usaAlgo = esSmartProd || Boolean(pkg.useSmartAlgorithm);
 
-                    if (usaAlgo && Number(pkg.targetClientUSD) > 0) {
-                        const combo = calcularMejorCombinacionTarjetasPool(
-                            pkg.targetClientUSD,
-                            platGroup,
-                            settingsDoc.arbitrageBaseCards || [],
-                            catalogoCO
-                        );
-                        const prevSummary = pkg.resolvedCombo ? pkg.resolvedCombo.summaryText : '';
-                        pkg.resolvedCombo = combo;
+                    if (usaAlgo) {
+                        const metaUsd = extraerMetaUsdDeNombrePaqueteServer(pkg);
+                        if (metaUsd > 0 && Number(pkg.targetClientUSD) !== metaUsd) {
+                            pkg.targetClientUSD = metaUsd;
+                            prodModificado = true;
+                        }
+                        if (metaUsd > 0) {
+                            const combo = calcularMejorCombinacionTarjetasPool(
+                                metaUsd,
+                                platGroup,
+                                settingsDoc.arbitrageBaseCards || [],
+                                catalogoCO
+                            );
+                            const prevSummary = pkg.resolvedCombo ? pkg.resolvedCombo.summaryText : '';
+                            pkg.resolvedCombo = combo;
 
-                        if (combo.hasSolution) {
-                            if (Math.abs((pkg.costUSD || 0) - Number(combo.totalCostUSD.toFixed(4))) > 0.0001) {
-                                pkg.costUSD = Number(combo.totalCostUSD.toFixed(4));
-                                prodModificado = true;
-                            }
-                            if (pkg.providerInStock !== true) {
-                                pkg.providerInStock = true;
-                                prodModificado = true;
-                            }
-                            if (prevSummary && prevSummary !== combo.summaryText) {
-                                prodModificado = true;
-                                await registrarAlertaCentralOne(settingsDoc, {
-                                    type: 'ALGO_FALLBACK',
-                                    severity: 'WARN',
-                                    title: `🧠 Algoritmo reajustó combinación en ${prod.name} (${pkg.name})`,
-                                    detail: `Pasó de "${prevSummary}" a "${combo.summaryText}" (Costo: $${pkg.costUSD.toFixed(2)} USD).`
-                                });
-                            }
-                        } else {
-                            if (pkg.providerInStock !== false) {
-                                pkg.providerInStock = false;
-                                prodModificado = true;
-                            }
-                            if (prevSummary !== 'SIN_SOLUCION') {
-                                pkg.resolvedCombo = { ...combo, summaryText: 'SIN_SOLUCION' };
-                                prodModificado = true;
+                            if (combo.hasSolution) {
+                                const costoCombo = Number(combo.totalCostUSD.toFixed(4));
+                                if (Math.abs((pkg.costUSD || 0) - costoCombo) > 0.0001) {
+                                    pkg.costUSD = costoCombo;
+                                    prodModificado = true;
+                                }
+                                if (pkg.providerInStock !== true) {
+                                    pkg.providerInStock = true;
+                                    prodModificado = true;
+                                }
+                                if (prevSummary && prevSummary !== combo.summaryText) {
+                                    prodModificado = true;
+                                }
+                            } else {
+                                if (pkg.providerInStock !== false) {
+                                    pkg.providerInStock = false;
+                                    prodModificado = true;
+                                }
+                                if (prevSummary !== 'SIN_SOLUCION') {
+                                    pkg.resolvedCombo = { ...combo, summaryText: 'SIN_SOLUCION' };
+                                    prodModificado = true;
+                                }
                             }
                         }
                     } else {
