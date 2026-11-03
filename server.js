@@ -1113,7 +1113,7 @@ function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, ba
         }
     }
 
-    const candidatas = [];
+    let candidatas = [];
     for (const c of (baseCardsPool || [])) {
         if (c.active === false) continue;
         if (excluidosSet.has(String(c.cardId))) continue;
@@ -1165,17 +1165,28 @@ function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, ba
         };
     }
 
-    candidatas.sort((a, b) => {
-        if (Math.abs(a.costPerDollar - b.costPerDollar) > 0.04) {
-            return a.costPerDollar - b.costPerDollar;
+    const { max: maxCartasHumano, ideal: idealCartas } = obtenerLimiteHumanoCodigosServer(metaUSD);
+
+    // Si la meta es grande (ej. >= $10 USD) y hay tarjetas grandes disponibles, descartar micro-tarjetas que jamás podrían armar el paquete eficientemente
+    if (metaUSD >= 10) {
+        const umbralMinTarjeta = (metaUSD / maxCartasHumano) * 0.45;
+        const candidatasGrandes = candidatas.filter(c => c.effectiveClientUSD >= umbralMinTarjeta);
+        if (candidatasGrandes.length > 0) {
+            candidatas = candidatasGrandes;
         }
-        return b.effectiveClientUSD - a.effectiveClientUSD;
+    }
+
+    // Ordenar de MAYOR a MENOR denominación primero para encontrar solución válida en el paso #1 y podar el 99% del árbol
+    candidatas.sort((a, b) => {
+        if (Math.abs(b.effectiveClientUSD - a.effectiveClientUSD) > 0.25) {
+            return b.effectiveClientUSD - a.effectiveClientUSD;
+        }
+        return a.costPerDollar - b.costPerDollar;
     });
 
     const n = candidatas.length;
     const menorCartaUSD = Math.min(...candidatas.map(c => c.effectiveClientUSD));
     const mayorCartaUSD = Math.max(...candidatas.map(c => c.effectiveClientUSD));
-    const { max: maxCartasHumano, ideal: idealCartas } = obtenerLimiteHumanoCodigosServer(metaUSD);
 
     const minimoCodigosNecesarios = Math.ceil((metaUSD * 0.99) / Math.max(0.1, mayorCartaUSD));
     if (minimoCodigosNecesarios > maxCartasHumano) {
@@ -1197,7 +1208,7 @@ function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, ba
 
     function explorar(startIndex, cartasUsadas, conteoPorIndice, sumaClienteUSD, sumaCostoMicro) {
         nodosExplorados++;
-        if (nodosExplorados > 5000) return;
+        if (nodosExplorados > 750) return;
 
         if (cartasUsadas > 0 && sumaClienteUSD >= pisoMinimoUSD && sumaClienteUSD <= techoMaximoUSD) {
             const diffMeta = sumaClienteUSD - metaUSD;
@@ -1243,8 +1254,10 @@ function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, ba
 
         if (cartasUsadas >= maxCartasHumano) return;
 
+        // Como candidatas está ordenado de mayor a menor, la carta más grande disponible desde startIndex es candidatas[startIndex]
+        const maxCartaRestanteUSD = candidatas[startIndex] ? candidatas[startIndex].effectiveClientUSD : mayorCartaUSD;
         const faltaUSD = Math.max(0, pisoMinimoUSD - sumaClienteUSD);
-        const minCartasFaltantes = Math.ceil(faltaUSD / Math.max(0.1, mayorCartaUSD));
+        const minCartasFaltantes = Math.ceil(faltaUSD / Math.max(0.1, maxCartaRestanteUSD));
         if (cartasUsadas + minCartasFaltantes > maxCartasHumano) return;
 
         const costoMinimoRestanteMicro = Math.round(faltaUSD * mejorRatioCosto * 10000);
@@ -1357,7 +1370,7 @@ async function guardarCodigosRecuperadosEnStockInterno(ordenDB, listaObjetosCodi
     }
 }
 
-// 🔄 RECALCULADOR GLOBAL DE PRECIOS POR GANANCIA FIJA + ALGORITMO + FLYERS CANVA
+// 🔄 RECALCULADOR GLOBAL DE PRECIOS POR GANANCIA FIJA + ALGORITMO + FLYERS CANVA (SIN DESCARGAR IMÁGENES BASE64 PESADAS)
 async function recalcularPreciosYAlgoritmoTiendaKZ(settingsDoc = null, targetSlugOnly = null, desdeSyncAPI = false) {
     try {
         if (!settingsDoc) settingsDoc = await StoreSettings.findOne({ key: 'main_settings' });
@@ -1376,7 +1389,6 @@ async function recalcularPreciosYAlgoritmoTiendaKZ(settingsDoc = null, targetSlu
         const poolCards = settingsDoc.arbitrageBaseCards || [];
         for (let i = 0; i < poolCards.length; i++) {
             const card = poolCards[i];
-            // Respeta el valor de "Da al Cliente ($ USD)" configurado manualmente; solo lo calcula si está vacío o en 0
             if (!card.effectiveClientUSD || Number(card.effectiveClientUSD) <= 0) {
                 const effUsdCalc = Number(((Number(card.faceValueOrigin) || 0) * (Number(card.conversionRateToUSD) || 0)).toFixed(2));
                 if (effUsdCalc > 0) {
@@ -1408,17 +1420,21 @@ async function recalcularPreciosYAlgoritmoTiendaKZ(settingsDoc = null, targetSlu
         }
         if (huboCambioPool) settingsDoc.markModified('arbitrageBaseCards');
 
+        // Lee los productos excluyendo las imágenes pesadas de portada, banner y guía para que la consulta a MongoDB sea instantánea
         const filtroProd = targetSlugOnly ? { slug: String(targetSlugOnly).trim().toLowerCase() } : {};
-        const productos = await CatalogProduct.find(filtroProd);
+        const productos = await CatalogProduct.find(filtroProd)
+            .select('_id slug name isSmartCodeProduct smartPlatformGroup useAltPricing packages altPackages')
+            .lean();
+
         const mapaPreciosParaFlyers = {};
-        const promesasGuardadoProd = [];
+        const operacionesBulk = [];
 
         for (const prod of productos) {
             let prodModificado = false;
             const esSmartProd = Boolean(prod.isSmartCodeProduct);
             const platGroup = prod.smartPlatformGroup || 'steam';
 
-            const procesarArregloPaquetes = async (listaPaquetes) => {
+            const procesarArregloPaquetes = (listaPaquetes) => {
                 if (!Array.isArray(listaPaquetes)) return;
                 for (const pkg of listaPaquetes) {
                     const usaAlgo = esSmartProd || Boolean(pkg.useSmartAlgorithm);
@@ -1449,7 +1465,7 @@ async function recalcularPreciosYAlgoritmoTiendaKZ(settingsDoc = null, targetSlu
                                     pkg.providerInStock = true;
                                     prodModificado = true;
                                 }
-                                if (prevSummary && prevSummary !== combo.summaryText) {
+                                if (prevSummary !== combo.summaryText) {
                                     prodModificado = true;
                                 }
                             } else {
@@ -1498,13 +1514,16 @@ async function recalcularPreciosYAlgoritmoTiendaKZ(settingsDoc = null, targetSlu
                 }
             };
 
-            await procesarArregloPaquetes(prod.packages);
-            await procesarArregloPaquetes(prod.altPackages);
+            procesarArregloPaquetes(prod.packages);
+            procesarArregloPaquetes(prod.altPackages);
 
             if (prodModificado) {
-                prod.markModified('packages');
-                prod.markModified('altPackages');
-                promesasGuardadoProd.push(prod.save());
+                operacionesBulk.push({
+                    updateOne: {
+                        filter: { _id: prod._id },
+                        update: { $set: { packages: prod.packages, altPackages: prod.altPackages } }
+                    }
+                });
             }
 
             const listaActiva = (prod.useAltPricing && Array.isArray(prod.altPackages) && prod.altPackages.length > 0)
@@ -1516,8 +1535,8 @@ async function recalcularPreciosYAlgoritmoTiendaKZ(settingsDoc = null, targetSlu
             }
         }
 
-        if (promesasGuardadoProd.length > 0) {
-            await Promise.all(promesasGuardadoProd);
+        if (operacionesBulk.length > 0) {
+            await CatalogProduct.bulkWrite(operacionesBulk);
         }
 
         let flyersModificados = false;
