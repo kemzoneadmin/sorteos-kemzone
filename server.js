@@ -1209,6 +1209,8 @@ function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, ba
         maxCartaGlobalPorIndice[i] = maxRunning;
     }
 
+// Cada tarjeta adicional debe ahorrar al menos 1.2% del paquete (mín. $0.15 USD) para justificar entregar más códigos
+    const penalizacionPorCartaMicro = Math.round(Math.max(0.15, metaUSD * 0.012) * 10000);
     const solucionesValidas = [];
     let mejorCostoHalladoMicro = Infinity;
     let nodosExplorados = 0;
@@ -1237,8 +1239,7 @@ function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, ba
                 etiquetas.push(`${qty}x ${card.name} ($${(card.effectiveClientUSD * qty).toFixed(2)})`);
             });
 
-            // Penalización mínima ($0.015 por tarjeta extra) solo para desempatar si dos combos cuestan exactamente igual
-            const scoreBeneficioMicro = sumaCostoMicro + ((cartasUsadas - 1) * 150);
+            const scoreBeneficioMicro = sumaCostoMicro + ((cartasUsadas - 1) * penalizacionPorCartaMicro);
             if (scoreBeneficioMicro < mejorCostoHalladoMicro) {
                 mejorCostoHalladoMicro = scoreBeneficioMicro;
             }
@@ -1265,9 +1266,10 @@ function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, ba
         const minCartasFaltantes = Math.ceil(faltaUSD / Math.max(0.1, maxCartaRestanteUSD));
         if (cartasUsadas + minCartasFaltantes > maxCartasHumano) return;
 
-        // Poda por costo: si lo que ya cuesta + el mínimo costo posible para llegar a la meta supera la mejor opción hallada, cortar rama
+        const minTotalCartasRama = Math.max(1, cartasUsadas + minCartasFaltantes);
         const costoMinimoFaltanteMicro = Math.round(faltaUSD * mejorRatioCosto * 10000);
-        if (sumaCostoMicro + costoMinimoFaltanteMicro > mejorCostoHalladoMicro + 1500) {
+        const scoreMinimoPosibleRama = sumaCostoMicro + costoMinimoFaltanteMicro + ((minTotalCartasRama - 1) * penalizacionPorCartaMicro);
+        if (scoreMinimoPosibleRama > mejorCostoHalladoMicro + 500) {
             return;
         }
 
