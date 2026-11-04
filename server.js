@@ -3017,7 +3017,7 @@ app.get('/api/store/bootstrap', async (req, res) => {
     try {
         const [settings, products, paymentMethods] = await Promise.all([
             StoreSettings.findOne({ key: 'main_settings' })
-                .select('-centralOneCatalogCache -centralOneCoverageCache -centralOneAlerts -processedWebhookIds')
+                .select('-centralOneCatalogCache -centralOneCoverageCache -centralOneAlerts -processedWebhookIds -flyersCanvaConfig')
                 .lean(),
             CatalogProduct.find()
                 .sort({ sortOrder: 1, createdAt: 1 })
