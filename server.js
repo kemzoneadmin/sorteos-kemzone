@@ -4678,6 +4678,28 @@ app.post('/api/admin/product/delete', verificarSoloAdmin, async (req, res) => {
     }
 });
 
+// 4.5 Reordenar Posiciones Globales de los Productos en la Tienda (Estándar + Algoritmo)
+app.post('/api/admin/product/reorder', verificarSoloAdmin, async (req, res) => {
+    try {
+        const { orderedSlugs } = req.body;
+        if (!Array.isArray(orderedSlugs) || orderedSlugs.length === 0) {
+            return res.status(400).json({ error: 'Lista de orden inválida.' });
+        }
+
+        const ops = orderedSlugs.map((slug, idx) => ({
+            updateOne: {
+                filter: { slug: String(slug || '').trim().toLowerCase() },
+                update: { $set: { sortOrder: idx + 1 } }
+            }
+        }));
+
+        await CatalogProduct.bulkWrite(ops);
+        return res.json({ success: true });
+    } catch (error) {
+        return res.status(500).json({ error: 'Error guardando el nuevo orden de productos.' });
+    }
+});
+
 // 5. Crear o Editar Métodos de Pago (Pago Móvil, Binance, Zinli, etc.)
 app.post('/api/admin/payment-method/save', verificarSoloAdmin, async (req, res) => {
     try {
