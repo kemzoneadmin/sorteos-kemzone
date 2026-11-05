@@ -274,6 +274,7 @@ flashOffers: [{
     navigationConfig: { type: mongoose.Schema.Types.Mixed, default: null },
     flyersCanvaConfig: { type: mongoose.Schema.Types.Mixed, default: null },
     steamCalculatorConfig: { type: mongoose.Schema.Types.Mixed, default: null },
+    binanceAutoConfig: { type: mongoose.Schema.Types.Mixed, default: null },
 
 // 🧠 BÓVEDA DE TARJETAS BASE DEL PROVEEDOR PARA EL ALGORITMO DE CÓDIGOS (STEAM, PSN, NINTENDO, ETC.)
     arbitrageBaseCards: [{
@@ -4033,33 +4034,48 @@ app.post('/api/admin/binance-pay/config', verificarSoloAdmin, async (req, res) =
         let settings = await StoreSettings.findOne({ key: 'main_settings' }).select('-centralOneCatalogCache -centralOneCoverageCache');
         if (!settings) settings = new StoreSettings({ key: 'main_settings' });
 
-        if (!settings.binanceAutoConfig) settings.binanceAutoConfig = {};
-        if (typeof enabled === 'boolean') settings.binanceAutoConfig.enabled = enabled;
-        if (payId !== undefined) settings.binanceAutoConfig.payId = String(payId).trim();
-        if (merchantName !== undefined) settings.binanceAutoConfig.merchantName = String(merchantName).trim();
-        if (qrImageUrl !== undefined) settings.binanceAutoConfig.qrImageUrl = String(qrImageUrl).trim();
-        if (apiKey !== undefined && !String(apiKey).includes('••••')) {
-            settings.binanceAutoConfig.apiKey = String(apiKey).trim();
+        const prevCfg = (settings.binanceAutoConfig && typeof settings.binanceAutoConfig === 'object')
+            ? { ...settings.binanceAutoConfig }
+            : {};
+
+        if (typeof enabled === 'boolean') prevCfg.enabled = enabled;
+        if (payId !== undefined && String(payId).trim() !== '') {
+            prevCfg.payId = String(payId).trim();
         }
-        if (apiSecret !== undefined && !String(apiSecret).includes('••••')) {
-            settings.binanceAutoConfig.apiSecret = String(apiSecret).trim();
+        if (merchantName !== undefined && String(merchantName).trim() !== '') {
+            prevCfg.merchantName = String(merchantName).trim();
+        }
+        if (qrImageUrl !== undefined) {
+            prevCfg.qrImageUrl = String(qrImageUrl).trim();
+        }
+        // Jamás sobreescribir con vacío ni con asteriscos/puntos
+        if (apiKey && !String(apiKey).includes('•') && !String(apiKey).includes('*') && String(apiKey).trim().length > 8) {
+            prevCfg.apiKey = String(apiKey).trim();
+        }
+        if (apiSecret && !String(apiSecret).includes('•') && !String(apiSecret).includes('*') && String(apiSecret).trim().length > 8) {
+            prevCfg.apiSecret = String(apiSecret).trim();
         }
 
-        if (payId) {
+        if (prevCfg.payId) {
             await PaymentMethod.updateMany(
                 { methodKey: { $regex: /binance/i } },
-                { $set: { phoneOrEmail: String(payId).trim(), binancePayId: String(payId).trim() } }
+                { $set: { phoneOrEmail: prevCfg.payId, binancePayId: prevCfg.payId } }
             ).catch(() => {});
         }
 
-        const testRes = await consultarTransaccionesBinancePayAPI(settings);
-        settings.binanceAutoConfig.lastCheckAt = new Date();
-        settings.binanceAutoConfig.lastError = testRes.ok ? '' : (testRes.error || '');
-        settings.markModified('binanceAutoConfig');
+        const testRes = await consultarTransaccionesBinancePayAPI({ binanceAutoConfig: prevCfg });
+        prevCfg.lastCheckAt = new Date();
+        prevCfg.lastError = testRes.ok ? '' : (testRes.error || '');
 
-        if (!testOnly) {
-            await settings.save();
-        }
+        settings.binanceAutoConfig = prevCfg;
+        settings.markModified('binanceAutoConfig');
+        await settings.save();
+
+        // Guardar también directo en la colección de MongoDB para garantizar 100% persistencia tras F5
+        await StoreSettings.collection.updateOne(
+            { key: 'main_settings' },
+            { $set: { binanceAutoConfig: prevCfg } }
+        );
 
         return res.json({
             success: true,
@@ -4067,12 +4083,12 @@ app.post('/api/admin/binance-pay/config', verificarSoloAdmin, async (req, res) =
             transactionsReadCount: (testRes.transactions || []).length,
             error: testRes.ok ? null : testRes.error,
             config: {
-                enabled: settings.binanceAutoConfig.enabled !== false,
-                payId: settings.binanceAutoConfig.payId || '',
-                merchantName: settings.binanceAutoConfig.merchantName || 'Kem!Zone Oficial',
-                qrImageUrl: settings.binanceAutoConfig.qrImageUrl || '',
-                hasApiKey: Boolean(settings.binanceAutoConfig.apiKey || process.env.BINANCE_API_KEY),
-                hasApiSecret: Boolean(settings.binanceAutoConfig.apiSecret || process.env.BINANCE_API_SECRET)
+                enabled: prevCfg.enabled !== false,
+                payId: prevCfg.payId || '',
+                merchantName: prevCfg.merchantName || 'Kem!Zone Oficial',
+                qrImageUrl: prevCfg.qrImageUrl || '',
+                hasApiKey: Boolean(prevCfg.apiKey || process.env.BINANCE_API_KEY),
+                hasApiSecret: Boolean(prevCfg.apiSecret || process.env.BINANCE_API_SECRET)
             }
         });
     } catch (error) {
