@@ -639,7 +639,7 @@ async function inicializarTiendaKemZonePorDefecto() {
             console.log('✅ [Seed] Métodos de pago creados en payment_methods');
         }
 
-        const existePaypal = await PaymentMethod.findOne({ methodKey: 'paypal' });
+const existePaypal = await PaymentMethod.findOne({ methodKey: 'paypal' });
         if (!existePaypal) {
             await new PaymentMethod({
                 methodKey: 'paypal',
@@ -653,10 +653,20 @@ async function inicializarTiendaKemZonePorDefecto() {
                 instructions: '',
                 requiresReference: true,
                 refDigitsLength: 6,
-                active: true,
+                active: false,
                 sortOrder: 3
             }).save();
-            console.log('✅ [Seed] Método de pago PayPal ($) añadido al Dashboard');
+            console.log('✅ [Seed] Método de pago PayPal ($) añadido al Dashboard (Oculto por defecto)');
+        } else {
+            const stDoc = await StoreSettings.findOne({ key: 'main_settings' }).lean();
+            if (!stDoc || !stDoc.paypalDefaultHiddenApplied) {
+                existePaypal.active = false;
+                await existePaypal.save();
+                await StoreSettings.collection.updateOne(
+                    { key: 'main_settings' },
+                    { $set: { paypalDefaultHiddenApplied: true } }
+                );
+            }
         }
 
         // 3. Catálogo inicial con tus divisiones exactas (Sin PayPal en Servicios, solo Zinli y Windows 11)
