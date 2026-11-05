@@ -3650,7 +3650,7 @@ let estadoAlgoritmoInicial = null;
             }).save().catch(() => {});
         }
 
-        const orderId = 'KZ-' + crypto.randomInt(100000, 999999).toString();
+const orderId = 'KZ-' + crypto.randomInt(100000, 999999).toString();
 
         let uidDestinoFinal = (playerUid || '').trim();
         if (!uidDestinoFinal) {
@@ -3659,6 +3659,31 @@ let estadoAlgoritmoInicial = null;
             } else {
                 uidDestinoFinal = 'Entrega Automática de Código';
             }
+        }
+
+        // 🇻🇪 Verificar si la orden se está creando en horario nocturno de Venezuela (11:00 PM a 11:00 AM VET / UTC-4)
+        const ahoraUtcMs = Date.now();
+        const offsetVzlaMs = 4 * 60 * 60 * 1000;
+        const fechaVzla = new Date(ahoraUtcMs - offsetVzlaMs);
+        const horaVzla = fechaVzla.getUTCHours();
+        const esFueraDeHorarioVzla = (horaVzla >= 23 || horaVzla < 11);
+
+        let inicioRelojEntrega = new Date(ahoraUtcMs);
+        let mensajeInicialOrden = 'Tu orden está en proceso. Un operador está verificando tu referencia de pago...';
+
+        if (esFueraDeHorarioVzla) {
+            // 11:00 AM en Venezuela equivale a las 15:00:00 UTC
+            let proxima11amUtcMs = Date.UTC(
+                fechaVzla.getUTCFullYear(),
+                fechaVzla.getUTCMonth(),
+                fechaVzla.getUTCDate(),
+                15, 0, 0, 0
+            );
+            if (horaVzla >= 23) {
+                proxima11amUtcMs += 24 * 60 * 60 * 1000;
+            }
+            inicioRelojEntrega = new Date(proxima11amUtcMs);
+            mensajeInicialOrden = '🌙 Compra registrada fuera de horario. Tu pedido está asegurado en cola prioritaria y se entregará a partir de las 11:00 AM.';
         }
 
         const nuevaOrden = new Order({
@@ -3702,8 +3727,9 @@ let estadoAlgoritmoInicial = null;
             tokemsAmount: costoEnTokems,
             paidWithTokems: pagadoConTokems,
             status: 'EN_PROCESO',
-            statusMessage: 'Tu orden está en proceso. Un operador está verificando tu referencia de pago...',
+            statusMessage: mensajeInicialOrden,
             progressPercent: 50,
+            timerStartedAt: inicioRelojEntrega,
             ...(estadoAlgoritmoInicial ? { algoExecutionState: estadoAlgoritmoInicial } : {})
         });
 
