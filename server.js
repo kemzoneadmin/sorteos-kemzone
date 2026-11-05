@@ -239,7 +239,7 @@ const StoreSettingsSchema = new mongoose.Schema({
         icon: { type: String, default: '⚡' },
         subtitle: { type: String, default: 'Ofertas especiales del día' }
     },
-    flashOffers: [{
+flashOffers: [{
         slug: { type: String, default: 'free-fire-id' },
         pkgId: { type: String, default: 'ff_semanal' },
         game: { type: String, default: 'FREE FIRE' },
@@ -250,7 +250,9 @@ const StoreSettingsSchema = new mongoose.Schema({
         profitUSD: { type: Number, default: 0.45 },
         tokemsPrice: { type: Number, default: 1.95 },
         discount: { type: String, default: '-22%' },
-        timer: { type: String, default: '3D 08H 45M' },
+        timer: { type: String, default: 'OFERTA ACTIVA' },
+        expiresAt: { type: Date, default: null },
+        active: { type: Boolean, default: true },
         img: { type: String, default: 'https://images.unsplash.com/photo-1542751371-adc38448a05e?auto=format&fit=crop&w=300&q=80' },
         pkgIconUrl: { type: String, default: '' },
         apiProductSku: { type: String, default: '' },
@@ -3684,25 +3686,44 @@ let estadoAlgoritmoInicial = null;
                 (nombrePkgBuscado && String(p.name || '').trim().toLowerCase() === nombrePkgBuscado)
             );
 
-            const ofertaMatch = (settings.flashOffers || []).find(of =>
+const ofertaMatch = (settings.flashOffers || []).find(of =>
                 String(of.slug || '').trim().toLowerCase() === slugBuscado &&
                 (String(of.pkgId || '').trim() === idPkgBuscado ||
                  (nombrePkgBuscado && String(of.title || '').trim().toLowerCase() === nombrePkgBuscado))
             );
 
             if (ofertaMatch) {
-                pkg = {
-                    packageId: ofertaMatch.pkgId || idPkgBuscado,
-                    name: ofertaMatch.title,
-                    priceUSD: Number(ofertaMatch.usd),
-                    costUSD: Number(ofertaMatch.costUSD || (pkg ? pkg.costUSD : 0) || 0),
-                    tokemsPrice: Number(ofertaMatch.tokemsPrice || ofertaMatch.usd),
-                    apiProviderName: (pkg && pkg.apiProviderName) || 'DEFAULT_API',
-                    apiProductSku: ofertaMatch.apiProductSku || (pkg ? pkg.apiProductSku : '') || ofertaMatch.pkgId,
-                    isGiftCardPin: ofertaMatch.isGiftCardPin !== undefined ? Boolean(ofertaMatch.isGiftCardPin) : Boolean(pkg && pkg.isGiftCardPin),
-                    backupPinVault: Array.isArray(ofertaMatch.backupPinVault) ? ofertaMatch.backupPinVault : [],
-                    inStock: true
-                };
+                const vencioPorTiempo = Boolean(ofertaMatch.expiresAt && new Date(ofertaMatch.expiresAt).getTime() <= Date.now());
+                const estaActivaOferta = ofertaMatch.active !== false && !vencioPorTiempo;
+
+                // Si venció por tiempo, la apaga permanentemente en MongoDB en segundo plano
+                if (vencioPorTiempo && ofertaMatch.active !== false && typeof settings.save === 'function') {
+                    ofertaMatch.active = false;
+                    settings.markModified('flashOffers');
+                    settings.save().catch(() => {});
+                }
+
+                if (!estaActivaOferta) {
+                    if (!pkg) {
+                        return res.status(400).json({
+                            error: '⏰ El tiempo de esta oferta relámpago ya finalizó o fue desactivada.'
+                        });
+                    }
+                } else {
+                    pkg = {
+                        packageId: ofertaMatch.pkgId || idPkgBuscado,
+                        name: ofertaMatch.title,
+                        priceUSD: Number(ofertaMatch.usd),
+                        costUSD: Number(ofertaMatch.costUSD || (pkg ? pkg.costUSD : 0) || 0),
+                        tokemsPrice: Number(ofertaMatch.tokemsPrice || ofertaMatch.usd),
+                        apiProviderName: (pkg && pkg.apiProviderName) || 'DEFAULT_API',
+                        apiProductSku: ofertaMatch.apiProductSku || (pkg ? pkg.apiProductSku : '') || ofertaMatch.pkgId,
+                        centralOneProductId: ofertaMatch.centralOneProductId || (pkg ? pkg.centralOneProductId : '') || '',
+                        isGiftCardPin: ofertaMatch.isGiftCardPin !== undefined ? Boolean(ofertaMatch.isGiftCardPin) : Boolean(pkg && pkg.isGiftCardPin),
+                        backupPinVault: Array.isArray(ofertaMatch.backupPinVault) ? ofertaMatch.backupPinVault : [],
+                        inStock: true
+                    };
+                }
             }
 
             if (!pkg || pkg.inStock === false) {
