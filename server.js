@@ -571,7 +571,14 @@ async function inicializarTiendaKemZonePorDefecto() {
             console.log('✅ [Seed] Configuración inicial creada en store_settings');
         }
 
-        // 2. Métodos de pago iniciales
+// 2. Métodos de pago iniciales (Purga automática de Zinli en MongoDB)
+        await PaymentMethod.deleteMany({
+            $or: [
+                { methodKey: { $regex: /zinli/i } },
+                { name: { $regex: /zinli/i } }
+            ]
+        }).catch(() => {});
+
         const methodsCount = await PaymentMethod.countDocuments();
         if (methodsCount === 0) {
             await PaymentMethod.insertMany([
@@ -603,15 +610,18 @@ async function inicializarTiendaKemZonePorDefecto() {
                     sortOrder: 2
                 },
                 {
-                    methodKey: 'zinli',
-                    name: 'Billetera Zinli ($)',
+                    methodKey: 'paypal',
+                    name: 'PayPal ($)',
                     currency: 'USD',
-                    icon: '🟣',
+                    icon: '🅿️',
+                    bankName: '',
                     phoneOrEmail: 'pagos@kemzone07.com',
-                    accountHolder: 'Kem!Zone Store',
-                    instructions: 'Envía el monto en USD a nuestro correo Zinli y coloca los últimos 6 dígitos del comprobante.',
+                    documentId: '',
+                    copyText: 'pagos@kemzone07.com',
+                    instructions: '',
                     requiresReference: true,
                     refDigitsLength: 6,
+                    active: true,
                     sortOrder: 3
                 },
                 {
@@ -628,7 +638,6 @@ async function inicializarTiendaKemZonePorDefecto() {
             console.log('✅ [Seed] Métodos de pago creados en payment_methods');
         }
 
-        // Asegurar que PayPal ($) exista en el Dashboard de Métodos de Pago igual que Zinli
         const existePaypal = await PaymentMethod.findOne({ methodKey: 'paypal' });
         if (!existePaypal) {
             await new PaymentMethod({
