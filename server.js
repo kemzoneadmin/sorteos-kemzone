@@ -3362,38 +3362,29 @@ app.post('/api/reset-password', authLimiter, async (req, res) => {
     }
 });
 
-// =================================================================
 // 🟡 MOTOR AUTOMÁTICO BINANCE PAY (MICRO-DECIMALES + LECTURA API 24/7)
 // =================================================================
-StoreSettings.schema.add({
-    binanceAutoConfig: {
-        enabled: { type: Boolean, default: true },
-        payId: { type: String, default: '758 964 705' },
-        merchantName: { type: String, default: 'Kem!Zone Oficial' },
-        qrImageUrl: { type: String, default: '' },
-        apiKey: { type: String, default: '' },
-        apiSecret: { type: String, default: '' },
-        lastCheckAt: { type: Date, default: null },
-        lastError: { type: String, default: '' }
-    }
-});
-
-Order.schema.add({
-    binanceCheckoutId: { type: String, default: '', index: true },
-    binanceExactAmountUSDT: { type: Number, default: 0, index: true },
-    binanceMicroDecimal: { type: String, default: '' },
-    binanceTransactionId: { type: String, default: '', index: true },
-    binancePayerName: { type: String, default: '' },
-    binanceExpiresAt: { type: Date, default: null },
-    isWaitingBinanceAuto: { type: Boolean, default: false, index: true }
-});
-
 const BINANCE_API_MIRRORS = [
     'https://api.binance.com',
+    'https://api-gcp.binance.com',
     'https://api1.binance.com',
     'https://api2.binance.com',
-    'https://api3.binance.com'
+    'https://api3.binance.com',
+    'https://api4.binance.com'
 ];
+
+// Obtiene el monto exacto con 3 decimales de una orden de Binance (incluso si fue creada antes de actualizar el esquema)
+function obtenerMontoExactoEsperadoOrdenBinance(orden) {
+    if (!orden) return 0;
+    let m = Number(orden.binanceExactAmountUSDT) || 0;
+    if (m <= 0 && String(orden.paymentReference || '').startsWith('AUTO-')) {
+        m = Number(String(orden.paymentReference).replace('AUTO-', '').trim()) || 0;
+    }
+    if (m <= 0 && Number(orden.clientPayUSD) > 0) {
+        m = Number(orden.clientPayUSD);
+    }
+    return Number(m.toFixed(3));
+}
 
 // Genera un monto con 3 decimales únicos (ej: 10.011 USDT) que no esté en uso en la última hora
 async function reservarMontoUnicoBinanceUSDT(baseUSD) {
@@ -3402,14 +3393,14 @@ async function reservarMontoUnicoBinanceUSDT(baseUSD) {
 
     const activasRecientes = await Order.find({
         fecha: { $gte: hace90Min },
-        binanceExactAmountUSDT: { $gt: 0 },
+        paymentMethodKey: 'binance',
         status: { $ne: 'RECHAZADO' }
-    }).select('binanceExactAmountUSDT isWaitingBinanceAuto status').lean();
+    }).select('binanceExactAmountUSDT clientPayUSD paymentReference isWaitingBinanceAuto status').lean();
 
     const ocupadosSet = new Set(
         activasRecientes
             .filter(o => o.isWaitingBinanceAuto || o.status === 'INICIANDO')
-            .map(o => Number(o.binanceExactAmountUSDT).toFixed(3))
+            .map(o => obtenerMontoExactoEsperadoOrdenBinance(o).toFixed(3))
     );
 
     // Priorizamos desde .001 hasta .099 (saltando múltiplos de 10 como .010 para que Binance siempre conserve los 3 decimales)
@@ -3454,8 +3445,9 @@ async function consultarTransaccionesBinancePayAPI(settingsDoc = null) {
     let ultimoError = '';
     for (const host of BINANCE_API_MIRRORS) {
         try {
-            const timestamp = Date.now();
-            const queryString = `limit=80&recvWindow=15000&timestamp=${timestamp}`;
+            // Restamos 1500ms al reloj local y usamos recvWindow=60000 para evitar el error -1021 de Binance
+            const timestamp = Date.now() - 1500;
+            const queryString = `limit=100&recvWindow=60000&timestamp=${timestamp}`;
             const signature = crypto.createHmac('sha256', apiSecret).update(queryString).digest('hex');
 
             const resp = await axios.get(`${host}/sapi/v1/pay/transactions?${queryString}&signature=${signature}`, {
@@ -3481,24 +3473,63 @@ async function consultarTransaccionesBinancePayAPI(settingsDoc = null) {
     return { ok: false, error: ultimoError || 'No se pudo conectar con Binance API', transactions: [] };
 }
 
-// Ejecuta la acreditación o disparo de API apenas se confirma el pago exacto en Binance
-async function completarOrdenConfirmadaPorBinance(orden, txMatch) {
-    const txId = String(txMatch.transactionId || txMatch.orderId || ('BN-' + Date.now())).trim();
-    const payerName = txMatch.payerInfo?.name || txMatch.payerInfo?.binanceId || '';
+// Marca automáticamente una orden de Binance como RECHAZADA cuando se agota el tiempo de 60 minutos sin pago
+async function rechazarOrdenBinancePorTiempoAgotado(orden) {
+    if (!orden || !orden.orderId) return null;
+    const montoExacto = obtenerMontoExactoEsperadoOrdenBinance(orden);
+    const checkoutIdTxt = orden.binanceCheckoutId || 'N/A';
 
-    // Candado atómico para evitar doble acreditación si el poller y el cliente consultan al mismo milisegundo
-    const ordenBloqueada = await Order.findOneAndUpdate(
+    const ordenExpirada = await Order.findOneAndUpdate(
         {
             orderId: orden.orderId,
-            isWaitingBinanceAuto: true
+            status: 'INICIANDO'
         },
         {
             $set: {
                 isWaitingBinanceAuto: false,
+                status: 'RECHAZADO',
+                progressPercent: 100,
+                binanceExactAmountUSDT: montoExacto,
+                approvedByWorker: 'AUTO-BINANCE-PAY',
+                completedAt: new Date(),
+                paymentMethodName: `Binance Pay (${montoExacto.toFixed(3)} USDT • Expirado)`,
+                paymentReference: orden.paymentReference || `EXP-${montoExacto.toFixed(3)}`,
+                workerNotes: `⏰ Tiempo de espera agotado en Binance Pay (60 min sin recibir ${montoExacto.toFixed(3)} USDT • Checkout: ${checkoutIdTxt}).`,
+                statusMessage: `❌ Orden rechazada automáticamente: El tiempo de pago en Binance Pay expiró sin detectar la transferencia de ${montoExacto.toFixed(3)} USDT.`
+            }
+        },
+        { new: true }
+    );
+
+    return ordenExpirada || await Order.findOne({ orderId: orden.orderId });
+}
+
+// Ejecuta la acreditación o disparo de API apenas se confirma el pago exacto en Binance
+async function completarOrdenConfirmadaPorBinance(orden, txMatch) {
+    const txId = String(txMatch.transactionId || txMatch.orderId || ('BN-' + Date.now())).trim();
+    const payerName = txMatch.payerInfo?.name || txMatch.payerInfo?.binanceId || txMatch.receiverInfo?.name || '';
+    const montoExacto = obtenerMontoExactoEsperadoOrdenBinance(orden);
+
+    // Candado atómico compatible tanto con órdenes nuevas como con órdenes creadas antes de actualizar el esquema
+    const ordenBloqueada = await Order.findOneAndUpdate(
+        {
+            orderId: orden.orderId,
+            status: { $in: ['INICIANDO', 'EN_PROCESO'] },
+            $or: [
+                { isWaitingBinanceAuto: true },
+                { binanceTransactionId: '' },
+                { binanceTransactionId: null },
+                { binanceTransactionId: { $exists: false } }
+            ]
+        },
+        {
+            $set: {
+                isWaitingBinanceAuto: false,
+                binanceExactAmountUSDT: montoExacto,
                 binanceTransactionId: txId,
                 binancePayerName: String(payerName),
-                paymentReference: txId.slice(-8).toUpperCase(),
-                paymentMethodName: `Binance Pay Auto (${Number(orden.binanceExactAmountUSDT).toFixed(3)} USDT)`,
+                paymentReference: txId,
+                paymentMethodName: `Binance Pay Auto (${montoExacto.toFixed(3)} USDT${payerName ? ' • ' + payerName : ''})`,
                 timerStartedAt: new Date()
             }
         },
@@ -3522,14 +3553,15 @@ async function completarOrdenConfirmadaPorBinance(orden, txMatch) {
             tipo: 'Compra',
             tokens: ordenBloqueada.tokemsAmount,
             plan: ordenBloqueada.packageName,
-            precio: `${Number(ordenBloqueada.binanceExactAmountUSDT).toFixed(3)} USDT`,
-            detalles: `Recarga automática Binance Pay (#${ordenBloqueada.orderId})`
+            precio: `${montoExacto.toFixed(3)} USDT`,
+            detalles: `Recarga automática Binance Pay (#${ordenBloqueada.orderId} • TxID: ${txId})`
         }).save().catch(() => {});
 
         ordenBloqueada.status = 'ENTREGADO';
         ordenBloqueada.progressPercent = 100;
         ordenBloqueada.deliveredCode = `+${ordenBloqueada.tokemsAmount} TOKEMS KZ ACREDITADOS`;
-        ordenBloqueada.statusMessage = `¡Pago de ${Number(ordenBloqueada.binanceExactAmountUSDT).toFixed(3)} USDT confirmado! Se acreditaron +${ordenBloqueada.tokemsAmount} Tokems KZ en tu billetera.`;
+        ordenBloqueada.statusMessage = `¡Pago de ${montoExacto.toFixed(3)} USDT confirmado en Binance! Se acreditaron +${ordenBloqueada.tokemsAmount} Tokems KZ en tu billetera.`;
+        ordenBloqueada.workerNotes = `🤖 Aprobada automáticamente por Binance Pay (${montoExacto.toFixed(3)} USDT • TxID Binance: ${txId}${payerName ? ' • Pagador: ' + payerName : ''} • Checkout: ${ordenBloqueada.binanceCheckoutId || 'N/A'})`;
         ordenBloqueada.approvedByWorker = 'AUTO-BINANCE-PAY';
         ordenBloqueada.completedAt = new Date();
         await ordenBloqueada.save();
@@ -3540,8 +3572,8 @@ async function completarOrdenConfirmadaPorBinance(orden, txMatch) {
     if (ordenBloqueada.fulfillmentType === 'MANUAL_INTERNAL' || ordenBloqueada.subCategory === 'recargas_internas') {
         ordenBloqueada.status = 'EN_PROCESO';
         ordenBloqueada.progressPercent = 70;
-        ordenBloqueada.statusMessage = `✅ Pago de ${Number(ordenBloqueada.binanceExactAmountUSDT).toFixed(3)} USDT verificado automáticamente por Binance. Te escribiremos por WhatsApp para realizar tu recarga interna.`;
-        ordenBloqueada.workerNotes = `✅ PAGO BINANCE AUTO-VERIFICADO (${Number(ordenBloqueada.binanceExactAmountUSDT).toFixed(3)} USDT • TxID: ${txId})`;
+        ordenBloqueada.statusMessage = `✅ Pago de ${montoExacto.toFixed(3)} USDT verificado automáticamente por Binance. Te escribiremos por WhatsApp para realizar tu recarga interna.`;
+        ordenBloqueada.workerNotes = `✅ PAGO BINANCE AUTO-VERIFICADO (${montoExacto.toFixed(3)} USDT • TxID Binance: ${txId}${payerName ? ' • Pagador: ' + payerName : ''} • Checkout: ${ordenBloqueada.binanceCheckoutId || 'N/A'})`;
         await ordenBloqueada.save();
         return ordenBloqueada;
     }
@@ -3557,7 +3589,8 @@ async function completarOrdenConfirmadaPorBinance(orden, txMatch) {
             ordenBloqueada.apiOrderId = apiRes.apiOrderId || '';
             ordenBloqueada.apiRawResponse = apiRes.raw || null;
             ordenBloqueada.approvedByWorker = 'AUTO-BINANCE-PAY';
-            ordenBloqueada.statusMessage = `✅ Pago de ${Number(ordenBloqueada.binanceExactAmountUSDT).toFixed(3)} USDT confirmado. Ejecutando entrega automática de tu compra...`;
+            ordenBloqueada.workerNotes = `🤖 Pago Binance confirmado (${montoExacto.toFixed(3)} USDT • TxID: ${txId}${payerName ? ' • Pagador: ' + payerName : ''}). Procesando entrega API...`;
+            ordenBloqueada.statusMessage = `✅ Pago de ${montoExacto.toFixed(3)} USDT confirmado. Ejecutando entrega automática de tu compra...`;
         } else {
             ordenBloqueada.status = 'ENTREGADO';
             ordenBloqueada.progressPercent = 100;
@@ -3566,6 +3599,7 @@ async function completarOrdenConfirmadaPorBinance(orden, txMatch) {
             ordenBloqueada.apiRawResponse = apiRes.raw || null;
             ordenBloqueada.approvedByWorker = 'AUTO-BINANCE-PAY';
             ordenBloqueada.completedAt = new Date();
+            ordenBloqueada.workerNotes = `🤖 Entregada automáticamente vía Binance Pay (${montoExacto.toFixed(3)} USDT • TxID Binance: ${txId}${payerName ? ' • Pagador: ' + payerName : ''} • Checkout: ${ordenBloqueada.binanceCheckoutId || 'N/A'})`;
             ordenBloqueada.statusMessage = '¡Pago confirmado automáticamente por Binance Pay y pedido entregado con éxito!';
 
             if (ordenBloqueada.userEmail && ordenBloqueada.userEmail.includes('@')) {
@@ -3576,7 +3610,7 @@ async function completarOrdenConfirmadaPorBinance(orden, txMatch) {
                     html: `
                         <div style="font-family: sans-serif; background-color: #09090d; color: #ffffff; padding: 25px; border-radius: 14px; border: 2px solid #ff6600; max-width: 520px;">
                             <h2 style="color: #ff6600; margin-top: 0;">¡Tu compra #${ordenBloqueada.orderId} fue entregada! 🔥</h2>
-                            <p style="color: #cccccc;">Tu pago de <b>${Number(ordenBloqueada.binanceExactAmountUSDT).toFixed(3)} USDT</b> por Binance Pay fue verificado automáticamente.</p>
+                            <p style="color: #cccccc;">Tu pago de <b>${montoExacto.toFixed(3)} USDT</b> por Binance Pay (TxID: <code>${txId}</code>) fue verificado automáticamente.</p>
                             <div style="background: #14141d; padding: 15px; border-radius: 10px; border-left: 4px solid #ff6600; margin: 18px 0;">
                                 <p style="margin: 4px 0;"><b>Producto:</b> ${ordenBloqueada.productName}</p>
                                 <p style="margin: 4px 0;"><b>Paquete:</b> ${ordenBloqueada.packageName}</p>
@@ -3592,8 +3626,8 @@ async function completarOrdenConfirmadaPorBinance(orden, txMatch) {
         ordenBloqueada.status = 'ERROR_API';
         ordenBloqueada.progressPercent = 75;
         ordenBloqueada.approvedByWorker = 'AUTO-BINANCE-PAY';
-        ordenBloqueada.statusMessage = `✅ Pago de ${Number(ordenBloqueada.binanceExactAmountUSDT).toFixed(3)} USDT confirmado por Binance. Nuestro sistema está completando la liberación de tu pedido.`;
-        ordenBloqueada.workerNotes = `✅ Pago Binance Auto-Confirmado (${Number(ordenBloqueada.binanceExactAmountUSDT).toFixed(3)} USDT • TxID: ${txId}). Pendiente liberación.`;
+        ordenBloqueada.statusMessage = `✅ Pago de ${montoExacto.toFixed(3)} USDT confirmado por Binance. Nuestro sistema está completando la liberación de tu pedido.`;
+        ordenBloqueada.workerNotes = `✅ Pago Binance Auto-Confirmado (${montoExacto.toFixed(3)} USDT • TxID Binance: ${txId}${payerName ? ' • Pagador: ' + payerName : ''}). Pendiente liberación API: ${apiRes.errorMsg || ''}`;
     }
 
     if (ordenBloqueada.algoExecutionState) {
@@ -3605,26 +3639,41 @@ async function completarOrdenConfirmadaPorBinance(orden, txMatch) {
 
 // Busca si en la lista de transacciones de Binance ya llegó el pago exacto de una orden
 async function buscarCoincidenciaPagoBinanceParaOrden(orden, listaTx) {
-    if (!orden || !orden.binanceExactAmountUSDT || !Array.isArray(listaTx) || listaTx.length === 0) return null;
+    const montoEsperado = obtenerMontoExactoEsperadoOrdenBinance(orden);
+    if (!orden || montoEsperado <= 0 || !Array.isArray(listaTx) || listaTx.length === 0) return null;
 
-    const montoEsperado = Number(orden.binanceExactAmountUSDT);
-    const fechaOrdenMs = new Date(orden.fecha || orden.createdAt || Date.now()).getTime() - (3 * 60 * 1000);
+    // Ventana amplia de 30 minutos antes de la creación de la orden para tolerar cualquier desfase de reloj
+    const fechaOrdenMs = new Date(orden.fecha || orden.createdAt || Date.now()).getTime() - (30 * 60 * 1000);
 
-    for (const tx of listaTx) {
-        const moneda = String(tx.currency || tx.asset || '').toUpperCase();
+    // Ordenamos priorizando pagos entrantes (amount positivo) primero
+    const txsOrdenadas = [...listaTx].sort((a, b) => (Number(b.amount) > 0 ? 1 : 0) - (Number(a.amount) > 0 ? 1 : 0));
+
+    for (const tx of txsOrdenadas) {
+        const fundDetail = Array.isArray(tx.fundsDetail) && tx.fundsDetail.length > 0 ? tx.fundsDetail[0] : null;
+        const moneda = String(tx.currency || tx.asset || (fundDetail && fundDetail.currency) || '').toUpperCase();
         if (moneda && moneda !== 'USDT') continue;
 
-        const montoTx = Number(tx.amount);
+        const rawAmt = tx.amount !== undefined ? tx.amount : (fundDetail ? fundDetail.amount : 0);
+        const montoTx = Math.abs(Number(rawAmt));
         if (!Number.isFinite(montoTx) || montoTx <= 0) continue;
 
-        if (Math.abs(montoTx - montoEsperado) < 0.0001) {
-            const tiempoTx = Number(tx.transactionTime || tx.createTime || Date.now());
-            if (tiempoTx < fechaOrdenMs) continue;
+        if (Math.abs(montoTx - montoEsperado) < 0.00015) {
+            const tiempoTxRaw = tx.transactionTime || tx.createTime || Date.now();
+            const tiempoTx = typeof tiempoTxRaw === 'string' && isNaN(Number(tiempoTxRaw))
+                ? new Date(tiempoTxRaw).getTime()
+                : (Number(tiempoTxRaw) < 1e12 ? Number(tiempoTxRaw) * 1000 : Number(tiempoTxRaw));
+
+            if (tiempoTx > 0 && tiempoTx < fechaOrdenMs) continue;
 
             const txId = String(tx.transactionId || tx.orderId || '').trim();
             if (!txId) continue;
 
-            const yaUsada = await Order.findOne({ binanceTransactionId: txId }).select('_id orderId').lean();
+            // Verificar que este transactionId de Binance no haya sido usado en otra orden distinta
+            const yaUsada = await Order.findOne({
+                binanceTransactionId: txId,
+                orderId: { $ne: orden.orderId }
+            }).select('_id orderId').lean();
+
             if (!yaUsada) {
                 return tx;
             }
@@ -3633,23 +3682,40 @@ async function buscarCoincidenciaPagoBinanceParaOrden(orden, listaTx) {
     return null;
 }
 
-// Vigilante en segundo plano: cada 10s revisa si hay órdenes esperando pago automático de Binance
+// Vigilante en segundo plano: cada 10s revisa órdenes esperando Binance Pay (aprueba si pagó o rechaza si expiró el tiempo)
 setInterval(async () => {
     try {
+        const hace24Horas = new Date(Date.now() - 24 * 60 * 60 * 1000);
         const pendientesBinance = await Order.find({
-            isWaitingBinanceAuto: true,
-            binanceExpiresAt: { $gt: new Date() }
-        }).limit(15);
+            fecha: { $gte: hace24Horas },
+            $or: [
+                { isWaitingBinanceAuto: true },
+                { status: 'INICIANDO', paymentMethodKey: 'binance' }
+            ]
+        }).limit(25);
 
         if (pendientesBinance.length === 0) return;
 
         const resBinance = await consultarTransaccionesBinancePayAPI();
-        if (!resBinance.ok || resBinance.transactions.length === 0) return;
+        const listaTx = resBinance.ok ? (resBinance.transactions || []) : [];
 
         for (const ord of pendientesBinance) {
-            const matchTx = await buscarCoincidenciaPagoBinanceParaOrden(ord, resBinance.transactions);
+            const matchTx = listaTx.length > 0
+                ? await buscarCoincidenciaPagoBinanceParaOrden(ord, listaTx)
+                : null;
+
             if (matchTx) {
                 await completarOrdenConfirmadaPorBinance(ord, matchTx);
+                continue;
+            }
+
+            // Si no se detectó pago y ya se cumplieron los 60 minutos del checkout, pasa automáticamente a RECHAZADO
+            const limiteExpiracionMs = ord.binanceExpiresAt
+                ? new Date(ord.binanceExpiresAt).getTime()
+                : (new Date(ord.fecha || Date.now()).getTime() + 60 * 60 * 1000);
+
+            if (Date.now() >= limiteExpiracionMs && ord.status === 'INICIANDO') {
+                await rechazarOrdenBinancePorTiempoAgotado(ord);
             }
         }
     } catch (e) {}
@@ -3877,12 +3943,12 @@ app.post('/api/binance-pay/create-checkout', orderLimiter, verificarTokenOpciona
         const bcvAmountUSD = tasaBCV > 0 ? Number((totalVES / tasaBCV).toFixed(2)) : totalUSD;
         const discountUSD = Math.max(0, Number((bcvAmountUSD - totalUSD).toFixed(2)));
 
-        // Reservar el monto único con 3 decimales (ej: 10.011 USDT)
+        // Reservar el monto único con 3 decimales (ej: 0.941 USDT)
         const reservaDecimal = await reservarMontoUnicoBinanceUSDT(totalUSD);
 
         const orderId = 'KZ-' + crypto.randomInt(100000, 999999).toString();
         const checkoutId = 'ch_KZ' + crypto.randomBytes(6).toString('hex');
-        const expiraEn = new Date(Date.now() + 60 * 60 * 1000); // 60 minutos igual que Zeno Bank
+        const expiraEn = new Date(Date.now() + 60 * 60 * 1000); // 60 minutos
 
         let uidDestinoFinal = (playerUid || '').trim();
         if (!uidDestinoFinal) {
@@ -3941,7 +4007,7 @@ app.post('/api/binance-pay/create-checkout', orderLimiter, verificarTokenOpciona
 
         const metodoBinanceDB = await PaymentMethod.findOne({ methodKey: { $regex: /binance/i } }).lean();
         const cfgBinance = settings.binanceAutoConfig || {};
-        const payIdMostrar = (cfgBinance.payId || metodoBinanceDB?.phoneOrEmail || metodoBinanceDB?.binancePayId || '758 964 705').trim();
+        const payIdMostrar = (cfgBinance.payId || metodoBinanceDB?.phoneOrEmail || metodoBinanceDB?.binancePayId || '339 341 792').trim();
         const qrImgMostrar = (cfgBinance.qrImageUrl || '').trim();
 
         return res.json({
@@ -3977,7 +4043,8 @@ app.get('/api/binance-pay/check-status/:orderId', async (req, res) => {
         let orden = await Order.findOne({ orderId: idLimpio });
         if (!orden) return res.status(404).json({ error: 'Checkout no encontrado.' });
 
-        if (!orden.isWaitingBinanceAuto && (orden.status === 'ENTREGADO' || orden.status === 'EJECUTANDO_API' || orden.status === 'EN_PROCESO')) {
+        // Si ya fue pagada y procesada, devolver paid: true de inmediato
+        if (!orden.isWaitingBinanceAuto && (orden.status === 'ENTREGADO' || orden.status === 'EJECUTANDO_API' || orden.status === 'EN_PROCESO' || orden.status === 'ERROR_API')) {
             return res.json({
                 success: true,
                 paid: true,
@@ -3985,7 +4052,8 @@ app.get('/api/binance-pay/check-status/:orderId', async (req, res) => {
             });
         }
 
-        if (orden.binanceExpiresAt && new Date(orden.binanceExpiresAt).getTime() <= Date.now()) {
+        // Si ya había sido rechazada por expiración
+        if (orden.status === 'RECHAZADO') {
             return res.json({
                 success: true,
                 paid: false,
@@ -3994,6 +4062,7 @@ app.get('/api/binance-pay/check-status/:orderId', async (req, res) => {
             });
         }
 
+        // Consultar transacciones recientes en Binance Pay API
         const resBinance = await consultarTransaccionesBinancePayAPI();
         if (resBinance.ok && resBinance.transactions.length > 0) {
             const matchTx = await buscarCoincidenciaPagoBinanceParaOrden(orden, resBinance.transactions);
@@ -4007,11 +4076,27 @@ app.get('/api/binance-pay/check-status/:orderId', async (req, res) => {
             }
         }
 
+        // Si no se encontró pago y ya expiraron los 60 minutos, convertir automáticamente la orden en RECHAZADA
+        const limiteExpiracionMs = orden.binanceExpiresAt
+            ? new Date(orden.binanceExpiresAt).getTime()
+            : (new Date(orden.fecha || Date.now()).getTime() + 60 * 60 * 1000);
+
+        if (Date.now() >= limiteExpiracionMs) {
+            orden = await rechazarOrdenBinancePorTiempoAgotado(orden);
+            return res.json({
+                success: true,
+                paid: false,
+                expired: true,
+                order: orden
+            });
+        }
+
         return res.json({
             success: true,
             paid: false,
             expired: false,
             apiConnected: resBinance.ok,
+            apiError: resBinance.ok ? null : resBinance.error,
             order: orden
         });
     } catch (error) {
