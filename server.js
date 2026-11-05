@@ -494,8 +494,20 @@ exchangeRateApplied: { type: Number, required: true }, // Tasa KZ aplicada
     apiOrderId: { type: String, default: '' },
     apiRawResponse: { type: Object, default: null },
     workerNotes: { type: String, default: '' },
-    approvedByWorker: { type: String, default: '' },
+approvedByWorker: { type: String, default: '' },
     completedAt: { type: Date, default: null },
+    timerStartedAt: { type: Date, default: Date.now },
+    clientChoseToWait: { type: Boolean, default: false },
+    cancelledByDelayRefund: { type: Boolean, default: false },
+    refundTicketId: { type: String, default: '' },
+    algoExecutionState: { type: mongoose.Schema.Types.Mixed, default: null },
+    binanceCheckoutId: { type: String, default: '', index: true },
+    binanceExactAmountUSDT: { type: Number, default: 0, index: true },
+    binanceMicroDecimal: { type: String, default: '' },
+    binanceTransactionId: { type: String, default: '', index: true },
+    binancePayerName: { type: String, default: '' },
+    binanceExpiresAt: { type: Date, default: null },
+    isWaitingBinanceAuto: { type: Boolean, default: false, index: true },
     fecha: { type: Date, default: Date.now }
 }, { timestamps: true });
 
