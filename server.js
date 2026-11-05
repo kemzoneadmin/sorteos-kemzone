@@ -3767,14 +3767,50 @@ const orderId = 'KZ-' + crypto.randomInt(100000, 999999).toString();
 if (pagadoConTokems && settings.autoTriggerApiOnTokems && fulfillment !== 'MANUAL_INTERNAL') {
             const apiRes = await ejecutarEntregaPorAPI(nuevaOrden, productoDB);
             if (apiRes.success) {
-                nuevaOrden.status = 'ENTREGADO';
-                nuevaOrden.statusMessage = '¡Tu pedido ha sido entregado automáticamente con éxito!';
-                nuevaOrden.progressPercent = 100;
-                nuevaOrden.deliveredCode = apiRes.deliveredCode;
-                nuevaOrden.apiOrderId = apiRes.apiOrderId;
-                nuevaOrden.apiRawResponse = apiRes.raw;
-                nuevaOrden.approvedByWorker = 'AUTO-TOKEMS-API';
-                nuevaOrden.completedAt = new Date();
+                if (apiRes.isProcessingAsync) {
+                    nuevaOrden.status = 'EJECUTANDO_API';
+                    nuevaOrden.statusMessage = 'Pago con Tokems KZ recibido. Procesando la entrega automática de tu compra...';
+                    nuevaOrden.progressPercent = 85;
+                    nuevaOrden.apiOrderId = apiRes.apiOrderId || '';
+                    nuevaOrden.apiRawResponse = apiRes.raw || null;
+                    nuevaOrden.approvedByWorker = 'AUTO-TOKEMS-API';
+                } else {
+                    nuevaOrden.status = 'ENTREGADO';
+                    nuevaOrden.statusMessage = '¡Tu pedido ha sido entregado automáticamente con éxito!';
+                    nuevaOrden.progressPercent = 100;
+                    nuevaOrden.deliveredCode = apiRes.deliveredCode;
+                    nuevaOrden.apiOrderId = apiRes.apiOrderId || '';
+                    nuevaOrden.apiRawResponse = apiRes.raw || null;
+                    nuevaOrden.approvedByWorker = 'AUTO-TOKEMS-API';
+                    nuevaOrden.completedAt = new Date();
+
+                    if (nuevaOrden.userEmail && nuevaOrden.userEmail.includes('@')) {
+                        resend.emails.send({
+                            from: 'Kem!Zone Oficial <registro@kzsorteos.com>',
+                            to: nuevaOrden.userEmail,
+                            subject: `✅ Pedido Entregado #${nuevaOrden.orderId} - ${nuevaOrden.productName}`,
+                            html: `
+                                <div style="font-family: sans-serif; background-color: #09090d; color: #ffffff; padding: 25px; border-radius: 14px; border: 2px solid #ff6600; max-width: 520px;">
+                                    <h2 style="color: #ff6600; margin-top: 0;">¡Tu compra #${nuevaOrden.orderId} fue entregada! 🔥</h2>
+                                    <p style="color: #cccccc;">Tu pago con Tokems KZ fue procesado automáticamente con éxito.</p>
+                                    <div style="background: #14141d; padding: 15px; border-radius: 10px; border-left: 4px solid #ff6600; margin: 18px 0;">
+                                        <p style="margin: 4px 0;"><b>Producto:</b> ${nuevaOrden.productName}</p>
+                                        <p style="margin: 4px 0;"><b>Paquete:</b> ${nuevaOrden.packageName}</p>
+                                        <p style="margin: 4px 0;"><b>Destino / ID:</b> ${nuevaOrden.playerUid}</p>
+                                        <p style="margin: 12px 0 4px 0; color: #00e676; font-size: 16px;"><b>🎁 Entrega / Código:</b> <code style="background:#000; padding:5px 10px; border-radius:6px; color:#fff;">${nuevaOrden.deliveredCode}</code></p>
+                                    </div>
+                                </div>
+                            `
+                        }).catch(() => {});
+                    }
+                }
+            } else {
+                nuevaOrden.status = 'ERROR_API';
+                nuevaOrden.statusMessage = 'Pago con Tokems KZ verificado. Un operador completará la liberación de tu entrega en breve.';
+                nuevaOrden.progressPercent = 75;
+            }
+            if (nuevaOrden.algoExecutionState) {
+                nuevaOrden.markModified('algoExecutionState');
             }
         }
 
