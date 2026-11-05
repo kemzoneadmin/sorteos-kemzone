@@ -271,6 +271,7 @@ const StoreSettingsSchema = new mongoose.Schema({
     },
     navigationConfig: { type: mongoose.Schema.Types.Mixed, default: null },
     flyersCanvaConfig: { type: mongoose.Schema.Types.Mixed, default: null },
+    steamCalculatorConfig: { type: mongoose.Schema.Types.Mixed, default: null },
 
 // 🧠 BÓVEDA DE TARJETAS BASE DEL PROVEEDOR PARA EL ALGORITMO DE CÓDIGOS (STEAM, PSN, NINTENDO, ETC.)
     arbitrageBaseCards: [{
@@ -4770,6 +4771,7 @@ app.post('/api/admin/settings', verificarSoloAdmin, async (req, res) => {
             catalogSectionConfig,
             navigationConfig,
             flyersCanvaConfig,
+            steamCalculatorConfig,
             arbitrageBaseCards
         } = req.body;
 
@@ -4811,6 +4813,10 @@ app.post('/api/admin/settings', verificarSoloAdmin, async (req, res) => {
         if (flyersCanvaConfig && typeof flyersCanvaConfig === 'object') {
             settings.flyersCanvaConfig = flyersCanvaConfig;
             settings.markModified('flyersCanvaConfig');
+        }
+        if (steamCalculatorConfig && typeof steamCalculatorConfig === 'object') {
+            settings.steamCalculatorConfig = steamCalculatorConfig;
+            settings.markModified('steamCalculatorConfig');
         }
         if (Array.isArray(arbitrageBaseCards)) {
             settings.arbitrageBaseCards = arbitrageBaseCards;
