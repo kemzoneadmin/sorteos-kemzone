@@ -2315,6 +2315,138 @@ function obtenerGananciaRangoSteamServer(precioUsd) {
     return 0.25;
 }
 
+// 🔍 Extrae la lista de juegos individuales de una orden de Calculadora de Steam
+function extraerJuegosIndividualesDeOrdenSteam(orden) {
+    if (!orden) return [];
+    if (Array.isArray(orden.algoExecutionState?.gamesTargetsUSD) && orden.algoExecutionState.gamesTargetsUSD.length > 0) {
+        return orden.algoExecutionState.gamesTargetsUSD
+            .map((g, i) => ({
+                label: String(g.label || g.name || `Juego ${i + 1}`).trim(),
+                usdR: Math.round((Number(g.usdR || g.targetUSD || g.priceUSD || 0) + Number.EPSILON) * 100) / 100
+            }))
+            .filter(g => g.usdR > 0);
+    }
+
+    if (String(orden.productSlug || '').toLowerCase() === 'calculadora-steam' && orden.packageName) {
+        const pkgTxt = String(orden.packageName || '');
+        const parteJuegos = pkgTxt.split('➔')[0] || pkgTxt;
+        const regexJuegos = /([^+]+?)\s*\(\$(\d+(?:[.,]\d+)?)\)/g;
+        const extraidos = [];
+        let m;
+        while ((m = regexJuegos.exec(parteJuegos)) !== null) {
+            const val = Math.round((parseFloat(String(m[2]).replace(',', '.')) + Number.EPSILON) * 100) / 100;
+            if (val > 0) {
+                extraidos.push({
+                    label: m[1].trim() || `Juego ${extraidos.length + 1}`,
+                    usdR: val
+                });
+            }
+        }
+        if (extraidos.length > 0) return extraidos;
+    }
+    return [];
+}
+
+// 🧠 Calcula los códigos exactos para cada juego POR SEPARADO y une las tarjetas resultantes
+function calcularCombinacionListaJuegosSeparadosSteam(validGames, baseCardsPool, catalogCache = null, excludedCardIds = []) {
+    const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+    const round4 = (n) => Math.round((Number(n) + Number.EPSILON) * 10000) / 10000;
+
+    if (!Array.isArray(validGames) || validGames.length === 0) {
+        return { hasSolution: false, reason: 'No hay juegos válidos para calcular.' };
+    }
+
+    const poolSimulado = (baseCardsPool || []).map(rawCard => {
+        const c = rawCard && typeof rawCard.toObject === 'function'
+            ? rawCard.toObject()
+            : (rawCard && rawCard._doc ? { ...rawCard._doc } : { ...rawCard });
+        return {
+            ...c,
+            internalCodeStock: Array.isArray(c.internalCodeStock) ? [...c.internalCodeStock] : []
+        };
+    });
+
+    const perGamePlans = [];
+    const mapaTarjetasSumadas = new Map();
+    let totalCardsSeparadas = 0;
+    let totalClientUSDSeparado = 0;
+    let totalCostUSDSeparado = 0;
+    let totalPriceJuegosUSD = 0;
+
+    for (let i = 0; i < validGames.length; i++) {
+        const g = validGames[i];
+        const metaJuegoUSD = round2(g.usdR || g.targetUSD || g.priceUSD || 0);
+        if (metaJuegoUSD <= 0) continue;
+
+        const planIndiv = calcularMejorCombinacionTarjetasPool(
+            metaJuegoUSD,
+            'steam',
+            poolSimulado,
+            catalogCache,
+            excludedCardIds
+        );
+
+        if (!planIndiv || !planIndiv.hasSolution) {
+            return {
+                hasSolution: false,
+                reason: `En ${g.label || `Juego ${i + 1}`} ($${metaJuegoUSD.toFixed(2)}): ${(planIndiv && planIndiv.reason) || 'Sin stock para cubrir este juego.'}`
+            };
+        }
+
+        // Descontar stock simulado entre un juego y el siguiente de la misma compra
+        (planIndiv.items || []).forEach(usedIt => {
+            const cardEnPool = poolSimulado.find(c => c.cardId === usedIt.cardId);
+            if (cardEnPool) {
+                let qtyRestante = Number(usedIt.quantity || 1);
+                while (qtyRestante > 0 && Array.isArray(cardEnPool.internalCodeStock) && cardEnPool.internalCodeStock.length > 0) {
+                    cardEnPool.internalCodeStock.shift();
+                    qtyRestante--;
+                }
+                if (cardEnPool.availableStock !== null && cardEnPool.availableStock !== undefined) {
+                    cardEnPool.availableStock = Math.max(0, Number(cardEnPool.availableStock) - Number(usedIt.quantity || 1));
+                }
+            }
+        });
+
+        perGamePlans.push({
+            label: g.label || `Juego ${i + 1}`,
+            usdR: metaJuegoUSD,
+            planIndiv
+        });
+
+        totalPriceJuegosUSD = round2(totalPriceJuegosUSD + metaJuegoUSD);
+        totalCardsSeparadas += Number(planIndiv.totalCards || 0);
+        totalClientUSDSeparado = round2(totalClientUSDSeparado + Number(planIndiv.totalClientUSD || 0));
+        totalCostUSDSeparado = round4(totalCostUSDSeparado + Number(planIndiv.totalCostUSD || 0));
+
+        (planIndiv.items || []).forEach(it => {
+            const key = it.cardId || it.sku || it.name;
+            if (mapaTarjetasSumadas.has(key)) {
+                mapaTarjetasSumadas.get(key).quantity += Number(it.quantity || 1);
+            } else {
+                mapaTarjetasSumadas.set(key, { ...it, quantity: Number(it.quantity || 1) });
+            }
+        });
+    }
+
+    const itemsCombinados = Array.from(mapaTarjetasSumadas.values());
+    const bonusTotal = round2(Math.max(0, totalClientUSDSeparado - totalPriceJuegosUSD));
+
+    return {
+        hasSolution: true,
+        totalCards: totalCardsSeparadas,
+        totalClientUSD: totalClientUSDSeparado,
+        totalCostUSD: totalCostUSDSeparado,
+        bonusClientUSD: bonusTotal,
+        overshootUSD: bonusTotal,
+        items: itemsCombinados,
+        perGamePlans,
+        summaryText: itemsCombinados
+            .map(it => `${it.quantity}x ${it.name} ($${(it.unitClientUSD * it.quantity).toFixed(2)})`)
+            .join(' + ')
+    };
+}
+
 // 🚀 EJECUTOR PRINCIPAL DE ENTREGA (USA STOCK INTERNO PRIMERO + ALGORITMO PASO A PASO + CENTRAL ONE API)
 async function ejecutarEntregaPorAPI(orden, productoDB) {
     orden.timerStartedAt = new Date();
@@ -2403,15 +2535,23 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
             const platGroup = (productoDB && productoDB.smartPlatformGroup) || 'steam';
             const esSteamPool = String(platGroup).toLowerCase() === 'steam' || esSteamOrder;
             const excluidosFallidos = [];
+            const juegosSeparados = extraerJuegosIndividualesDeOrdenSteam(orden);
 
             for (let intento = 1; intento <= 2; intento++) {
-                const combo = calcularMejorCombinacionTarjetasPool(
-                    pkg.targetClientUSD,
-                    platGroup,
-                    poolCards,
-                    settings ? settings.centralOneCatalogCache : null,
-                    excluidosFallidos
-                );
+                const combo = juegosSeparados.length > 0
+                    ? calcularCombinacionListaJuegosSeparadosSteam(
+                        juegosSeparados,
+                        poolCards,
+                        settings ? settings.centralOneCatalogCache : null,
+                        excluidosFallidos
+                      )
+                    : calcularMejorCombinacionTarjetasPool(
+                        pkg.targetClientUSD,
+                        platGroup,
+                        poolCards,
+                        settings ? settings.centralOneCatalogCache : null,
+                        excluidosFallidos
+                      );
 
                 if (!combo.hasSolution) {
                     await registrarAlertaCentralOne(settings, {
@@ -3960,31 +4100,32 @@ app.post('/api/binance-pay/create-checkout', orderLimiter, verificarTokenOpciona
             }
 
             if (validGames.length === 0) {
-                return res.status(400).json({ error: 'Ingresa al menos un juego con precio válido en la Calculadora de Steam.' });
+return res.status(400).json({ error: 'Ingresa al menos un juego con precio válido en la Calculadora de Steam.' });
             }
 
             const totalPriceUsd = round2(validGames.reduce((a, it) => a + it.usdR, 0));
-            const planTarjetas = calcularMejorCombinacionTarjetasPool(
-                totalPriceUsd,
-                'steam',
+            const planTarjetas = calcularCombinacionListaJuegosSeparadosSteam(
+                validGames,
                 settings.arbitrageBaseCards || [],
                 settings.centralOneCatalogCache || null
             );
 
             if (!planTarjetas || !planTarjetas.hasSolution) {
                 return res.status(400).json({
-                    error: (planTarjetas && planTarjetas.reason) || `No hay combinación de tarjetas en stock para cubrir $${totalPriceUsd.toFixed(2)} USD.`
+                    error: (planTarjetas && planTarjetas.reason) || `No hay combinación de tarjetas en stock para cubrir los juegos solicitados.`
                 });
             }
 
             const costoTarjetasTotal = Number(planTarjetas.totalCostUSD);
-            const itemsCalc = validGames.map(it => {
-                const planIndiv = calcularMejorCombinacionTarjetasPool(
-                    it.usdR,
-                    'steam',
-                    settings.arbitrageBaseCards || [],
-                    settings.centralOneCatalogCache || null
-                );
+            const itemsCalc = validGames.map((it, idx) => {
+                const planIndiv = (planTarjetas.perGamePlans && planTarjetas.perGamePlans[idx]?.planIndiv)
+                    ? planTarjetas.perGamePlans[idx].planIndiv
+                    : calcularMejorCombinacionTarjetasPool(
+                        it.usdR,
+                        'steam',
+                        settings.arbitrageBaseCards || [],
+                        settings.centralOneCatalogCache || null
+                    );
                 const costoIndiv = (planIndiv && planIndiv.hasSolution) ? Number(planIndiv.totalCostUSD) : it.usdR;
                 const difIndiv = Math.max(0, round4(costoIndiv - it.usdR));
                 const subExact = round4(it.usdR + difIndiv + it.tierFee);
@@ -3996,7 +4137,7 @@ app.post('/api/binance-pay/create-checkout', orderLimiter, verificarTokenOpciona
             const resumenJuegosTxt = validGames.map(g => `${g.label} ($${g.usdR.toFixed(2)})`).join(' + ');
 
             nombreProducto = 'Compra tus Juegos de Steam';
-            nombrePaquete = packageName || `${resumenJuegosTxt} ➔ Recibes $${Number(planTarjetas.totalClientUSD).toFixed(2)} USD en Steam`;
+            nombrePaquete = `${resumenJuegosTxt} ➔ Recibes $${Number(planTarjetas.totalClientUSD).toFixed(2)} USD en Steam`;
             mainCat = 'giftcards';
             subCat = 'giftcards_plataformas';
             fulfillment = 'API_GIFT_CARD';
@@ -4011,6 +4152,7 @@ app.post('/api/binance-pay/create-checkout', orderLimiter, verificarTokenOpciona
                 isAlgorithmOrder: true,
                 platformGroup: 'steam',
                 targetClientUSD: totalPriceUsd,
+                gamesTargetsUSD: validGames.map(g => ({ label: g.label, usdR: g.usdR })),
                 deliveredClientUSD: 0,
                 deliveredCostUSD: 0,
                 deliveredCodesList: [],
@@ -4619,31 +4761,32 @@ let estadoAlgoritmoInicial = null;
             }
 
             if (validGames.length === 0) {
-                return res.status(400).json({ error: 'Debes ingresar al menos un juego con precio válido en la Calculadora de Steam.' });
+return res.status(400).json({ error: 'Debes ingresar al menos un juego con precio válido en la Calculadora de Steam.' });
             }
 
             const totalPriceUsd = round2(validGames.reduce((a, it) => a + it.usdR, 0));
-            const planTarjetas = calcularMejorCombinacionTarjetasPool(
-                totalPriceUsd,
-                'steam',
+            const planTarjetas = calcularCombinacionListaJuegosSeparadosSteam(
+                validGames,
                 settings.arbitrageBaseCards || [],
                 settings.centralOneCatalogCache || null
             );
 
             if (!planTarjetas || !planTarjetas.hasSolution) {
                 return res.status(400).json({
-                    error: (planTarjetas && planTarjetas.reason) || `Por el momento no hay combinación de tarjetas en stock para cubrir $${totalPriceUsd.toFixed(2)} USD.`
+                    error: (planTarjetas && planTarjetas.reason) || `Por el momento no hay combinación de tarjetas en stock para cubrir los juegos solicitados.`
                 });
             }
 
             const costoTarjetasTotal = Number(planTarjetas.totalCostUSD);
-            const itemsCalc = validGames.map(it => {
-                const planIndiv = calcularMejorCombinacionTarjetasPool(
-                    it.usdR,
-                    'steam',
-                    settings.arbitrageBaseCards || [],
-                    settings.centralOneCatalogCache || null
-                );
+            const itemsCalc = validGames.map((it, idx) => {
+                const planIndiv = (planTarjetas.perGamePlans && planTarjetas.perGamePlans[idx]?.planIndiv)
+                    ? planTarjetas.perGamePlans[idx].planIndiv
+                    : calcularMejorCombinacionTarjetasPool(
+                        it.usdR,
+                        'steam',
+                        settings.arbitrageBaseCards || [],
+                        settings.centralOneCatalogCache || null
+                    );
                 const costoIndiv = (planIndiv && planIndiv.hasSolution) ? Number(planIndiv.totalCostUSD) : it.usdR;
                 const difIndiv = Math.max(0, round4(costoIndiv - it.usdR));
                 const subExact = round4(it.usdR + difIndiv + it.tierFee);
@@ -4655,7 +4798,7 @@ let estadoAlgoritmoInicial = null;
             const resumenJuegosTxt = validGames.map(g => `${g.label} ($${g.usdR.toFixed(2)})`).join(' + ');
 
             nombreProducto = 'Compra tus Juegos de Steam';
-            nombrePaquete = req.body.packageName || `${resumenJuegosTxt} ➔ Recibes $${Number(planTarjetas.totalClientUSD).toFixed(2)} USD en Steam`;
+            nombrePaquete = `${resumenJuegosTxt} ➔ Recibes $${Number(planTarjetas.totalClientUSD).toFixed(2)} USD en Steam`;
             mainCat = 'giftcards';
             subCat = 'giftcards_plataformas';
             fulfillment = 'API_GIFT_CARD';
@@ -4670,6 +4813,7 @@ let estadoAlgoritmoInicial = null;
                 isAlgorithmOrder: true,
                 platformGroup: 'steam',
                 targetClientUSD: totalPriceUsd,
+                gamesTargetsUSD: validGames.map(g => ({ label: g.label, usdR: g.usdR })),
                 deliveredClientUSD: 0,
                 deliveredCostUSD: 0,
                 deliveredCodesList: [],
