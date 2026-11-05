@@ -3432,14 +3432,14 @@ let estadoAlgoritmoInicial = null;
             fulfillment = 'TOKEM_WALLET_CREDIT';
             baseUSD = Number((cantTokems * (settings.tokemValueUSD || 1)).toFixed(2));
             costoEnTokems = cantTokems;
-        } else if (String(productSlug || '').trim().toLowerCase() === 'calculadora-steam') {
+} else if (String(productSlug || '').trim().toLowerCase() === 'calculadora-steam') {
             const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
             const round4 = (n) => Math.round((Number(n) + Number.EPSILON) * 10000) / 10000;
             const ceil2  = (n) => Math.ceil(round4(n) * 100 - 1e-6) / 100;
 
             const calcData = req.body.customSteamCalcData || {};
             const rawGames = Array.isArray(calcData.gamesList) ? calcData.gamesList : [];
-            const validGames = rawGames
+            let validGames = rawGames
                 .map((g, idx) => {
                     const usdR = round2(parseFloat(g.priceUSD) || 0);
                     return {
@@ -3449,6 +3449,37 @@ let estadoAlgoritmoInicial = null;
                     };
                 })
                 .filter(g => g.usdR > 0);
+
+            // Soporte para "Repetir Compra" desde Mi Cuenta cuando no viene customSteamCalcData en vivo
+            if (validGames.length === 0 && req.body.packageName) {
+                const pkgTxt = String(req.body.packageName || '');
+                const parteJuegos = pkgTxt.split('➔')[0] || pkgTxt;
+                const regexJuegos = /([^+]+?)\s*\(\$(\d+(?:\.\d+)?)\)/g;
+                let matchG;
+                while ((matchG = regexJuegos.exec(parteJuegos)) !== null) {
+                    const pVal = round2(parseFloat(matchG[2]) || 0);
+                    if (pVal > 0) {
+                        validGames.push({
+                            label: matchG[1].trim() || 'Juego Steam',
+                            usdR: pVal,
+                            tierFee: round2(obtenerGananciaRangoSteamServer(pVal))
+                        });
+                    }
+                }
+                if (validGames.length === 0) {
+                    const matchMeta = pkgTxt.match(/\$(\d+(?:\.\d+)?)/);
+                    if (matchMeta) {
+                        const pVal = round2(parseFloat(matchMeta[1]) || 0);
+                        if (pVal > 0) {
+                            validGames.push({
+                                label: 'Juego Steam',
+                                usdR: pVal,
+                                tierFee: round2(obtenerGananciaRangoSteamServer(pVal))
+                            });
+                        }
+                    }
+                }
+            }
 
             if (validGames.length === 0) {
                 return res.status(400).json({ error: 'Debes ingresar al menos un juego con precio válido en la Calculadora de Steam.' });
@@ -3482,7 +3513,7 @@ let estadoAlgoritmoInicial = null;
             const subtotalCalculado = round2(itemsCalc.reduce((a, it) => a + it.sub, 0));
             const resumenJuegosTxt = validGames.map(g => `${g.label} ($${g.usdR.toFixed(2)})`).join(' + ');
 
-            nombreProducto = 'Calculadora de Juegos Steam';
+            nombreProducto = 'Compra tus Juegos de Steam';
             nombrePaquete = req.body.packageName || `${resumenJuegosTxt} ➔ Recibes $${Number(planTarjetas.totalClientUSD).toFixed(2)} USD en Steam`;
             mainCat = 'giftcards';
             subCat = 'giftcards_plataformas';
