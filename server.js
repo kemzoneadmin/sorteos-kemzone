@@ -1906,8 +1906,19 @@ setTimeout(() => {
     }
 }, 6000);
 
+// 🏷️ Formatea el código agregándole "Steam Wallet X,XX$ ➔ " si pertenece al pool de Steam
+function formatearCodigoConEtiquetaSteam(codeStr, amountUSD, esSteam = true) {
+    const limpio = String(codeStr || '').trim();
+    if (!limpio) return '';
+    if (limpio.toLowerCase().includes('steam wallet')) return limpio;
+    const num = Number(amountUSD) || 0;
+    if (!esSteam || num <= 0) return limpio;
+    const montoComa = num.toFixed(2).replace('.', ',');
+    return `Steam Wallet ${montoComa}$ ➔ ${limpio}`;
+}
+
 // 🔎 CONSULTAR ESTADO DETALLADO Y CÓDIGOS POR LÍNEA EN CENTRAL ONE (`GET /orders/{id}` y `GET /orders/{id}/codes`)
-async function verificarYExtraerEntregaCentralOne(coOrderId, headers) {
+async function verificarYExtraerEntregaCentralOne(coOrderId, headers, poolCards = null, esSteamOrder = false, fallbackUnitUSD = 0) {
     const resOrder = await axios.get(`${CENTRAL_ONE_BASE_URL}/orders/${encodeURIComponent(coOrderId)}`, {
         headers,
         timeout: 12000
@@ -1932,17 +1943,35 @@ async function verificarYExtraerEntregaCentralOne(coOrderId, headers) {
             const codeItems = resCodes.data?.order?.items || [];
             codeItems.forEach(ci => {
                 if (Array.isArray(ci.codes) && ci.codes.length > 0) {
+                    const catId = ci.catalog_item_id || ci.product_id || '';
+                    const skuUp = String(ci.sku || '').trim().toUpperCase();
+                    let unitUsdCard = fallbackUnitUSD;
+
+                    if (Array.isArray(poolCards) && poolCards.length > 0) {
+                        const matchCard = poolCards.find(c =>
+                            (catId && c.centralOneProductId === catId) ||
+                            (skuUp && String(c.centralOneSku || '').trim().toUpperCase() === skuUp)
+                        );
+                        if (matchCard && Number(matchCard.effectiveClientUSD) > 0) {
+                            unitUsdCard = Number(matchCard.effectiveClientUSD);
+                        }
+                    }
+
+                    const codigosFormateadosItem = ci.codes.map(cStr =>
+                        formatearCodigoConEtiquetaSteam(cStr, unitUsdCard, esSteamOrder)
+                    );
+
                     codigosPorItem.push({
-                        catalogItemId: ci.catalog_item_id || ci.product_id || '',
-                        codes: ci.codes
+                        catalogItemId: catId,
+                        codes: codigosFormateadosItem,
+                        rawCodes: ci.codes
                     });
-                    ci.codes.forEach(cStr => codigosPlanos.push(cStr));
+                    codigosFormateadosItem.forEach(cStr => codigosPlanos.push(cStr));
                 }
             });
         } catch (errCodes) {}
     }
 
-    // 1. Si el 100% de las tarjetas de esta orden de Central One se entregaron
     if (st === 'completed') {
         const textoFinal = codigosPlanos.length > 0
             ? codigosPlanos.join('  |  ')
@@ -1960,7 +1989,6 @@ async function verificarYExtraerEntregaCentralOne(coOrderId, headers) {
         };
     }
 
-    // 2. Si Central One terminó como 'partially_completed' (entregó unas tarjetas y reembolsó las faltantes)
     if (st === 'partially_completed') {
         const failedCatalogIds = lines
             .filter(l => (Number(l.delivered_count) || 0) < (Number(l.quantity) || 1))
@@ -1979,7 +2007,6 @@ async function verificarYExtraerEntregaCentralOne(coOrderId, headers) {
         };
     }
 
-    // 3. Si Central One falló o canceló/reembolsó toda la orden
     if (st === 'failed' || st === 'cancelled') {
         const firstFailedLine = lines.find(l => l.failure) || {};
         const failureInfo = firstFailedLine.failure || coOrder.failure || {};
@@ -1994,7 +2021,6 @@ async function verificarYExtraerEntregaCentralOne(coOrderId, headers) {
         };
     }
 
-    // 4. Sigue en espera ('confirmed' / 'processing'): esperamos sin pedir duplicados
     return {
         state: 'PROCESSING',
         codigosPlanos,
@@ -2027,7 +2053,6 @@ function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId, fallbackIdemp
                 return;
             }
 
-            // Si la petición inicial dio timeout mientras Central One creaba la orden, recuperamos el ID usando la misma Idempotency-Key (sin duplicar cobro)
             if (!currentCoOrderId && ordenDB.apiOrderId && !ordenDB.apiOrderId.startsWith('kz-ord-')) {
                 currentCoOrderId = ordenDB.apiOrderId;
             }
@@ -2056,9 +2081,13 @@ function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId, fallbackIdemp
                 return;
             }
 
-            const check = await verificarYExtraerEntregaCentralOne(currentCoOrderId, headers);
+            const settings = await StoreSettings.findOne({ key: 'main_settings' });
+            const poolCards = settings ? (settings.arbitrageBaseCards || []) : [];
+            const esSteamOrd = String(ordenDB.productSlug || '').toLowerCase().includes('steam') ||
+                               String(ordenDB.algoExecutionState?.platformGroup || '').toLowerCase() === 'steam';
 
-            // 🏦 Si el cliente ya había cancelado por reembolso a los 30 min y Central One acaba de entregar códigos: guardarlos en Stock Interno
+            const check = await verificarYExtraerEntregaCentralOne(currentCoOrderId, headers, poolCards, esSteamOrd, 0);
+
             if (ordenDB.cancelledByDelayRefund || ordenDB.status === 'RECHAZADO') {
                 if (check.state === 'COMPLETED' || check.state === 'PARTIAL_REFUNDED') {
                     await guardarCodigosRecuperadosEnStockInterno(ordenDB, check.codigosPorItem, check.codigosPlanos);
@@ -2104,9 +2133,6 @@ function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId, fallbackIdemp
 
             // 🔄 CASO B: ENTREGA PARCIAL CON REEMBOLSO DE FALTANTES O FALLO/REEMBOLSO EN ALGORITMO
             if ((check.state === 'PARTIAL_REFUNDED' || check.state === 'FAILED') && algoState && algoState.isAlgorithmOrder) {
-                const settings = await StoreSettings.findOne({ key: 'main_settings' });
-                const poolCards = settings ? (settings.arbitrageBaseCards || []) : [];
-
                 if (check.state === 'PARTIAL_REFUNDED' && Array.isArray(check.codigosPorItem)) {
                     for (const cItem of check.codigosPorItem) {
                         const cardMatch = poolCards.find(c => c.centralOneProductId === cItem.catalogItemId);
@@ -2214,7 +2240,6 @@ function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId, fallbackIdemp
                 ordenDB.status = 'ERROR_API';
                 ordenDB.statusMessage = 'Pago verificado. Nuestro sistema está completando la liberación de tu pedido.';
                 await ordenDB.save();
-                const settings = await StoreSettings.findOne({ key: 'main_settings' });
                 await registrarAlertaCentralOne(settings, {
                     type: 'ORDER_FAILED',
                     severity: 'CRIT',
@@ -2226,7 +2251,7 @@ function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId, fallbackIdemp
                 return;
             }
 
-            // ⏳ CASO D: SIGUE EN ESPERA EN CENTRAL ONE (Actualizamos contador de etapas si ya entregó parte)
+            // ⏳ CASO D: SIGUE EN ESPERA EN CENTRAL ONE
             if (algoState && check.deliveredCardsCount !== undefined) {
                 const prevCount = (algoState.deliveredCodesList ? algoState.deliveredCodesList.length : 0) + Number(check.deliveredCardsCount || 0);
                 if (algoState.deliveredCardsCount !== prevCount) {
@@ -2292,7 +2317,7 @@ function obtenerGananciaRangoSteamServer(precioUsd) {
 
 // 🚀 EJECUTOR PRINCIPAL DE ENTREGA (USA STOCK INTERNO PRIMERO + ALGORITMO PASO A PASO + CENTRAL ONE API)
 async function ejecutarEntregaPorAPI(orden, productoDB) {
-    orden.timerStartedAt = new Date(); // Reinicia el reloj de 30 minutos al momento de aprobar y disparar la API
+    orden.timerStartedAt = new Date();
 
     if (!productoDB && orden.productSlug === 'calculadora-steam') {
         const metaSteam = Number(orden.algoExecutionState?.targetClientUSD || orden.baseAmountUSD || 5);
@@ -2326,8 +2351,15 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
         : (productoDB ? productoDB.packages : []);
     const pkg = (listaPaquetes || []).find(p => p.packageId === orden.packageId);
 
+    const settings = await StoreSettings.findOne({ key: 'main_settings' });
+    const poolCards = settings ? (settings.arbitrageBaseCards || []) : [];
+    const esSteamOrder = String(orden.productSlug || '').toLowerCase().includes('steam') ||
+                         String((productoDB && productoDB.smartPlatformGroup) || '').toLowerCase() === 'steam';
+
     if (pkg && Array.isArray(pkg.backupPinVault) && pkg.backupPinVault.length > 0) {
-        const pinExtraido = pkg.backupPinVault.shift();
+        const pinRaw = pkg.backupPinVault.shift();
+        const montoPkg = Number(pkg.targetClientUSD || pkg.priceUSD || 0);
+        const pinExtraido = formatearCodigoConEtiquetaSteam(pinRaw, montoPkg, esSteamOrder);
         await productoDB.save();
         return {
             success: true,
@@ -2338,12 +2370,10 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
     }
 
     const headersBase = obtenerHeadersCentralOne();
-    const settings = await StoreSettings.findOne({ key: 'main_settings' });
 
-    // Si la orden ya tenía un apiOrderId de Central One asignado previamente, verificar su estado antes de crear otra
     if (headersBase && orden.apiOrderId && !orden.apiOrderId.startsWith('VAULT-') && !orden.apiOrderId.startsWith('INTERNAL-') && !orden.apiOrderId.startsWith('API-') && !orden.apiOrderId.startsWith('kz-ord-')) {
         try {
-            const checkPrev = await verificarYExtraerEntregaCentralOne(orden.apiOrderId, headersBase);
+            const checkPrev = await verificarYExtraerEntregaCentralOne(orden.apiOrderId, headersBase, poolCards, esSteamOrder, 0);
             if (checkPrev.state === 'COMPLETED') {
                 return {
                     success: true,
@@ -2371,13 +2401,14 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
         // 🧠 CASO A: PRODUCTO CON ALGORITMO INTELIGENTE DE CÓDIGOS
         if (usaAlgoritmo && pkg && Number(pkg.targetClientUSD) > 0) {
             const platGroup = (productoDB && productoDB.smartPlatformGroup) || 'steam';
+            const esSteamPool = String(platGroup).toLowerCase() === 'steam' || esSteamOrder;
             const excluidosFallidos = [];
 
             for (let intento = 1; intento <= 2; intento++) {
                 const combo = calcularMejorCombinacionTarjetasPool(
                     pkg.targetClientUSD,
                     platGroup,
-                    settings ? settings.arbitrageBaseCards : [],
+                    poolCards,
                     settings ? settings.centralOneCatalogCache : null,
                     excluidosFallidos
                 );
@@ -2401,12 +2432,13 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
 
                 for (const it of combo.items) {
                     let cantFaltante = Math.max(1, Math.round(Number(it.quantity) || 1));
-                    const cPool = (settings?.arbitrageBaseCards || []).find(c => c.cardId === it.cardId);
+                    const cPool = poolCards.find(c => c.cardId === it.cardId);
 
                     while (cantFaltante > 0 && cPool && Array.isArray(cPool.internalCodeStock) && cPool.internalCodeStock.length > 0) {
                         const codigoGuardado = cPool.internalCodeStock.shift();
                         if (codigoGuardado) {
-                            codigosDesdeStockInterno.push(codigoGuardado);
+                            const codigoConEtiqueta = formatearCodigoConEtiquetaSteam(codigoGuardado, it.unitClientUSD, esSteamPool);
+                            codigosDesdeStockInterno.push(codigoConEtiqueta);
                             usdCubiertoInterno = Number((usdCubiertoInterno + Number(it.unitClientUSD)).toFixed(2));
                             costoCubiertoInterno = Number((costoCubiertoInterno + Number(it.unitCostUSD)).toFixed(4));
                             cantFaltante--;
@@ -2454,7 +2486,6 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
                     note: `KemZone #${orden.orderId} (${combo.summaryText})`.slice(0, 480)
                 };
 
-                // Preparar estado del algoritmo antes de enviar por si Central One responde por Webhook o tarda > 25s
                 orden.algoExecutionState = {
                     isAlgorithmOrder: true,
                     platformGroup: platGroup,
@@ -2481,7 +2512,7 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
                     }
 
                     await new Promise(r => setTimeout(r, 1800));
-                    const check = await verificarYExtraerEntregaCentralOne(createdOrder.id, headersBase);
+                    const check = await verificarYExtraerEntregaCentralOne(createdOrder.id, headersBase, poolCards, esSteamPool, 0);
 
                     if (check.state === 'COMPLETED') {
                         const todosLosCodigos = [...new Set([...codigosDesdeStockInterno, ...(check.codigosPlanos || [])])];
@@ -2512,7 +2543,6 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
                     const errCode = errCO.response?.data?.error?.code || '';
                     const esTimeout = errCO.code === 'ECONNABORTED' || String(errCO.message || '').toLowerCase().includes('timeout');
 
-                    // Si Central One tardó más de 28s porque una tarjeta sigue "en curso", NO es un fallo: pasamos a seguimiento automático con el reloj de 30 minutos
                     if (esTimeout) {
                         programarSeguimientoOrdenCentralOne(orden.orderId, null, idempKey, bodyOrder);
                         return {
@@ -2527,7 +2557,7 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
                     if (errCode === 'insufficient_stock' && settings && intento === 1) {
                         itemsParaPedirCentralOne.forEach(it => {
                             excluidosFallidos.push(it.cardId);
-                            const cPool = (settings.arbitrageBaseCards || []).find(c => c.cardId === it.cardId);
+                            const cPool = poolCards.find(c => c.cardId === it.cardId);
                             if (cPool) cPool.inStock = false;
                         });
                         settings.markModified('arbitrageBaseCards');
@@ -2603,7 +2633,7 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
                 }
 
                 await new Promise(r => setTimeout(r, 1800));
-                const check = await verificarYExtraerEntregaCentralOne(createdOrder.id, headersBase);
+                const check = await verificarYExtraerEntregaCentralOne(createdOrder.id, headersBase, poolCards, esSteamOrder, Number(pkg?.targetClientUSD || 0));
 
                 if (check.state === 'COMPLETED') {
                     return {
@@ -3481,15 +3511,25 @@ async function quemarTxIdsEnStoreSettings(nuevosTxIds = [], nuevoUltimoDecimal =
     } catch (e) {}
 }
 
-// Genera un monto con 3 decimales únicos rotativos (.001 a .099) y quema todas las transacciones previas de Binance
+// Genera el monto con 3 decimales en orden (.001, .002, .003...) y se reinicia cada nuevo día (12:00 AM Venezuela)
 async function reservarMontoUnicoBinanceUSDT(baseUSD, settingsDoc = null) {
     const baseRedondeada = Math.floor((Number(baseUSD) + Number.EPSILON) * 100) / 100;
-    const hace24Horas = new Date(Date.now() - 24 * 60 * 60 * 1000);
+
+    // Calcular las 12:00 AM del día actual en Hora de Venezuela (UTC-4)
+    const offsetVzlaMs = 4 * 60 * 60 * 1000;
+    const ahoraVzla = new Date(Date.now() - offsetVzlaMs);
+    const inicioHoyVzlaUtcMs = Date.UTC(
+        ahoraVzla.getUTCFullYear(),
+        ahoraVzla.getUTCMonth(),
+        ahoraVzla.getUTCDate(),
+        4, 0, 0, 0 // 00:00:00 VET = 04:00:00 UTC
+    );
+    const inicioHoyDate = new Date(inicioHoyVzlaUtcMs);
 
     // 1. Foto en vivo de tu cuenta Binance ANTES de crear el checkout:
-    // Quema todas las transacciones que ya existen en tu Binance en este instante para que NINGÚN pago viejo pueda aprobar esta nueva orden
+    // Quema todos los IDs de transacción (P_...) que ya existen hasta este segundo para que jamás aprueben una orden nueva
     let maxTxTimePreExistente = Date.now() - 2000;
-    const montosRecientesEnBinance = new Set();
+    const montosUsadosHoyEnBinance = new Set();
 
     try {
         const snapBinance = await consultarTransaccionesBinancePayAPI(settingsDoc);
@@ -3502,11 +3542,11 @@ async function reservarMontoUnicoBinanceUSDT(baseUSD, settingsDoc = null) {
                 const tMs = extraerTimestampRealTxBinance(tx);
                 if (tMs > maxTxTimePreExistente) maxTxTimePreExistente = tMs;
 
-                // Si hubo un pago en las últimas 12 horas en Binance con ese monto exacto, bloqueamos ese decimal para no repetirlo
-                if (tMs > (Date.now() - 12 * 60 * 60 * 1000)) {
+                // Solo marcar como ocupado el decimal si el pago ocurrió HOY (desde las 12:00 AM Venezuela)
+                if (tMs >= inicioHoyVzlaUtcMs) {
                     const fund = Array.isArray(tx.fundsDetail) && tx.fundsDetail[0] ? tx.fundsDetail[0] : null;
-                    const amt = Math.abs(Number(tx.amount !== undefined ? tx.amount : (fund ? fund.amount : 0)));
-                    if (amt > 0) montosRecientesEnBinance.add(amt.toFixed(3));
+                    const amt = Number(tx.amount !== undefined ? tx.amount : (fund ? fund.amount : 0));
+                    if (amt > 0) montosUsadosHoyEnBinance.add(amt.toFixed(3));
                 }
             }
             if (idsExistentesAhora.length > 0) {
@@ -3515,45 +3555,38 @@ async function reservarMontoUnicoBinanceUSDT(baseUSD, settingsDoc = null) {
         }
     } catch (e) {}
 
-    // 2. Bloquear también cualquier monto exacto usado en órdenes de las últimas 24 horas
-    const ordenesUltimas24h = await Order.find({
-        fecha: { $gte: hace24Horas },
-        paymentMethodKey: 'binance'
+    // 2. Buscar los montos de Binance usados HOY en órdenes pagadas o que estén esperando pago ahorita
+    const ordenesDeHoy = await Order.find({
+        fecha: { $gte: inicioHoyDate },
+        paymentMethodKey: 'binance',
+        $or: [
+            { status: 'ENTREGADO' },
+            { status: 'EJECUTANDO_API' },
+            { status: 'EN_PROCESO' },
+            { status: 'INICIANDO', isWaitingBinanceAuto: true }
+        ]
     }).select('binanceExactAmountUSDT clientPayUSD paymentReference').lean();
 
-    const ocupadosSet = new Set(montosRecientesEnBinance);
-    ordenesUltimas24h.forEach(o => {
+    const ocupadosHoySet = new Set(montosUsadosHoyEnBinance);
+    ordenesDeHoy.forEach(o => {
         const m = obtenerMontoExactoEsperadoOrdenBinance(o);
-        if (m > 0) ocupadosSet.add(m.toFixed(3));
+        if (m > 0) ocupadosHoySet.add(m.toFixed(3));
     });
 
-    // 3. Rotación secuencial: empieza siempre desde (ultimoDecimal + 1) para nunca repetir .001 dos veces seguidas
+    // 3. Empezar cada día siempre en orden estricto: .001, luego .002, .003... (saltando múltiplos de 10 como .010)
     let elegido = null;
-    let decimalElegidoNum = 1;
-    const startOffset = Math.max(0, Number(memoriaUltimoDecimalBinance) || 0);
-
-    for (let step = 1; step <= 99; step++) {
-        const m = ((startOffset + step - 1) % 99) + 1;
-        if (m % 10 === 0) continue; // Saltar múltiplos de 10 (.010, .020...)
+    for (let m = 1; m <= 99; m++) {
+        if (m % 10 === 0) continue;
         const candidato = Number((baseRedondeada + (m / 1000)).toFixed(3));
-        if (!ocupadosSet.has(candidato.toFixed(3))) {
+        if (!ocupadosHoySet.has(candidato.toFixed(3))) {
             elegido = candidato;
-            decimalElegidoNum = m;
             break;
         }
     }
 
     if (!elegido) {
-        for (let step = 1; step <= 99; step++) {
-            const m = ((startOffset + step - 1) % 99) + 1;
-            if (m % 10 === 0) continue;
-            elegido = Number((baseRedondeada + (m / 1000)).toFixed(3));
-            decimalElegidoNum = m;
-            break;
-        }
+        elegido = Number((baseRedondeada + 0.001).toFixed(3));
     }
-
-    await quemarTxIdsEnStoreSettings([], decimalElegidoNum);
 
     const textoExacto = elegido.toFixed(3);
     const [parteEntera, parteDecimal] = textoExacto.split('.');
