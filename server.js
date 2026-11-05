@@ -1120,7 +1120,7 @@ function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, ba
 
         let effUsd = Number(c.effectiveClientUSD);
         if (!effUsd || effUsd <= 0) {
-            effUsd = Number(((Number(c.faceValueOrigin) || 0) * (Number(cc.conversionRateToUSD) || 0)).toFixed(4));
+            effUsd = Number(((Number(c.faceValueOrigin) || 0) * (Number(c.conversionRateToUSD) || 0)).toFixed(4));
         }
         let costoReal = Number(c.costUSD || 0);
         let enStockReal = c.inStock !== false;
@@ -2061,9 +2061,63 @@ function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId) {
     activeCentralOnePollers.set(orderIdKZ, firstTimer);
 }
 
+// 📈 TABLA OFICIAL DE GANANCIAS MÍNIMAS POR RANGO PARA LA CALCULADORA DE JUEGOS DE STEAM
+const RANGOS_GANANCIA_STEAM_CALC = [
+    { min: 0.01,   max: 1.40,   fee: 0.25 },
+    { min: 1.41,   max: 2.90,   fee: 0.40 },
+    { min: 2.91,   max: 3.90,   fee: 0.75 },
+    { min: 3.91,   max: 9.90,   fee: 1.00 },
+    { min: 9.91,   max: 14.90,  fee: 1.40 },
+    { min: 14.91,  max: 19.90,  fee: 2.05 },
+    { min: 19.91,  max: 29.90,  fee: 2.70 },
+    { min: 29.91,  max: 39.90,  fee: 3.30 },
+    { min: 39.91,  max: 49.90,  fee: 3.90 },
+    { min: 49.91,  max: 59.90,  fee: 4.50 },
+    { min: 59.91,  max: 69.90,  fee: 5.20 },
+    { min: 69.91,  max: 79.90,  fee: 5.90 },
+    { min: 79.91,  max: 89.90,  fee: 6.60 },
+    { min: 89.91,  max: 99.90,  fee: 7.25 },
+    { min: 99.91,  max: 199.90, fee: 7.90 },
+    { min: 199.91, max: 299.90, fee: 15.80 },
+    { min: 299.91, max: 399.90, fee: 23.70 },
+    { min: 399.91, max: 499.90, fee: 31.60 }
+];
+
+function obtenerGananciaRangoSteamServer(precioUsd) {
+    const p = Math.round((Number(precioUsd) + Number.EPSILON) * 100) / 100;
+    if (p <= 0) return 0;
+    for (const r of RANGOS_GANANCIA_STEAM_CALC) {
+        if (p >= r.min && p <= r.max) return r.fee;
+    }
+    if (p >= 99.91) {
+        const bloques = Math.floor((Math.round((p - 99.91) * 100) / 100) / 100) + 1;
+        return Math.round((bloques * 7.90 + Number.EPSILON) * 100) / 100;
+    }
+    return 0.25;
+}
+
 // 🚀 EJECUTOR PRINCIPAL DE ENTREGA (USA STOCK INTERNO PRIMERO + ALGORITMO PASO A PASO + CENTRAL ONE API)
 async function ejecutarEntregaPorAPI(orden, productoDB) {
     orden.timerStartedAt = new Date(); // Reinicia el reloj de 30 minutos al momento de aprobar y disparar la API
+
+    // Si es una orden de la Calculadora de Juegos de Steam, construir el perfil virtual conectado al Algoritmo de Steam
+    if (!productoDB && orden.productSlug === 'calculadora-steam') {
+        const metaSteam = Number(orden.algoExecutionState?.targetClientUSD || orden.baseAmountUSD || 5);
+        productoDB = {
+            slug: 'calculadora-steam',
+            name: orden.productName || 'Calculadora de Juegos Steam',
+            isSmartCodeProduct: true,
+            smartPlatformGroup: 'steam',
+            packages: [{
+                packageId: orden.packageId || 'steam_calc_custom',
+                name: orden.packageName || `Saldo Steam $${metaSteam.toFixed(2)} USD`,
+                useSmartAlgorithm: true,
+                targetClientUSD: metaSteam,
+                isGiftCardPin: true
+            }],
+            save: async () => {}
+        };
+    }
 
     if (orden.fulfillmentType === 'MANUAL_INTERNAL') {
         return {
@@ -3213,6 +3267,8 @@ app.post('/api/orders/create', orderLimiter, verificarTokenOpcional, async (req,
         let esPinGiftCard = false;
         let productoDB = null;
 
+let estadoAlgoritmoInicial = null;
+
         if (orderType === 'TOKEM_TOPUP') {
             const cantTokems = Math.max(1, Number(customTokemAmount) || 1);
             nombreProducto = 'Recarga de Billetera Tokems KZ';
@@ -3220,12 +3276,100 @@ app.post('/api/orders/create', orderLimiter, verificarTokenOpcional, async (req,
             fulfillment = 'TOKEM_WALLET_CREDIT';
             baseUSD = Number((cantTokems * (settings.tokemValueUSD || 1)).toFixed(2));
             costoEnTokems = cantTokems;
+        } else if (String(productSlug || '').trim().toLowerCase() === 'calculadora-steam') {
+            const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+            const round4 = (n) => Math.round((Number(n) + Number.EPSILON) * 10000) / 10000;
+            const ceil2  = (n) => Math.ceil(round4(n) * 100 - 1e-6) / 100;
+
+            const calcData = req.body.customSteamCalcData || {};
+            const rawGames = Array.isArray(calcData.gamesList) ? calcData.gamesList : [];
+            const validGames = rawGames
+                .map((g, idx) => {
+                    const usdR = round2(parseFloat(g.priceUSD) || 0);
+                    return {
+                        label: String(g.name || `Juego ${idx + 1}`).trim(),
+                        usdR,
+                        tierFee: round2(obtenerGananciaRangoSteamServer(usdR))
+                    };
+                })
+                .filter(g => g.usdR > 0);
+
+            if (validGames.length === 0) {
+                return res.status(400).json({ error: 'Debes ingresar al menos un juego con precio válido en la Calculadora de Steam.' });
+            }
+
+            const totalPriceUsd = round2(validGames.reduce((a, it) => a + it.usdR, 0));
+            const planTarjetas = calcularMejorCombinacionTarjetasPool(
+                totalPriceUsd,
+                'steam',
+                settings.arbitrageBaseCards || [],
+                settings.centralOneCatalogCache || null
+            );
+
+            if (!planTarjetas || !planTarjetas.hasSolution) {
+                return res.status(400).json({
+                    error: (planTarjetas && planTarjetas.reason) || `Por el momento no hay combinación de tarjetas en stock para cubrir $${totalPriceUsd.toFixed(2)} USD.`
+                });
+            }
+
+            const costoTarjetasTotal = Number(planTarjetas.totalCostUSD);
+            const diferenciaCostoTarjetas = Math.max(0, round4(costoTarjetasTotal - totalPriceUsd));
+
+            const itemsCalc = validGames.map(it => {
+                const pesoJuego = totalPriceUsd > 0 ? (it.usdR / totalPriceUsd) : (1 / validGames.length);
+                const ajusteTarjetaItem = round4(diferenciaCostoTarjetas * pesoJuego);
+                const subExact = round4(it.usdR + ajusteTarjetaItem + it.tierFee);
+                const sub = ceil2(subExact);
+                return { ...it, subExact, sub };
+            });
+
+            const subtotalCalculado = round2(itemsCalc.reduce((a, it) => a + it.sub, 0));
+            const resumenJuegosTxt = validGames.map(g => `${g.label} ($${g.usdR.toFixed(2)})`).join(' + ');
+
+            nombreProducto = 'Calculadora de Juegos Steam';
+            nombrePaquete = req.body.packageName || `${resumenJuegosTxt} ➔ Recibes $${Number(planTarjetas.totalClientUSD).toFixed(2)} USD en Steam`;
+            mainCat = 'giftcards';
+            subCat = 'giftcards_plataformas';
+            fulfillment = 'API_GIFT_CARD';
+            baseUSD = subtotalCalculado;
+            costoMayoristaUSD = Number(costoTarjetasTotal.toFixed(4));
+            costoEnTokems = subtotalCalculado;
+            apiProv = 'CENTRAL_ONE';
+            apiSku = 'STEAM_CALC_ALGO';
+            esPinGiftCard = true;
+
+            estadoAlgoritmoInicial = {
+                isAlgorithmOrder: true,
+                platformGroup: 'steam',
+                targetClientUSD: totalPriceUsd,
+                deliveredClientUSD: 0,
+                deliveredCostUSD: 0,
+                deliveredCodesList: [],
+                failedCardIds: [],
+                totalCardsExpected: planTarjetas.totalCards || 1,
+                deliveredCardsCount: 0,
+                retryAttempt: 0
+            };
+
+            productoDB = {
+                slug: 'calculadora-steam',
+                name: nombreProducto,
+                isSmartCodeProduct: true,
+                smartPlatformGroup: 'steam',
+                packages: [{
+                    packageId: 'steam_calc_custom',
+                    name: nombrePaquete,
+                    useSmartAlgorithm: true,
+                    targetClientUSD: totalPriceUsd,
+                    isGiftCardPin: true
+                }],
+                save: async () => {}
+            };
         } else {
             const slugBuscado = String(productSlug || '').trim().toLowerCase();
             productoDB = await CatalogProduct.findOne({ slug: slugBuscado });
             if (!productoDB) return res.status(404).json({ error: 'Producto no encontrado.' });
 
-            // 🔒 Bloqueo de seguridad si el producto está desactivado
             if (productoDB.active === false) {
                 return res.status(403).json({
                     error: `Por el momento ${productoDB.name} no está en funcionamiento. Mantente atento en el catálogo cuando se vuelva a activar.`
@@ -3235,7 +3379,6 @@ app.post('/api/orders/create', orderLimiter, verificarTokenOpcional, async (req,
             const idPkgBuscado = String(packageId || '').trim();
             const nombrePkgBuscado = String(req.body.packageName || '').trim().toLowerCase();
 
-            // ⚡ Detectar si el producto tiene activada la casilla de Precios Alternativos
             const listaPaquetesActiva = (productoDB.useAltPricing && Array.isArray(productoDB.altPackages) && productoDB.altPackages.length > 0)
                 ? productoDB.altPackages
                 : (productoDB.packages || []);
@@ -3245,7 +3388,6 @@ app.post('/api/orders/create', orderLimiter, verificarTokenOpcional, async (req,
                 (nombrePkgBuscado && String(p.name || '').trim().toLowerCase() === nombrePkgBuscado)
             );
 
-            // Si es un Paquete Único de Oferta creado desde el Editor de Loot Relámpago:
             const ofertaMatch = (settings.flashOffers || []).find(of =>
                 String(of.slug || '').trim().toLowerCase() === slugBuscado &&
                 (String(of.pkgId || '').trim() === idPkgBuscado ||
@@ -3295,13 +3437,9 @@ app.post('/api/orders/create', orderLimiter, verificarTokenOpcional, async (req,
         const tasaKZ = Number(settings.exchangeRateVES) || 1012.00;
         const tasaBCV = Number(settings.bcvRateVES) || tasaKZ || 889.25;
 
-        // Precio Neto KZ en USD (El valor real de venta en tu catálogo)
         const totalUSD = Number((baseUSD + feeUSD).toFixed(2));
-        // Monto en Bolívares multiplicando por la Tasa KZ Interna
         const totalVES = Number((totalUSD * tasaKZ).toFixed(2));
-        // Monto Público en USD dividiendo los Bolívares entre la Tasa BCV
         const bcvAmountUSD = tasaBCV > 0 ? Number((totalVES / tasaBCV).toFixed(2)) : totalUSD;
-        // Descuento aplicado para métodos en USD (Baja de BCV USD a KZ USD)
         const discountUSD = Math.max(0, Number((bcvAmountUSD - totalUSD).toFixed(2)));
 
         const keyMetodoLower = String(paymentMethodKey || '').toLowerCase();
@@ -3314,7 +3452,6 @@ app.post('/api/orders/create', orderLimiter, verificarTokenOpcional, async (req,
         if (esPagoMovil) {
             clientPayUSD = bcvAmountUSD;
         } else if (esPaypal) {
-            // Fórmula exacta de Calculadora PayPal (5.4% + $0.30 USD fijos)
             clientPayUSD = Number(((totalUSD + 0.30) / (1 - 0.054)).toFixed(2));
             paypalFeeUSD = Math.max(0, Number((clientPayUSD - totalUSD).toFixed(2)));
         } else {
@@ -3359,7 +3496,6 @@ app.post('/api/orders/create', orderLimiter, verificarTokenOpcional, async (req,
 
         const orderId = 'KZ-' + crypto.randomInt(100000, 999999).toString();
 
-        // Definir destino limpio según si es Recarga ID, Recarga Interna (WhatsApp) o GiftCard/Servicio
         let uidDestinoFinal = (playerUid || '').trim();
         if (!uidDestinoFinal) {
             if (fulfillment === 'MANUAL_INTERNAL' || subCat === 'recargas_internas') {
@@ -3411,10 +3547,11 @@ app.post('/api/orders/create', orderLimiter, verificarTokenOpcional, async (req,
             paidWithTokems: pagadoConTokems,
             status: 'EN_PROCESO',
             statusMessage: 'Tu orden está en proceso. Un operador está verificando tu referencia de pago...',
-            progressPercent: 50
+            progressPercent: 50,
+            ...(estadoAlgoritmoInicial ? { algoExecutionState: estadoAlgoritmoInicial } : {})
         });
 
-        if (pagadoConTokems && settings.autoTriggerApiOnTokems && fulfillment !== 'MANUAL_INTERNAL') {
+if (pagadoConTokems && settings.autoTriggerApiOnTokems && fulfillment !== 'MANUAL_INTERNAL') {
             const apiRes = await ejecutarEntregaPorAPI(nuevaOrden, productoDB);
             if (apiRes.success) {
                 nuevaOrden.status = 'ENTREGADO';
