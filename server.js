@@ -3340,6 +3340,750 @@ app.post('/api/reset-password', authLimiter, async (req, res) => {
 });
 
 // =================================================================
+// 🟡 MOTOR AUTOMÁTICO BINANCE PAY (MICRO-DECIMALES + LECTURA API 24/7)
+// =================================================================
+StoreSettings.schema.add({
+    binanceAutoConfig: {
+        enabled: { type: Boolean, default: true },
+        payId: { type: String, default: '758 964 705' },
+        merchantName: { type: String, default: 'Kem!Zone Oficial' },
+        qrImageUrl: { type: String, default: '' },
+        apiKey: { type: String, default: '' },
+        apiSecret: { type: String, default: '' },
+        lastCheckAt: { type: Date, default: null },
+        lastError: { type: String, default: '' }
+    }
+});
+
+Order.schema.add({
+    binanceCheckoutId: { type: String, default: '', index: true },
+    binanceExactAmountUSDT: { type: Number, default: 0, index: true },
+    binanceMicroDecimal: { type: String, default: '' },
+    binanceTransactionId: { type: String, default: '', index: true },
+    binancePayerName: { type: String, default: '' },
+    binanceExpiresAt: { type: Date, default: null },
+    isWaitingBinanceAuto: { type: Boolean, default: false, index: true }
+});
+
+const BINANCE_API_MIRRORS = [
+    'https://api.binance.com',
+    'https://api1.binance.com',
+    'https://api2.binance.com',
+    'https://api3.binance.com'
+];
+
+// Genera un monto con 3 decimales únicos (ej: 10.011 USDT) que no esté en uso en la última hora
+async function reservarMontoUnicoBinanceUSDT(baseUSD) {
+    const baseRedondeada = Math.floor((Number(baseUSD) + Number.EPSILON) * 100) / 100;
+    const hace90Min = new Date(Date.now() - 90 * 60 * 1000);
+
+    const activasRecientes = await Order.find({
+        fecha: { $gte: hace90Min },
+        binanceExactAmountUSDT: { $gt: 0 },
+        status: { $ne: 'RECHAZADO' }
+    }).select('binanceExactAmountUSDT isWaitingBinanceAuto status').lean();
+
+    const ocupadosSet = new Set(
+        activasRecientes
+            .filter(o => o.isWaitingBinanceAuto || o.status === 'INICIANDO')
+            .map(o => Number(o.binanceExactAmountUSDT).toFixed(3))
+    );
+
+    // Priorizamos desde .001 hasta .099 (saltando múltiplos de 10 como .010 para que Binance siempre conserve los 3 decimales)
+    let elegido = null;
+    for (let m = 1; m <= 99; m++) {
+        if (m % 10 === 0) continue;
+        const candidato = Number((baseRedondeada + (m / 1000)).toFixed(3));
+        if (!ocupadosSet.has(candidato.toFixed(3))) {
+            elegido = candidato;
+            break;
+        }
+    }
+
+    if (!elegido) {
+        const randM = (Math.floor(Math.random() * 8) + 1) + (Math.floor(Math.random() * 9) * 10);
+        elegido = Number((baseRedondeada + (randM / 1000)).toFixed(3));
+    }
+
+    const textoExacto = elegido.toFixed(3);
+    const [parteEntera, parteDecimal] = textoExacto.split('.');
+    return {
+        exactAmount: elegido,
+        exactText: textoExacto,
+        intPart: parteEntera,
+        decPart: parteDecimal
+    };
+}
+
+// Consulta en vivo el historial de Binance Pay (GET /sapi/v1/pay/transactions) con firma HMAC-SHA256
+async function consultarTransaccionesBinancePayAPI(settingsDoc = null) {
+    if (!settingsDoc) {
+        settingsDoc = await StoreSettings.findOne({ key: 'main_settings' }).select('binanceAutoConfig').lean();
+    }
+    const cfg = settingsDoc?.binanceAutoConfig || {};
+    const apiKey = (cfg.apiKey || process.env.BINANCE_API_KEY || '').trim();
+    const apiSecret = (cfg.apiSecret || process.env.BINANCE_API_SECRET || '').trim();
+
+    if (!apiKey || !apiSecret) {
+        return { ok: false, error: 'Falta configurar BINANCE_API_KEY y BINANCE_API_SECRET.', transactions: [] };
+    }
+
+    let ultimoError = '';
+    for (const host of BINANCE_API_MIRRORS) {
+        try {
+            const timestamp = Date.now();
+            const queryString = `limit=80&recvWindow=15000&timestamp=${timestamp}`;
+            const signature = crypto.createHmac('sha256', apiSecret).update(queryString).digest('hex');
+
+            const resp = await axios.get(`${host}/sapi/v1/pay/transactions?${queryString}&signature=${signature}`, {
+                headers: {
+                    'X-MBX-APIKEY': apiKey,
+                    'Accept': 'application/json'
+                },
+                timeout: 8000
+            });
+
+            if (resp.data && (resp.data.code === '000000' || Array.isArray(resp.data.data))) {
+                return {
+                    ok: true,
+                    transactions: Array.isArray(resp.data.data) ? resp.data.data : []
+                };
+            }
+            ultimoError = resp.data?.message || resp.data?.msg || 'Respuesta inesperada de Binance';
+        } catch (err) {
+            ultimoError = err.response?.data?.msg || err.response?.data?.message || err.message;
+        }
+    }
+
+    return { ok: false, error: ultimoError || 'No se pudo conectar con Binance API', transactions: [] };
+}
+
+// Ejecuta la acreditación o disparo de API apenas se confirma el pago exacto en Binance
+async function completarOrdenConfirmadaPorBinance(orden, txMatch) {
+    const txId = String(txMatch.transactionId || txMatch.orderId || ('BN-' + Date.now())).trim();
+    const payerName = txMatch.payerInfo?.name || txMatch.payerInfo?.binanceId || '';
+
+    // Candado atómico para evitar doble acreditación si el poller y el cliente consultan al mismo milisegundo
+    const ordenBloqueada = await Order.findOneAndUpdate(
+        {
+            orderId: orden.orderId,
+            isWaitingBinanceAuto: true
+        },
+        {
+            $set: {
+                isWaitingBinanceAuto: false,
+                binanceTransactionId: txId,
+                binancePayerName: String(payerName),
+                paymentReference: txId.slice(-8).toUpperCase(),
+                paymentMethodName: `Binance Pay Auto (${Number(orden.binanceExactAmountUSDT).toFixed(3)} USDT)`,
+                timerStartedAt: new Date()
+            }
+        },
+        { new: true }
+    );
+
+    if (!ordenBloqueada) {
+        return await Order.findOne({ orderId: orden.orderId });
+    }
+
+    // CASO 1: Recarga de Billetera Tokems KZ -> Acreditación automática inmediata
+    if (ordenBloqueada.orderType === 'TOKEM_TOPUP' || ordenBloqueada.productSlug === 'tokems-kz') {
+        if (ordenBloqueada.deviceId.includes('@')) {
+            await User.updateOne({ email: ordenBloqueada.deviceId }, { $inc: { tokems: ordenBloqueada.tokemsAmount } });
+        } else {
+            await Balance.updateOne({ deviceId: ordenBloqueada.deviceId }, { $inc: { tokens: ordenBloqueada.tokemsAmount } }, { upsert: true });
+        }
+
+        await new Transaction({
+            deviceId: ordenBloqueada.deviceId,
+            tipo: 'Compra',
+            tokens: ordenBloqueada.tokemsAmount,
+            plan: ordenBloqueada.packageName,
+            precio: `${Number(ordenBloqueada.binanceExactAmountUSDT).toFixed(3)} USDT`,
+            detalles: `Recarga automática Binance Pay (#${ordenBloqueada.orderId})`
+        }).save().catch(() => {});
+
+        ordenBloqueada.status = 'ENTREGADO';
+        ordenBloqueada.progressPercent = 100;
+        ordenBloqueada.deliveredCode = `+${ordenBloqueada.tokemsAmount} TOKEMS KZ ACREDITADOS`;
+        ordenBloqueada.statusMessage = `¡Pago de ${Number(ordenBloqueada.binanceExactAmountUSDT).toFixed(3)} USDT confirmado! Se acreditaron +${ordenBloqueada.tokemsAmount} Tokems KZ en tu billetera.`;
+        ordenBloqueada.approvedByWorker = 'AUTO-BINANCE-PAY';
+        ordenBloqueada.completedAt = new Date();
+        await ordenBloqueada.save();
+        return ordenBloqueada;
+    }
+
+    // CASO 2: Recarga Interna Manual (con acceso a cuenta por WhatsApp) -> Pasa a la cola ya pagada y verificada
+    if (ordenBloqueada.fulfillmentType === 'MANUAL_INTERNAL' || ordenBloqueada.subCategory === 'recargas_internas') {
+        ordenBloqueada.status = 'EN_PROCESO';
+        ordenBloqueada.progressPercent = 70;
+        ordenBloqueada.statusMessage = `✅ Pago de ${Number(ordenBloqueada.binanceExactAmountUSDT).toFixed(3)} USDT verificado automáticamente por Binance. Te escribiremos por WhatsApp para realizar tu recarga interna.`;
+        ordenBloqueada.workerNotes = `✅ PAGO BINANCE AUTO-VERIFICADO (${Number(ordenBloqueada.binanceExactAmountUSDT).toFixed(3)} USDT • TxID: ${txId})`;
+        await ordenBloqueada.save();
+        return ordenBloqueada;
+    }
+
+    // CASO 3: Recargas por ID, Gift Cards, Servicios y Calculadora de Steam -> Dispara Central One API / Bóveda al instante
+    const productoDB = await CatalogProduct.findOne({ slug: ordenBloqueada.productSlug });
+    const apiRes = await ejecutarEntregaPorAPI(ordenBloqueada, productoDB);
+
+    if (apiRes.success) {
+        if (apiRes.isProcessingAsync) {
+            ordenBloqueada.status = 'EJECUTANDO_API';
+            ordenBloqueada.progressPercent = 85;
+            ordenBloqueada.apiOrderId = apiRes.apiOrderId || '';
+            ordenBloqueada.apiRawResponse = apiRes.raw || null;
+            ordenBloqueada.approvedByWorker = 'AUTO-BINANCE-PAY';
+            ordenBloqueada.statusMessage = `✅ Pago de ${Number(ordenBloqueada.binanceExactAmountUSDT).toFixed(3)} USDT confirmado. Ejecutando entrega automática de tu compra...`;
+        } else {
+            ordenBloqueada.status = 'ENTREGADO';
+            ordenBloqueada.progressPercent = 100;
+            ordenBloqueada.deliveredCode = apiRes.deliveredCode;
+            ordenBloqueada.apiOrderId = apiRes.apiOrderId || '';
+            ordenBloqueada.apiRawResponse = apiRes.raw || null;
+            ordenBloqueada.approvedByWorker = 'AUTO-BINANCE-PAY';
+            ordenBloqueada.completedAt = new Date();
+            ordenBloqueada.statusMessage = '¡Pago confirmado automáticamente por Binance Pay y pedido entregado con éxito!';
+
+            if (ordenBloqueada.userEmail && ordenBloqueada.userEmail.includes('@')) {
+                resend.emails.send({
+                    from: 'Kem!Zone Oficial <registro@kzsorteos.com>',
+                    to: ordenBloqueada.userEmail,
+                    subject: `✅ Pedido Entregado #${ordenBloqueada.orderId} - ${ordenBloqueada.productName}`,
+                    html: `
+                        <div style="font-family: sans-serif; background-color: #09090d; color: #ffffff; padding: 25px; border-radius: 14px; border: 2px solid #ff6600; max-width: 520px;">
+                            <h2 style="color: #ff6600; margin-top: 0;">¡Tu compra #${ordenBloqueada.orderId} fue entregada! 🔥</h2>
+                            <p style="color: #cccccc;">Tu pago de <b>${Number(ordenBloqueada.binanceExactAmountUSDT).toFixed(3)} USDT</b> por Binance Pay fue verificado automáticamente.</p>
+                            <div style="background: #14141d; padding: 15px; border-radius: 10px; border-left: 4px solid #ff6600; margin: 18px 0;">
+                                <p style="margin: 4px 0;"><b>Producto:</b> ${ordenBloqueada.productName}</p>
+                                <p style="margin: 4px 0;"><b>Paquete:</b> ${ordenBloqueada.packageName}</p>
+                                <p style="margin: 4px 0;"><b>Destino / ID:</b> ${ordenBloqueada.playerUid}</p>
+                                <p style="margin: 12px 0 4px 0; color: #00e676; font-size: 16px;"><b>🎁 Entrega / Código:</b> <code style="background:#000; padding:5px 10px; border-radius:6px; color:#fff;">${ordenBloqueada.deliveredCode}</code></p>
+                            </div>
+                        </div>
+                    `
+                }).catch(() => {});
+            }
+        }
+    } else {
+        ordenBloqueada.status = 'ERROR_API';
+        ordenBloqueada.progressPercent = 75;
+        ordenBloqueada.approvedByWorker = 'AUTO-BINANCE-PAY';
+        ordenBloqueada.statusMessage = `✅ Pago de ${Number(ordenBloqueada.binanceExactAmountUSDT).toFixed(3)} USDT confirmado por Binance. Nuestro sistema está completando la liberación de tu pedido.`;
+        ordenBloqueada.workerNotes = `✅ Pago Binance Auto-Confirmado (${Number(ordenBloqueada.binanceExactAmountUSDT).toFixed(3)} USDT • TxID: ${txId}). Pendiente liberación.`;
+    }
+
+    if (ordenBloqueada.algoExecutionState) {
+        ordenBloqueada.markModified('algoExecutionState');
+    }
+    await ordenBloqueada.save();
+    return ordenBloqueada;
+}
+
+// Busca si en la lista de transacciones de Binance ya llegó el pago exacto de una orden
+async function buscarCoincidenciaPagoBinanceParaOrden(orden, listaTx) {
+    if (!orden || !orden.binanceExactAmountUSDT || !Array.isArray(listaTx) || listaTx.length === 0) return null;
+
+    const montoEsperado = Number(orden.binanceExactAmountUSDT);
+    const fechaOrdenMs = new Date(orden.fecha || orden.createdAt || Date.now()).getTime() - (3 * 60 * 1000);
+
+    for (const tx of listaTx) {
+        const moneda = String(tx.currency || tx.asset || '').toUpperCase();
+        if (moneda && moneda !== 'USDT') continue;
+
+        const montoTx = Number(tx.amount);
+        if (!Number.isFinite(montoTx) || montoTx <= 0) continue;
+
+        if (Math.abs(montoTx - montoEsperado) < 0.0001) {
+            const tiempoTx = Number(tx.transactionTime || tx.createTime || Date.now());
+            if (tiempoTx < fechaOrdenMs) continue;
+
+            const txId = String(tx.transactionId || tx.orderId || '').trim();
+            if (!txId) continue;
+
+            const yaUsada = await Order.findOne({ binanceTransactionId: txId }).select('_id orderId').lean();
+            if (!yaUsada) {
+                return tx;
+            }
+        }
+    }
+    return null;
+}
+
+// Vigilante en segundo plano: cada 10s revisa si hay órdenes esperando pago automático de Binance
+setInterval(async () => {
+    try {
+        const pendientesBinance = await Order.find({
+            isWaitingBinanceAuto: true,
+            binanceExpiresAt: { $gt: new Date() }
+        }).limit(15);
+
+        if (pendientesBinance.length === 0) return;
+
+        const resBinance = await consultarTransaccionesBinancePayAPI();
+        if (!resBinance.ok || resBinance.transactions.length === 0) return;
+
+        for (const ord of pendientesBinance) {
+            const matchTx = await buscarCoincidenciaPagoBinanceParaOrden(ord, resBinance.transactions);
+            if (matchTx) {
+                await completarOrdenConfirmadaPorBinance(ord, matchTx);
+            }
+        }
+    } catch (e) {}
+}, 10000);
+
+// 1. Endpoint para iniciar un Checkout Automático de Binance Pay (Reserva el monto con 3 decimales y devuelve QR + Pay ID)
+app.post('/api/binance-pay/create-checkout', orderLimiter, verificarTokenOpcional, async (req, res) => {
+    try {
+        const {
+            orderType,
+            deviceId,
+            userEmail,
+            userWhatsapp,
+            productSlug,
+            packageId,
+            packageName,
+            customTokemAmount,
+            playerUid,
+            playerServer,
+            playerRegion,
+            playerNickname,
+            customSteamCalcData
+        } = req.body;
+
+        const settings = await StoreSettings.findOne({ key: 'main_settings' }) || { exchangeRateVES: 1012.00, bcvRateVES: 889.25, tokemValueUSD: 1.00, storeOpen: true };
+        if (settings.storeOpen === false) {
+            return res.status(403).json({ error: 'La tienda está en mantenimiento temporal.' });
+        }
+
+        const identificadorLimpio = (userEmail || deviceId || 'invitado').trim().toLowerCase();
+        let nombreProducto = '';
+        let nombrePaquete = '';
+        let mainCat = 'recargas';
+        let subCat = 'recargas_id';
+        let fulfillment = 'API_DIRECT_TOPUP';
+        let baseUSD = 0;
+        let feeUSD = 0;
+        let costoMayoristaUSD = 0;
+        let costoEnTokems = 0;
+        let apiProv = '';
+        let apiSku = '';
+        let esPinGiftCard = false;
+        let estadoAlgoritmoInicial = null;
+
+        if (orderType === 'TOKEM_TOPUP') {
+            const cantTokems = Math.max(1, Number(customTokemAmount) || 1);
+            nombreProducto = 'Recarga de Billetera Tokems KZ';
+            nombrePaquete = `${cantTokems} Tokem(s) KZ 🪙`;
+            fulfillment = 'TOKEM_WALLET_CREDIT';
+            baseUSD = Number((cantTokems * (settings.tokemValueUSD || 1)).toFixed(2));
+            costoEnTokems = cantTokems;
+        } else if (String(productSlug || '').trim().toLowerCase() === 'calculadora-steam') {
+            const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+            const round4 = (n) => Math.round((Number(n) + Number.EPSILON) * 10000) / 10000;
+            const ceil2  = (n) => Math.ceil(round4(n) * 100 - 1e-6) / 100;
+
+            const calcData = customSteamCalcData || {};
+            const rawGames = Array.isArray(calcData.gamesList) ? calcData.gamesList : [];
+            let validGames = rawGames
+                .map((g, idx) => {
+                    const usdR = round2(parseFloat(g.priceUSD) || 0);
+                    return {
+                        label: String(g.name || `Juego ${idx + 1}`).trim(),
+                        usdR,
+                        tierFee: round2(obtenerGananciaRangoSteamServer(usdR))
+                    };
+                })
+                .filter(g => g.usdR > 0);
+
+            if (validGames.length === 0 && packageName) {
+                const pkgTxt = String(packageName || '');
+                const parteJuegos = pkgTxt.split('➔')[0] || pkgTxt;
+                const regexJuegos = /([^+]+?)\s*\(\$(\d+(?:\.\d+)?)\)/g;
+                let matchG;
+                while ((matchG = regexJuegos.exec(parteJuegos)) !== null) {
+                    const pVal = round2(parseFloat(matchG[2]) || 0);
+                    if (pVal > 0) {
+                        validGames.push({
+                            label: matchG[1].trim() || 'Juego Steam',
+                            usdR: pVal,
+                            tierFee: round2(obtenerGananciaRangoSteamServer(pVal))
+                        });
+                    }
+                }
+                if (validGames.length === 0) {
+                    const matchMeta = pkgTxt.match(/\$(\d+(?:\.\d+)?)/);
+                    if (matchMeta) {
+                        const pVal = round2(parseFloat(matchMeta[1]) || 0);
+                        if (pVal > 0) {
+                            validGames.push({
+                                label: 'Juego Steam',
+                                usdR: pVal,
+                                tierFee: round2(obtenerGananciaRangoSteamServer(pVal))
+                            });
+                        }
+                    }
+                }
+            }
+
+            if (validGames.length === 0) {
+                return res.status(400).json({ error: 'Ingresa al menos un juego con precio válido en la Calculadora de Steam.' });
+            }
+
+            const totalPriceUsd = round2(validGames.reduce((a, it) => a + it.usdR, 0));
+            const planTarjetas = calcularMejorCombinacionTarjetasPool(
+                totalPriceUsd,
+                'steam',
+                settings.arbitrageBaseCards || [],
+                settings.centralOneCatalogCache || null
+            );
+
+            if (!planTarjetas || !planTarjetas.hasSolution) {
+                return res.status(400).json({
+                    error: (planTarjetas && planTarjetas.reason) || `No hay combinación de tarjetas en stock para cubrir $${totalPriceUsd.toFixed(2)} USD.`
+                });
+            }
+
+            const costoTarjetasTotal = Number(planTarjetas.totalCostUSD);
+            const diferenciaCostoTarjetas = Math.max(0, round4(costoTarjetasTotal - totalPriceUsd));
+            const itemsCalc = validGames.map(it => {
+                const pesoJuego = totalPriceUsd > 0 ? (it.usdR / totalPriceUsd) : (1 / validGames.length);
+                const ajusteTarjetaItem = round4(diferenciaCostoTarjetas * pesoJuego);
+                const subExact = round4(it.usdR + ajusteTarjetaItem + it.tierFee);
+                const sub = ceil2(subExact);
+                return { ...it, subExact, sub };
+            });
+
+            const subtotalCalculado = round2(itemsCalc.reduce((a, it) => a + it.sub, 0));
+            const resumenJuegosTxt = validGames.map(g => `${g.label} ($${g.usdR.toFixed(2)})`).join(' + ');
+
+            nombreProducto = 'Compra tus Juegos de Steam';
+            nombrePaquete = packageName || `${resumenJuegosTxt} ➔ Recibes $${Number(planTarjetas.totalClientUSD).toFixed(2)} USD en Steam`;
+            mainCat = 'giftcards';
+            subCat = 'giftcards_plataformas';
+            fulfillment = 'API_GIFT_CARD';
+            baseUSD = subtotalCalculado;
+            costoMayoristaUSD = Number(costoTarjetasTotal.toFixed(4));
+            costoEnTokems = subtotalCalculado;
+            apiProv = 'CENTRAL_ONE';
+            apiSku = 'STEAM_CALC_ALGO';
+            esPinGiftCard = true;
+
+            estadoAlgoritmoInicial = {
+                isAlgorithmOrder: true,
+                platformGroup: 'steam',
+                targetClientUSD: totalPriceUsd,
+                deliveredClientUSD: 0,
+                deliveredCostUSD: 0,
+                deliveredCodesList: [],
+                failedCardIds: [],
+                totalCardsExpected: planTarjetas.totalCards || 1,
+                deliveredCardsCount: 0,
+                retryAttempt: 0
+            };
+        } else {
+            const slugBuscado = String(productSlug || '').trim().toLowerCase();
+            const productoDB = await CatalogProduct.findOne({ slug: slugBuscado });
+            if (!productoDB || productoDB.active === false) {
+                return res.status(404).json({ error: 'Este producto no se encuentra disponible.' });
+            }
+
+            const idPkgBuscado = String(packageId || '').trim();
+            const nombrePkgBuscado = String(packageName || '').trim().toLowerCase();
+            const listaPaquetesActiva = (productoDB.useAltPricing && Array.isArray(productoDB.altPackages) && productoDB.altPackages.length > 0)
+                ? productoDB.altPackages
+                : (productoDB.packages || []);
+
+            let pkg = listaPaquetesActiva.find(p =>
+                String(p.packageId || p.id || '').trim() === idPkgBuscado ||
+                (nombrePkgBuscado && String(p.name || '').trim().toLowerCase() === nombrePkgBuscado)
+            );
+
+            const ofertaMatch = (settings.flashOffers || []).find(of =>
+                String(of.slug || '').trim().toLowerCase() === slugBuscado &&
+                (String(of.pkgId || '').trim() === idPkgBuscado ||
+                 (nombrePkgBuscado && String(of.title || '').trim().toLowerCase() === nombrePkgBuscado))
+            );
+
+            if (ofertaMatch) {
+                const vencio = Boolean(ofertaMatch.expiresAt && new Date(ofertaMatch.expiresAt).getTime() <= Date.now());
+                if (ofertaMatch.active !== false && !vencio) {
+                    pkg = {
+                        packageId: ofertaMatch.pkgId || idPkgBuscado,
+                        name: ofertaMatch.title,
+                        priceUSD: Number(ofertaMatch.usd),
+                        costUSD: Number(ofertaMatch.costUSD || (pkg ? pkg.costUSD : 0) || 0),
+                        tokemsPrice: Number(ofertaMatch.tokemsPrice || ofertaMatch.usd),
+                        apiProviderName: (pkg && pkg.apiProviderName) || 'DEFAULT_API',
+                        apiProductSku: ofertaMatch.apiProductSku || (pkg ? pkg.apiProductSku : '') || ofertaMatch.pkgId,
+                        isGiftCardPin: ofertaMatch.isGiftCardPin !== undefined ? Boolean(ofertaMatch.isGiftCardPin) : Boolean(pkg && pkg.isGiftCardPin),
+                        inStock: true
+                    };
+                } else if (!pkg) {
+                    return res.status(400).json({ error: '⏰ El tiempo de esta oferta relámpago ya finalizó.' });
+                }
+            }
+
+            if (!pkg || pkg.inStock === false) {
+                return res.status(400).json({ error: 'Este paquete no se encuentra disponible en este momento.' });
+            }
+
+            nombreProducto = productoDB.name;
+            nombrePaquete = pkg.name;
+            mainCat = productoDB.mainCategory;
+            subCat = productoDB.subCategory;
+            fulfillment = productoDB.fulfillmentType;
+            baseUSD = Number(pkg.priceUSD);
+            costoMayoristaUSD = Number(pkg.costUSD || 0);
+            costoEnTokems = Number(pkg.tokemsPrice || pkg.priceUSD);
+            apiProv = pkg.apiProviderName || 'DEFAULT_API';
+            apiSku = pkg.apiProductSku || pkg.packageId;
+            esPinGiftCard = pkg.isGiftCardPin !== undefined
+                ? Boolean(pkg.isGiftCardPin)
+                : (productoDB.mainCategory === 'giftcards' || productoDB.fulfillmentType === 'API_GIFT_CARD');
+
+            if (productoDB.serviceCommissionPercent > 0) {
+                feeUSD = Number(((baseUSD * productoDB.serviceCommissionPercent) / 100).toFixed(2));
+            }
+        }
+
+        const tasaKZ = Number(settings.exchangeRateVES) || 1012.00;
+        const tasaBCV = Number(settings.bcvRateVES) || tasaKZ || 889.25;
+        const totalUSD = Number((baseUSD + feeUSD).toFixed(2));
+        const totalVES = Number((totalUSD * tasaKZ).toFixed(2));
+        const bcvAmountUSD = tasaBCV > 0 ? Number((totalVES / tasaBCV).toFixed(2)) : totalUSD;
+        const discountUSD = Math.max(0, Number((bcvAmountUSD - totalUSD).toFixed(2)));
+
+        // Reservar el monto único con 3 decimales (ej: 10.011 USDT)
+        const reservaDecimal = await reservarMontoUnicoBinanceUSDT(totalUSD);
+
+        const orderId = 'KZ-' + crypto.randomInt(100000, 999999).toString();
+        const checkoutId = 'ch_KZ' + crypto.randomBytes(6).toString('hex');
+        const expiraEn = new Date(Date.now() + 60 * 60 * 1000); // 60 minutos igual que Zeno Bank
+
+        let uidDestinoFinal = (playerUid || '').trim();
+        if (!uidDestinoFinal) {
+            if (fulfillment === 'MANUAL_INTERNAL' || subCat === 'recargas_internas') {
+                uidDestinoFinal = userWhatsapp ? `WS: ${userWhatsapp.trim()}` : 'Contacto por WhatsApp';
+            } else {
+                uidDestinoFinal = 'Entrega Automática de Código';
+            }
+        }
+
+        const nuevaOrden = await new Order({
+            orderId,
+            orderType: orderType || 'PRODUCT_ORDER',
+            deviceId: identificadorLimpio,
+            userEmail: userEmail ? userEmail.trim().toLowerCase() : (identificadorLimpio.includes('@') ? identificadorLimpio : ''),
+            userWhatsapp: (userWhatsapp || '').trim(),
+            productSlug: productSlug || 'tokems-kz',
+            productName: nombreProducto,
+            mainCategory: mainCat,
+            subCategory: subCat,
+            fulfillmentType: fulfillment,
+            isGiftCardPin: esPinGiftCard,
+            packageId: packageId || 'tokems_pack',
+            packageName: nombrePaquete,
+            apiProviderName: apiProv,
+            apiProductSku: apiSku,
+            playerUid: uidDestinoFinal,
+            playerServer: (playerServer || '').trim(),
+            playerRegion: (playerRegion || '').trim(),
+            playerNickname: (playerNickname || '').trim(),
+            paymentMethodKey: 'binance',
+            paymentMethodName: `Binance Pay (${reservaDecimal.exactText} USDT)`,
+            paymentReference: `AUTO-${reservaDecimal.exactText}`,
+            exchangeRateApplied: tasaKZ,
+            bcvRateApplied: tasaBCV,
+            baseAmountUSD: baseUSD,
+            bcvAmountUSD,
+            discountUSD,
+            clientPayUSD: reservaDecimal.exactAmount,
+            serviceFeeUSD: feeUSD,
+            totalAmountUSD: totalUSD,
+            totalAmountVES: totalVES,
+            costUSD: costoMayoristaUSD,
+            tokemsAmount: costoEnTokems,
+            paidWithTokems: false,
+            status: 'INICIANDO',
+            statusMessage: `Esperando transferencia exacta de ${reservaDecimal.exactText} USDT por Binance Pay...`,
+            progressPercent: 35,
+            binanceCheckoutId: checkoutId,
+            binanceExactAmountUSDT: reservaDecimal.exactAmount,
+            binanceMicroDecimal: reservaDecimal.decPart,
+            binanceExpiresAt: expiraEn,
+            isWaitingBinanceAuto: true,
+            ...(estadoAlgoritmoInicial ? { algoExecutionState: estadoAlgoritmoInicial } : {})
+        }).save();
+
+        const metodoBinanceDB = await PaymentMethod.findOne({ methodKey: { $regex: /binance/i } }).lean();
+        const cfgBinance = settings.binanceAutoConfig || {};
+        const payIdMostrar = (cfgBinance.payId || metodoBinanceDB?.phoneOrEmail || metodoBinanceDB?.binancePayId || '758 964 705').trim();
+        const qrImgMostrar = (cfgBinance.qrImageUrl || '').trim();
+
+        return res.json({
+            success: true,
+            checkout: {
+                checkoutId,
+                orderId: nuevaOrden.orderId,
+                productName: nombreProducto,
+                packageName: nombrePaquete,
+                baseAmountUSD: totalUSD,
+                exactAmountUSDT: reservaDecimal.exactAmount,
+                exactText: reservaDecimal.exactText,
+                intPart: reservaDecimal.intPart,
+                decPart: reservaDecimal.decPart,
+                payId: payIdMostrar,
+                merchantName: cfgBinance.merchantName || 'Kem!Zone Oficial',
+                qrImageUrl: qrImgMostrar,
+                expiresAt: expiraEn.toISOString()
+            },
+            order: nuevaOrden
+        });
+    } catch (error) {
+        console.error('Error creando Checkout Binance Pay:', error);
+        return res.status(500).json({ error: 'Error iniciando el checkout automático de Binance Pay.' });
+    }
+});
+
+// 2. Endpoint de Radar en Tiempo Real (El navegador del cliente lo consulta cada 4 segundos en la pantalla del QR)
+app.get('/api/binance-pay/check-status/:orderId', async (req, res) => {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    try {
+        const idLimpio = String(req.params.orderId || '').trim().toUpperCase();
+        let orden = await Order.findOne({ orderId: idLimpio });
+        if (!orden) return res.status(404).json({ error: 'Checkout no encontrado.' });
+
+        if (!orden.isWaitingBinanceAuto && (orden.status === 'ENTREGADO' || orden.status === 'EJECUTANDO_API' || orden.status === 'EN_PROCESO')) {
+            return res.json({
+                success: true,
+                paid: true,
+                order: orden
+            });
+        }
+
+        if (orden.binanceExpiresAt && new Date(orden.binanceExpiresAt).getTime() <= Date.now()) {
+            return res.json({
+                success: true,
+                paid: false,
+                expired: true,
+                order: orden
+            });
+        }
+
+        const resBinance = await consultarTransaccionesBinancePayAPI();
+        if (resBinance.ok && resBinance.transactions.length > 0) {
+            const matchTx = await buscarCoincidenciaPagoBinanceParaOrden(orden, resBinance.transactions);
+            if (matchTx) {
+                orden = await completarOrdenConfirmadaPorBinance(orden, matchTx);
+                return res.json({
+                    success: true,
+                    paid: true,
+                    order: orden
+                });
+            }
+        }
+
+        return res.json({
+            success: true,
+            paid: false,
+            expired: false,
+            apiConnected: resBinance.ok,
+            order: orden
+        });
+    } catch (error) {
+        return res.status(500).json({ error: 'Error consultando estado del pago en Binance.' });
+    }
+});
+
+// 3. Respaldo Manual en caso de que el cliente haya enviado sin decimales o quiera reportar los 6 dígitos del Order ID
+app.post('/api/binance-pay/manual-fallback', async (req, res) => {
+    try {
+        const { orderId, manualReference } = req.body;
+        const refLimpia = String(manualReference || '').trim().toUpperCase();
+        if (!orderId || refLimpia.length < 4) {
+            return res.status(400).json({ error: 'Ingresa al menos los últimos 6 dígitos del ID de Orden de Binance.' });
+        }
+
+        const idLimpio = String(orderId).trim().toUpperCase();
+        const orden = await Order.findOne({ orderId: idLimpio });
+        if (!orden) return res.status(404).json({ error: 'Orden no encontrada.' });
+
+        orden.isWaitingBinanceAuto = false;
+        orden.paymentReference = refLimpia;
+        orden.status = 'EN_PROCESO';
+        orden.progressPercent = 50;
+        orden.statusMessage = 'Referencia de Binance recibida. Un operador está verificando tu pago...';
+        orden.timerStartedAt = new Date();
+        await orden.save();
+
+        return res.json({
+            success: true,
+            order: orden
+        });
+    } catch (error) {
+        return res.status(500).json({ error: 'Error registrando la referencia manual.' });
+    }
+});
+
+// 4. Endpoint Exclusivo del Dueño para guardar API Key / Secret Key / Pay ID / QR de Binance y probar conexión
+app.post('/api/admin/binance-pay/config', verificarSoloAdmin, async (req, res) => {
+    try {
+        const { enabled, payId, merchantName, qrImageUrl, apiKey, apiSecret, testOnly } = req.body;
+        let settings = await StoreSettings.findOne({ key: 'main_settings' }).select('-centralOneCatalogCache -centralOneCoverageCache');
+        if (!settings) settings = new StoreSettings({ key: 'main_settings' });
+
+        if (!settings.binanceAutoConfig) settings.binanceAutoConfig = {};
+        if (typeof enabled === 'boolean') settings.binanceAutoConfig.enabled = enabled;
+        if (payId !== undefined) settings.binanceAutoConfig.payId = String(payId).trim();
+        if (merchantName !== undefined) settings.binanceAutoConfig.merchantName = String(merchantName).trim();
+        if (qrImageUrl !== undefined) settings.binanceAutoConfig.qrImageUrl = String(qrImageUrl).trim();
+        if (apiKey !== undefined && !String(apiKey).includes('••••')) {
+            settings.binanceAutoConfig.apiKey = String(apiKey).trim();
+        }
+        if (apiSecret !== undefined && !String(apiSecret).includes('••••')) {
+            settings.binanceAutoConfig.apiSecret = String(apiSecret).trim();
+        }
+
+        if (payId) {
+            await PaymentMethod.updateMany(
+                { methodKey: { $regex: /binance/i } },
+                { $set: { phoneOrEmail: String(payId).trim(), binancePayId: String(payId).trim() } }
+            ).catch(() => {});
+        }
+
+        const testRes = await consultarTransaccionesBinancePayAPI(settings);
+        settings.binanceAutoConfig.lastCheckAt = new Date();
+        settings.binanceAutoConfig.lastError = testRes.ok ? '' : (testRes.error || '');
+        settings.markModified('binanceAutoConfig');
+
+        if (!testOnly) {
+            await settings.save();
+        }
+
+        return res.json({
+            success: true,
+            apiConnected: testRes.ok,
+            transactionsReadCount: (testRes.transactions || []).length,
+            error: testRes.ok ? null : testRes.error,
+            config: {
+                enabled: settings.binanceAutoConfig.enabled !== false,
+                payId: settings.binanceAutoConfig.payId || '',
+                merchantName: settings.binanceAutoConfig.merchantName || 'Kem!Zone Oficial',
+                qrImageUrl: settings.binanceAutoConfig.qrImageUrl || '',
+                hasApiKey: Boolean(settings.binanceAutoConfig.apiKey || process.env.BINANCE_API_KEY),
+                hasApiSecret: Boolean(settings.binanceAutoConfig.apiSecret || process.env.BINANCE_API_SECRET)
+            }
+        });
+    } catch (error) {
+        return res.status(500).json({ error: 'Error configurando Binance Pay Automático.' });
+    }
+});
+
+// Filtrar órdenes que aún están esperando en la ventana de QR de Binance para que no ensucien la cola antes de pagar
+const _origFindOrders = Order.find;
+
+// =================================================================
 // 🏪 ENDPOINTS PÚBLICOS DE LA TIENDA KEM!ZONE (CATÁLOGO Y COMPRAS)
 // =================================================================
 
