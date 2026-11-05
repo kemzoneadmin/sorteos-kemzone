@@ -1112,8 +1112,13 @@ function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, ba
         }
     }
 
-    let candidatas = [];
-    for (const c of (baseCardsPool || [])) {
+let candidatas = [];
+    for (const rawCard of (baseCardsPool || [])) {
+        // Convertir subdocumento de Mongoose a objeto plano para conservar name, cardId y centralOneProductId
+        const c = rawCard && typeof rawCard.toObject === 'function'
+            ? rawCard.toObject()
+            : (rawCard && rawCard._doc ? { ...rawCard._doc } : { ...rawCard });
+
         if (c.active === false) continue;
         if (excluidosSet.has(String(c.cardId))) continue;
         if (String(c.platformGroup || 'steam').toLowerCase() !== String(platformGroup || 'steam').toLowerCase()) continue;
@@ -1127,12 +1132,17 @@ function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, ba
         let stockDisp = (c.availableStock !== null && c.availableStock !== undefined) ? Number(c.availableStock) : null;
         const stockInternoCount = Array.isArray(c.internalCodeStock) ? c.internalCodeStock.length : 0;
 
-        if (tieneCacheAPI && (c.centralOneProductId || c.centralOneSku)) {
-            const itemCO = (c.centralOneProductId && mapaCO_Id[c.centralOneProductId]) ||
-                           (c.centralOneSku && mapaCO_Sku[String(c.centralOneSku).trim().toUpperCase()]);
+        let coIdResuelto = String(c.centralOneProductId || '').trim();
+        let coSkuResuelto = String(c.centralOneSku || '').trim();
+
+        if (tieneCacheAPI && (coIdResuelto || coSkuResuelto)) {
+            const itemCO = (coIdResuelto && mapaCO_Id[coIdResuelto]) ||
+                           (coSkuResuelto && mapaCO_Sku[coSkuResuelto.toUpperCase()]);
             if (!itemCO) {
                 enStockReal = false;
             } else {
+                if (!coIdResuelto && itemCO.product_id) coIdResuelto = String(itemCO.product_id);
+                if (!coSkuResuelto && itemCO.sku) coSkuResuelto = String(itemCO.sku);
                 enStockReal = Boolean(itemCO.in_stock && itemCO.status === 'active');
                 if ((!costoReal || costoReal <= 0) && itemCO.reseller_price !== null && Number(itemCO.reseller_price) > 0) {
                     costoReal = Number(itemCO.reseller_price);
@@ -1149,6 +1159,12 @@ function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, ba
 
         candidatas.push({
             ...c,
+            cardId: c.cardId,
+            name: c.name || coSkuResuelto || 'Tarjeta Steam',
+            centralOneProductId: coIdResuelto,
+            centralOneSku: coSkuResuelto,
+            faceValueOrigin: c.faceValueOrigin,
+            originCurrency: c.originCurrency || 'VND',
             effectiveClientUSD: effUsd,
             costUSD: costoReal,
             costPerDollar: costoReal / effUsd,
