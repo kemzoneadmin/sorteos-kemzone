@@ -1917,8 +1917,48 @@ function formatearCodigoConEtiquetaSteam(codeStr, amountUSD, esSteam = true) {
     return `Steam Wallet ${montoComa}$ ➔ ${limpio}`;
 }
 
+// 🎯 Resuelve el monto exacto en $ USD que entrega cada tarjeta individual (100% blindado)
+function resolverMontoUsdTarjetaDeItemCentralOne(ci, idxGlobal, poolCards, algoState, fallbackUnitUSD = 0) {
+    const catId = String(ci?.catalog_item_id || ci?.product_id || '').trim();
+    const skuUp = String(ci?.sku || '').trim().toUpperCase();
+    const nameLow = String(ci?.product_name || ci?.name || '').trim().toLowerCase();
+
+    // 1. Buscar primero en las tarjetas exactas que pidió esta orden (orderedItemsMeta)
+    if (algoState && Array.isArray(algoState.orderedItemsMeta)) {
+        const matchMeta = algoState.orderedItemsMeta.find(m =>
+            (catId && String(m.centralOneProductId || '').trim() === catId) ||
+            (skuUp && String(m.sku || '').trim().toUpperCase() === skuUp) ||
+            (nameLow && String(m.name || '').trim().toLowerCase() === nameLow)
+        );
+        if (matchMeta && Number(matchMeta.unitClientUSD) > 0) {
+            return Number(matchMeta.unitClientUSD);
+        }
+    }
+
+    // 2. Buscar en la Bóveda de Tarjetas Base (poolCards)
+    if (Array.isArray(poolCards) && poolCards.length > 0) {
+        const matchCard = poolCards.find(c =>
+            (catId && String(c.centralOneProductId || '').trim() === catId) ||
+            (skuUp && String(c.centralOneSku || '').trim().toUpperCase() === skuUp) ||
+            (nameLow && String(c.name || '').trim().toLowerCase() === nameLow)
+        );
+        if (matchCard) {
+            const eff = Number(matchCard.effectiveClientUSD) ||
+                        Number(((Number(matchCard.faceValueOrigin) || 0) * (Number(matchCard.conversionRateToUSD) || 0)).toFixed(2));
+            if (eff > 0) return eff;
+        }
+    }
+
+    // 3. Respaldo por posición exacta en expectedUnitAmountsUSD (ej: [3.85, 3.85])
+    if (algoState && Array.isArray(algoState.expectedUnitAmountsUSD) && Number(algoState.expectedUnitAmountsUSD[idxGlobal]) > 0) {
+        return Number(algoState.expectedUnitAmountsUSD[idxGlobal]);
+    }
+
+    return Number(fallbackUnitUSD || 0);
+}
+
 // 🔎 CONSULTAR ESTADO DETALLADO Y CÓDIGOS POR LÍNEA EN CENTRAL ONE (`GET /orders/{id}` y `GET /orders/{id}/codes`)
-async function verificarYExtraerEntregaCentralOne(coOrderId, headers, poolCards = null, esSteamOrder = false, fallbackUnitUSD = 0) {
+async function verificarYExtraerEntregaCentralOne(coOrderId, headers, poolCards = null, esSteamOrder = false, fallbackUnitUSD = 0, algoState = null) {
     const resOrder = await axios.get(`${CENTRAL_ONE_BASE_URL}/orders/${encodeURIComponent(coOrderId)}`, {
         headers,
         timeout: 12000
@@ -1941,28 +1981,33 @@ async function verificarYExtraerEntregaCentralOne(coOrderId, headers, poolCards 
                 timeout: 12000
             });
             const codeItems = resCodes.data?.order?.items || [];
-            codeItems.forEach(ci => {
+            let globalCodeIndex = 0;
+
+            codeItems.forEach((ci, itemIdx) => {
                 if (Array.isArray(ci.codes) && ci.codes.length > 0) {
-                    const catId = ci.catalog_item_id || ci.product_id || '';
-                    const skuUp = String(ci.sku || '').trim().toUpperCase();
-                    let unitUsdCard = fallbackUnitUSD;
+                    const lineFallback = lines[itemIdx] || {};
+                    const ciEnriquecido = {
+                        ...lineFallback,
+                        ...ci,
+                        catalog_item_id: ci.catalog_item_id || ci.product_id || lineFallback.catalog_item_id || lineFallback.product_id || '',
+                        sku: ci.sku || lineFallback.sku || '',
+                        product_name: ci.product_name || ci.name || lineFallback.product_name || lineFallback.name || ''
+                    };
 
-                    if (Array.isArray(poolCards) && poolCards.length > 0) {
-                        const matchCard = poolCards.find(c =>
-                            (catId && c.centralOneProductId === catId) ||
-                            (skuUp && String(c.centralOneSku || '').trim().toUpperCase() === skuUp)
+                    const codigosFormateadosItem = ci.codes.map(cStr => {
+                        const unitUsdCard = resolverMontoUsdTarjetaDeItemCentralOne(
+                            ciEnriquecido,
+                            globalCodeIndex,
+                            poolCards,
+                            algoState,
+                            fallbackUnitUSD
                         );
-                        if (matchCard && Number(matchCard.effectiveClientUSD) > 0) {
-                            unitUsdCard = Number(matchCard.effectiveClientUSD);
-                        }
-                    }
-
-                    const codigosFormateadosItem = ci.codes.map(cStr =>
-                        formatearCodigoConEtiquetaSteam(cStr, unitUsdCard, esSteamOrder)
-                    );
+                        globalCodeIndex++;
+                        return formatearCodigoConEtiquetaSteam(cStr, unitUsdCard, esSteamOrder);
+                    });
 
                     codigosPorItem.push({
-                        catalogItemId: catId,
+                        catalogItemId: ciEnriquecido.catalog_item_id,
                         codes: codigosFormateadosItem,
                         rawCodes: ci.codes
                     });
@@ -2086,7 +2131,7 @@ function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId, fallbackIdemp
             const esSteamOrd = String(ordenDB.productSlug || '').toLowerCase().includes('steam') ||
                                String(ordenDB.algoExecutionState?.platformGroup || '').toLowerCase() === 'steam';
 
-            const check = await verificarYExtraerEntregaCentralOne(currentCoOrderId, headers, poolCards, esSteamOrd, 0);
+            const check = await verificarYExtraerEntregaCentralOne(currentCoOrderId, headers, poolCards, esSteamOrd, 0, ordenDB.algoExecutionState);
 
             if (ordenDB.cancelledByDelayRefund || ordenDB.status === 'RECHAZADO') {
                 if (check.state === 'COMPLETED' || check.state === 'PARTIAL_REFUNDED') {
@@ -2212,6 +2257,13 @@ function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId, fallbackIdemp
 
                         const newCoOrder = resRetry.data?.order;
                         if (newCoOrder && newCoOrder.id) {
+                            algoState.orderedItemsMeta = comboReemplazo.items;
+                            const nuevosMontosEsp = [];
+                            (comboReemplazo.items || []).forEach(it => {
+                                const q = Math.max(1, Math.round(Number(it.quantity) || 1));
+                                for (let k = 0; k < q; k++) nuevosMontosEsp.push(Number(it.unitClientUSD || 0));
+                            });
+                            algoState.expectedUnitAmountsUSD = nuevosMontosEsp;
                             algoState.deliveredCardsCount = algoState.deliveredCodesList.length;
                             algoState.totalCardsExpected = algoState.deliveredCodesList.length + comboReemplazo.totalCards;
                             ordenDB.apiOrderId = newCoOrder.id;
@@ -2599,6 +2651,31 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
                     await settings.save();
                 }
 
+const montosEsperadosPorTarjeta = [];
+                (itemsParaPedirCentralOne.length > 0 ? itemsParaPedirCentralOne : combo.items).forEach(it => {
+                    const q = Math.max(1, Math.round(Number(it.quantity) || 1));
+                    for (let k = 0; k < q; k++) {
+                        montosEsperadosPorTarjeta.push(Number(it.unitClientUSD || 0));
+                    }
+                });
+
+                orden.algoExecutionState = {
+                    isAlgorithmOrder: true,
+                    platformGroup: platGroup,
+                    targetClientUSD: Number(pkg.targetClientUSD),
+                    gamesTargetsUSD: juegosSeparados.length > 0 ? juegosSeparados : (orden.algoExecutionState?.gamesTargetsUSD || []),
+                    orderedItemsMeta: combo.items,
+                    expectedUnitAmountsUSD: montosEsperadosPorTarjeta,
+                    deliveredClientUSD: usdCubiertoInterno,
+                    deliveredCostUSD: costoCubiertoInterno,
+                    deliveredCodesList: [...codigosDesdeStockInterno],
+                    failedCardIds: [...excluidosFallidos],
+                    totalCardsExpected: combo.totalCards,
+                    deliveredCardsCount: codigosDesdeStockInterno.length,
+                    retryAttempt: 0
+                };
+                orden.markModified('algoExecutionState');
+
                 if (itemsParaPedirCentralOne.length === 0 && codigosDesdeStockInterno.length > 0) {
                     return {
                         success: true,
@@ -2626,20 +2703,6 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
                     note: `KemZone #${orden.orderId} (${combo.summaryText})`.slice(0, 480)
                 };
 
-                orden.algoExecutionState = {
-                    isAlgorithmOrder: true,
-                    platformGroup: platGroup,
-                    targetClientUSD: Number(pkg.targetClientUSD),
-                    deliveredClientUSD: usdCubiertoInterno,
-                    deliveredCostUSD: costoCubiertoInterno,
-                    deliveredCodesList: [...codigosDesdeStockInterno],
-                    failedCardIds: [...excluidosFallidos],
-                    totalCardsExpected: combo.totalCards,
-                    deliveredCardsCount: codigosDesdeStockInterno.length,
-                    retryAttempt: 0
-                };
-                orden.markModified('algoExecutionState');
-
                 try {
                     const resCreate = await axios.post(`${CENTRAL_ONE_BASE_URL}/orders`, bodyOrder, {
                         headers: headersOrder,
@@ -2652,7 +2715,7 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
                     }
 
                     await new Promise(r => setTimeout(r, 1800));
-                    const check = await verificarYExtraerEntregaCentralOne(createdOrder.id, headersBase, poolCards, esSteamPool, 0);
+                    const check = await verificarYExtraerEntregaCentralOne(createdOrder.id, headersBase, poolCards, esSteamPool, 0, orden.algoExecutionState);
 
                     if (check.state === 'COMPLETED') {
                         const todosLosCodigos = [...new Set([...codigosDesdeStockInterno, ...(check.codigosPlanos || [])])];
@@ -3194,16 +3257,35 @@ app.post('/webhooks/central-one', express.raw({ type: 'application/json' }), asy
                     ordenDB.apiOrderId = wOrder.id;
                 }
 
+                const poolCardsWebhook = settings ? (settings.arbitrageBaseCards || []) : [];
+                const esSteamOrd = String(ordenDB.productSlug || '').toLowerCase().includes('steam') ||
+                                   String(ordenDB.algoExecutionState?.platformGroup || '').toLowerCase() === 'steam';
+
                 const listaCodigos = [];
                 const codigosPorItem = [];
+                let globalWebhookCodeIdx = 0;
+
                 if (Array.isArray(wOrder.codes)) {
                     wOrder.codes.forEach(cGroup => {
                         if (Array.isArray(cGroup.codes) && cGroup.codes.length > 0) {
+                            const codigosFormateadosGrupo = cGroup.codes.map(codeStr => {
+                                const unitUsdCard = resolverMontoUsdTarjetaDeItemCentralOne(
+                                    cGroup,
+                                    globalWebhookCodeIdx,
+                                    poolCardsWebhook,
+                                    ordenDB.algoExecutionState,
+                                    0
+                                );
+                                globalWebhookCodeIdx++;
+                                return formatearCodigoConEtiquetaSteam(codeStr, unitUsdCard, esSteamOrd);
+                            });
+
                             codigosPorItem.push({
                                 catalogItemId: cGroup.catalog_item_id || cGroup.product_id || '',
-                                codes: cGroup.codes
+                                codes: codigosFormateadosGrupo,
+                                rawCodes: cGroup.codes
                             });
-                            cGroup.codes.forEach(codeStr => listaCodigos.push(codeStr));
+                            codigosFormateadosGrupo.forEach(codeStr => listaCodigos.push(codeStr));
                         }
                     });
                 }
