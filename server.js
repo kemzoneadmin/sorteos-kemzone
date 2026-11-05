@@ -3978,11 +3978,16 @@ app.post('/api/binance-pay/create-checkout', orderLimiter, verificarTokenOpciona
             }
 
             const costoTarjetasTotal = Number(planTarjetas.totalCostUSD);
-            const diferenciaCostoTarjetas = Math.max(0, round4(costoTarjetasTotal - totalPriceUsd));
             const itemsCalc = validGames.map(it => {
-                const pesoJuego = totalPriceUsd > 0 ? (it.usdR / totalPriceUsd) : (1 / validGames.length);
-                const ajusteTarjetaItem = round4(diferenciaCostoTarjetas * pesoJuego);
-                const subExact = round4(it.usdR + ajusteTarjetaItem + it.tierFee);
+                const planIndiv = calcularMejorCombinacionTarjetasPool(
+                    it.usdR,
+                    'steam',
+                    settings.arbitrageBaseCards || [],
+                    settings.centralOneCatalogCache || null
+                );
+                const costoIndiv = (planIndiv && planIndiv.hasSolution) ? Number(planIndiv.totalCostUSD) : it.usdR;
+                const difIndiv = Math.max(0, round4(costoIndiv - it.usdR));
+                const subExact = round4(it.usdR + difIndiv + it.tierFee);
                 const sub = ceil2(subExact);
                 return { ...it, subExact, sub };
             });
@@ -4632,7 +4637,19 @@ let estadoAlgoritmoInicial = null;
             }
 
             const costoTarjetasTotal = Number(planTarjetas.totalCostUSD);
-            const diferenciaCostoTarjetas = Math.max(0, round4(costoTarjetasTotal - totalPriceUsd));
+            const itemsCalc = validGames.map(it => {
+                const planIndiv = calcularMejorCombinacionTarjetasPool(
+                    it.usdR,
+                    'steam',
+                    settings.arbitrageBaseCards || [],
+                    settings.centralOneCatalogCache || null
+                );
+                const costoIndiv = (planIndiv && planIndiv.hasSolution) ? Number(planIndiv.totalCostUSD) : it.usdR;
+                const difIndiv = Math.max(0, round4(costoIndiv - it.usdR));
+                const subExact = round4(it.usdR + difIndiv + it.tierFee);
+                const sub = ceil2(subExact);
+                return { ...it, subExact, sub };
+            });
 
             const itemsCalc = validGames.map(it => {
                 const pesoJuego = totalPriceUsd > 0 ? (it.usdR / totalPriceUsd) : (1 / validGames.length);
