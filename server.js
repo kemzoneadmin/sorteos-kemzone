@@ -1866,9 +1866,10 @@ async function verificarYExtraerEntregaCentralOne(coOrderId, headers) {
 // ⏱️ VIGILANTE PASO A PASO: ESPERA A QUE LAS TARJETAS SE ENTREGUEN O SE REEMBOLSEN PARA REEMPLAZARLAS AUTOMÁTICAMENTE
 const activeCentralOnePollers = new Map();
 
-function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId) {
-    if (!orderIdKZ || !coOrderId || activeCentralOnePollers.has(orderIdKZ)) return;
+function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId, fallbackIdempKey = null, fallbackBodyOrder = null) {
+    if (!orderIdKZ || activeCentralOnePollers.has(orderIdKZ)) return;
     const inicioMs = Date.now();
+    let currentCoOrderId = coOrderId || '';
 
     const cicloRevision = async () => {
         try {
@@ -1883,7 +1884,36 @@ function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId) {
                 return;
             }
 
-            const check = await verificarYExtraerEntregaCentralOne(coOrderId, headers);
+            // Si la petición inicial dio timeout mientras Central One creaba la orden, recuperamos el ID usando la misma Idempotency-Key (sin duplicar cobro)
+            if (!currentCoOrderId && ordenDB.apiOrderId && !ordenDB.apiOrderId.startsWith('kz-ord-')) {
+                currentCoOrderId = ordenDB.apiOrderId;
+            }
+            if (!currentCoOrderId && fallbackIdempKey && fallbackBodyOrder) {
+                try {
+                    const headersIdemp = obtenerHeadersCentralOne({ 'Idempotency-Key': fallbackIdempKey });
+                    const resRec = await axios.post(`${CENTRAL_ONE_BASE_URL}/orders`, fallbackBodyOrder, {
+                        headers: headersIdemp,
+                        timeout: 20000
+                    });
+                    if (resRec.data?.order?.id) {
+                        currentCoOrderId = resRec.data.order.id;
+                        ordenDB.apiOrderId = currentCoOrderId;
+                        await ordenDB.save();
+                    }
+                } catch (eRec) {}
+            }
+
+            if (!currentCoOrderId) {
+                const transcurridoSinId = Date.now() - inicioMs;
+                if (transcurridoSinId < 30 * 60 * 1000) {
+                    activeCentralOnePollers.set(orderIdKZ, setTimeout(cicloRevision, 15000));
+                } else {
+                    activeCentralOnePollers.delete(orderIdKZ);
+                }
+                return;
+            }
+
+            const check = await verificarYExtraerEntregaCentralOne(currentCoOrderId, headers);
 
             // 🏦 Si el cliente ya había cancelado por reembolso a los 30 min y Central One acaba de entregar códigos: guardarlos en Stock Interno
             if (ordenDB.cancelledByDelayRefund || ordenDB.status === 'RECHAZADO') {
@@ -1896,10 +1926,9 @@ function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId) {
                     activeCentralOnePollers.delete(orderIdKZ);
                     return;
                 }
-                // Si aún sigue procesando en Central One aunque el cliente canceló, seguimos vigilando para rescatar el código cuando salga
                 const tCancel = Date.now() - inicioMs;
                 if (tCancel < 3 * 60 * 60 * 1000) {
-                    activeCentralOnePollers.set(orderIdKZ, setTimeout(cicloRevision, 60000));
+                    activeCentralOnePollers.set(orderIdKZ, setTimeout(cicloRevision, 45000));
                 } else {
                     activeCentralOnePollers.delete(orderIdKZ);
                 }
@@ -1911,7 +1940,7 @@ function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId) {
             // ✅ CASO A: CENTRAL ONE COMPLETÓ TODA LA ORDEN ACTUAL
             if (check.state === 'COMPLETED') {
                 const codigosPrevios = (algoState && Array.isArray(algoState.deliveredCodesList)) ? algoState.deliveredCodesList : [];
-                const todosLosCodigos = [...codigosPrevios, ...(check.codigosPlanos || [])];
+                const todosLosCodigos = [...new Set([...codigosPrevios, ...(check.codigosPlanos || [])])];
                 const textoFinal = todosLosCodigos.length > 0 ? todosLosCodigos.join('  |  ') : check.deliveredCode;
 
                 ordenDB.status = 'ENTREGADO';
@@ -1935,7 +1964,6 @@ function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId) {
                 const settings = await StoreSettings.findOne({ key: 'main_settings' });
                 const poolCards = settings ? (settings.arbitrageBaseCards || []) : [];
 
-                // 1. Rescatar los códigos que sí se entregaron en esta etapa
                 if (check.state === 'PARTIAL_REFUNDED' && Array.isArray(check.codigosPorItem)) {
                     for (const cItem of check.codigosPorItem) {
                         const cardMatch = poolCards.find(c => c.centralOneProductId === cItem.catalogItemId);
@@ -1951,7 +1979,6 @@ function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId) {
                     }
                 }
 
-                // 2. Marcar como fallidas las tarjetas que entraron en reembolso para no volver a pedir esa misma denominación trabada
                 if (!Array.isArray(algoState.failedCardIds)) algoState.failedCardIds = [];
                 (check.failedCatalogIds || []).forEach(catId => {
                     const cardFailed = poolCards.find(c => c.centralOneProductId === catId);
@@ -1975,7 +2002,6 @@ function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId) {
                     return;
                 }
 
-                // 3. Buscar tarjetas de reemplazo para cubrir el saldo faltante una vez confirmado el reembolso en Central One
                 let comboReemplazo = calcularMejorCombinacionTarjetasPool(
                     saldoFaltanteUSD,
                     algoState.platformGroup || 'steam',
@@ -1984,7 +2010,6 @@ function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId) {
                     algoState.failedCardIds
                 );
 
-                // Si excluyendo la tarjeta fallida no alcanza, permitir intentar con cualquier tarjeta disponible
                 if (!comboReemplazo.hasSolution && (algoState.retryAttempt || 0) < 2) {
                     comboReemplazo = calcularMejorCombinacionTarjetasPool(
                         saldoFaltanteUSD,
@@ -1995,7 +2020,6 @@ function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId) {
                     );
                 }
 
-                // Verificar que la orden total siga teniendo saldo positivo para ti (aunque ganes unos centavos menos)
                 const costoAcumuladoConReemplazo = (Number(algoState.deliveredCostUSD) || 0) + (comboReemplazo.hasSolution ? Number(comboReemplazo.totalCostUSD) : 9999);
                 const sigueConSaldoPositivo = costoAcumuladoConReemplazo <= (Number(ordenDB.totalAmountUSD) + 0.05);
 
@@ -2003,15 +2027,19 @@ function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId) {
                     algoState.retryAttempt = (algoState.retryAttempt || 0) + 1;
                     const idempRetry = `kz-ord-${ordenDB.orderId}-rep-${algoState.retryAttempt}-${Date.now().toString(36)}`.replace(/[^A-Za-z0-9_-]/g, '');
                     const headersRetry = obtenerHeadersCentralOne({ 'Idempotency-Key': idempRetry });
+                    const bodyRetry = {
+                        items: comboReemplazo.items.map(it => ({
+                            catalog_item_id: it.centralOneProductId,
+                            quantity: Math.max(1, Math.round(Number(it.quantity) || 1))
+                        })),
+                        note: `KemZone Reemplazo #${ordenDB.orderId} (${comboReemplazo.summaryText})`.slice(0, 480)
+                    };
 
                     try {
-                        const resRetry = await axios.post(`${CENTRAL_ONE_BASE_URL}/orders`, {
-                            items: comboReemplazo.items.map(it => ({
-                                catalog_item_id: it.centralOneProductId,
-                                quantity: Math.max(1, Math.round(Number(it.quantity) || 1))
-                            })),
-                            note: `KemZone Reemplazo #${ordenDB.orderId} (${comboReemplazo.summaryText})`.slice(0, 480)
-                        }, { headers: headersRetry, timeout: 20000 });
+                        const resRetry = await axios.post(`${CENTRAL_ONE_BASE_URL}/orders`, bodyRetry, {
+                            headers: headersRetry,
+                            timeout: 30000
+                        });
 
                         const newCoOrder = resRetry.data?.order;
                         if (newCoOrder && newCoOrder.id) {
@@ -2024,10 +2052,17 @@ function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId) {
                             await ordenDB.save();
 
                             activeCentralOnePollers.delete(orderIdKZ);
-                            programarSeguimientoOrdenCentralOne(orderIdKZ, newCoOrder.id);
+                            programarSeguimientoOrdenCentralOne(orderIdKZ, newCoOrder.id, idempRetry, bodyRetry);
                             return;
                         }
-                    } catch (errRep) {}
+                    } catch (errRep) {
+                        const esTimeoutRep = errRep.code === 'ECONNABORTED' || String(errRep.message || '').toLowerCase().includes('timeout');
+                        if (esTimeoutRep) {
+                            activeCentralOnePollers.delete(orderIdKZ);
+                            programarSeguimientoOrdenCentralOne(orderIdKZ, null, idempRetry, bodyRetry);
+                            return;
+                        }
+                    }
                 }
             }
 
@@ -2064,16 +2099,16 @@ function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId) {
                 activeCentralOnePollers.delete(orderIdKZ);
                 return;
             }
-            const proximoIntervalo = transcurridoMs < (5 * 60 * 1000) ? 25000 : 120000;
+            const proximoIntervalo = transcurridoMs < (10 * 60 * 1000) ? 15000 : 60000;
             const timerId = setTimeout(cicloRevision, proximoIntervalo);
             activeCentralOnePollers.set(orderIdKZ, timerId);
         } catch (e) {
-            const timerId = setTimeout(cicloRevision, 45000);
+            const timerId = setTimeout(cicloRevision, 25000);
             activeCentralOnePollers.set(orderIdKZ, timerId);
         }
     };
 
-    const firstTimer = setTimeout(cicloRevision, 20000);
+    const firstTimer = setTimeout(cicloRevision, 12000);
     activeCentralOnePollers.set(orderIdKZ, firstTimer);
 }
 
@@ -2116,12 +2151,11 @@ function obtenerGananciaRangoSteamServer(precioUsd) {
 async function ejecutarEntregaPorAPI(orden, productoDB) {
     orden.timerStartedAt = new Date(); // Reinicia el reloj de 30 minutos al momento de aprobar y disparar la API
 
-    // Si es una orden de la Calculadora de Juegos de Steam, construir el perfil virtual conectado al Algoritmo de Steam
     if (!productoDB && orden.productSlug === 'calculadora-steam') {
         const metaSteam = Number(orden.algoExecutionState?.targetClientUSD || orden.baseAmountUSD || 5);
         productoDB = {
             slug: 'calculadora-steam',
-            name: orden.productName || 'Calculadora de Juegos Steam',
+            name: orden.productName || 'Compra tus Juegos de Steam',
             isSmartCodeProduct: true,
             smartPlatformGroup: 'steam',
             packages: [{
@@ -2163,6 +2197,31 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
     const headersBase = obtenerHeadersCentralOne();
     const settings = await StoreSettings.findOne({ key: 'main_settings' });
 
+    // Si la orden ya tenía un apiOrderId de Central One asignado previamente, verificar su estado antes de crear otra
+    if (headersBase && orden.apiOrderId && !orden.apiOrderId.startsWith('VAULT-') && !orden.apiOrderId.startsWith('INTERNAL-') && !orden.apiOrderId.startsWith('API-') && !orden.apiOrderId.startsWith('kz-ord-')) {
+        try {
+            const checkPrev = await verificarYExtraerEntregaCentralOne(orden.apiOrderId, headersBase);
+            if (checkPrev.state === 'COMPLETED') {
+                return {
+                    success: true,
+                    deliveredCode: checkPrev.deliveredCode,
+                    apiOrderId: orden.apiOrderId,
+                    raw: checkPrev.raw
+                };
+            }
+            if (checkPrev.state === 'PROCESSING') {
+                programarSeguimientoOrdenCentralOne(orden.orderId, orden.apiOrderId);
+                return {
+                    success: true,
+                    isProcessingAsync: true,
+                    deliveredCode: '',
+                    apiOrderId: orden.apiOrderId,
+                    raw: checkPrev.raw
+                };
+            }
+        } catch (ePrev) {}
+    }
+
     if (headersBase) {
         const usaAlgoritmo = Boolean((productoDB && productoDB.isSmartCodeProduct) || (pkg && pkg.useSmartAlgorithm));
 
@@ -2191,7 +2250,6 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
                     return { success: false, errorMsg: combo.reason || 'Sin stock en tarjetas base del algoritmo.' };
                 }
 
-                // 🏦 1. Verificar primero si tenemos códigos en el Stock Interno Recuperado (internalCodeStock)
                 const codigosDesdeStockInterno = [];
                 let usdCubiertoInterno = 0;
                 let costoCubiertoInterno = 0;
@@ -2226,7 +2284,6 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
                     await settings.save();
                 }
 
-                // Si el 100% de la combinación se cubrió con el Stock Interno de la Bóveda: entrega instantánea en 0ms
                 if (itemsParaPedirCentralOne.length === 0 && codigosDesdeStockInterno.length > 0) {
                     return {
                         success: true,
@@ -2246,19 +2303,33 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
 
                 const idempKey = `kz-ord-${orden.orderId}-algo-v${intento}`.replace(/[^A-Za-z0-9_-]/g, '');
                 const headersOrder = obtenerHeadersCentralOne({ 'Idempotency-Key': idempKey });
+                const bodyOrder = {
+                    items: itemsParaPedirCentralOne.map(it => ({
+                        catalog_item_id: it.centralOneProductId,
+                        quantity: it.quantity
+                    })),
+                    note: `KemZone #${orden.orderId} (${combo.summaryText})`.slice(0, 480)
+                };
+
+                // Preparar estado del algoritmo antes de enviar por si Central One responde por Webhook o tarda > 25s
+                orden.algoExecutionState = {
+                    isAlgorithmOrder: true,
+                    platformGroup: platGroup,
+                    targetClientUSD: Number(pkg.targetClientUSD),
+                    deliveredClientUSD: usdCubiertoInterno,
+                    deliveredCostUSD: costoCubiertoInterno,
+                    deliveredCodesList: [...codigosDesdeStockInterno],
+                    failedCardIds: [...excluidosFallidos],
+                    totalCardsExpected: combo.totalCards,
+                    deliveredCardsCount: codigosDesdeStockInterno.length,
+                    retryAttempt: 0
+                };
+                orden.markModified('algoExecutionState');
 
                 try {
-                    const bodyOrder = {
-                        items: itemsParaPedirCentralOne.map(it => ({
-                            catalog_item_id: it.centralOneProductId,
-                            quantity: it.quantity
-                        })),
-                        note: `KemZone #${orden.orderId} (${combo.summaryText})`.slice(0, 480)
-                    };
-
                     const resCreate = await axios.post(`${CENTRAL_ONE_BASE_URL}/orders`, bodyOrder, {
                         headers: headersOrder,
-                        timeout: 20000
+                        timeout: 28000
                     });
 
                     const createdOrder = resCreate.data?.order;
@@ -2266,26 +2337,11 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
                         return { success: false, errorMsg: 'Respuesta inválida al crear orden en Central One.' };
                     }
 
-                    // Guardar estado paso a paso en la orden para seguimiento de entregas parciales y reembolsos
-                    orden.algoExecutionState = {
-                        isAlgorithmOrder: true,
-                        platformGroup: platGroup,
-                        targetClientUSD: Number(pkg.targetClientUSD),
-                        deliveredClientUSD: usdCubiertoInterno,
-                        deliveredCostUSD: costoCubiertoInterno,
-                        deliveredCodesList: [...codigosDesdeStockInterno],
-                        failedCardIds: [...excluidosFallidos],
-                        totalCardsExpected: combo.totalCards,
-                        deliveredCardsCount: codigosDesdeStockInterno.length,
-                        retryAttempt: 0
-                    };
-                    orden.markModified('algoExecutionState');
-
-                    await new Promise(r => setTimeout(r, 2200));
+                    await new Promise(r => setTimeout(r, 1800));
                     const check = await verificarYExtraerEntregaCentralOne(createdOrder.id, headersBase);
 
                     if (check.state === 'COMPLETED') {
-                        const todosLosCodigos = [...codigosDesdeStockInterno, ...(check.codigosPlanos || [])];
+                        const todosLosCodigos = [...new Set([...codigosDesdeStockInterno, ...(check.codigosPlanos || [])])];
                         orden.algoExecutionState.deliveredCodesList = todosLosCodigos;
                         orden.algoExecutionState.deliveredCardsCount = combo.totalCards;
                         return {
@@ -2301,8 +2357,7 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
                         continue;
                     }
 
-                    // Si sigue procesando (o entregó 2 de 4 y 2 están en espera), activar el vigilante paso a paso
-                    programarSeguimientoOrdenCentralOne(orden.orderId, createdOrder.id);
+                    programarSeguimientoOrdenCentralOne(orden.orderId, createdOrder.id, idempKey, bodyOrder);
                     return {
                         success: true,
                         isProcessingAsync: true,
@@ -2312,6 +2367,20 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
                     };
                 } catch (errCO) {
                     const errCode = errCO.response?.data?.error?.code || '';
+                    const esTimeout = errCO.code === 'ECONNABORTED' || String(errCO.message || '').toLowerCase().includes('timeout');
+
+                    // Si Central One tardó más de 28s porque una tarjeta sigue "en curso", NO es un fallo: pasamos a seguimiento automático con el reloj de 30 minutos
+                    if (esTimeout) {
+                        programarSeguimientoOrdenCentralOne(orden.orderId, null, idempKey, bodyOrder);
+                        return {
+                            success: true,
+                            isProcessingAsync: true,
+                            deliveredCode: '',
+                            apiOrderId: idempKey,
+                            raw: { asyncTimeoutPending: true }
+                        };
+                    }
+
                     if (errCode === 'insufficient_stock' && settings && intento === 1) {
                         itemsParaPedirCentralOne.forEach(it => {
                             excluidosFallidos.push(it.cardId);
@@ -2374,18 +2443,23 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
                 }
             }
 
+            const bodyDirect = {
+                items: [itemPayload],
+                note: `KemZone #${orden.orderId} - ${orden.productName}`.slice(0, 480)
+            };
+
             try {
-                const resCreate = await axios.post(`${CENTRAL_ONE_BASE_URL}/orders`, {
-                    items: [itemPayload],
-                    note: `KemZone #${orden.orderId} - ${orden.productName}`.slice(0, 480)
-                }, { headers: headersOrder, timeout: 20000 });
+                const resCreate = await axios.post(`${CENTRAL_ONE_BASE_URL}/orders`, bodyDirect, {
+                    headers: headersOrder,
+                    timeout: 28000
+                });
 
                 const createdOrder = resCreate.data?.order;
                 if (!createdOrder || !createdOrder.id) {
                     return { success: false, errorMsg: 'Central One no devolvió ID de pedido.' };
                 }
 
-                await new Promise(r => setTimeout(r, 2200));
+                await new Promise(r => setTimeout(r, 1800));
                 const check = await verificarYExtraerEntregaCentralOne(createdOrder.id, headersBase);
 
                 if (check.state === 'COMPLETED') {
@@ -2404,7 +2478,7 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
                     };
                 }
 
-                programarSeguimientoOrdenCentralOne(orden.orderId, createdOrder.id);
+                programarSeguimientoOrdenCentralOne(orden.orderId, createdOrder.id, idempKey, bodyDirect);
                 return {
                     success: true,
                     isProcessingAsync: true,
@@ -2413,6 +2487,18 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
                     raw: check.raw
                 };
             } catch (errDirect) {
+                const esTimeoutDir = errDirect.code === 'ECONNABORTED' || String(errDirect.message || '').toLowerCase().includes('timeout');
+                if (esTimeoutDir) {
+                    programarSeguimientoOrdenCentralOne(orden.orderId, null, idempKey, bodyDirect);
+                    return {
+                        success: true,
+                        isProcessingAsync: true,
+                        deliveredCode: '',
+                        apiOrderId: idempKey,
+                        raw: { asyncTimeoutPending: true }
+                    };
+                }
+
                 const msgErr = errDirect.response?.data?.error?.message || errDirect.message;
                 const codeErr = errDirect.response?.data?.error?.code || 'api_error';
                 await registrarAlertaCentralOne(settings, {
@@ -2779,7 +2865,7 @@ app.post('/webhooks/central-one', express.raw({ type: 'application/json' }), asy
             return;
         }
 
-        // B. Eventos de Órdenes: order.delivered, order.partially_delivered, order.failed, order.refunded
+// B. Eventos de Órdenes: order.delivered, order.partially_delivered, order.failed, order.refunded
         if (eventName.startsWith('order.') && payload.order) {
             const wOrder = payload.order;
             const idemp = wOrder.idempotency_key || '';
@@ -2788,35 +2874,89 @@ app.post('/webhooks/central-one', express.raw({ type: 'application/json' }), asy
 
             const ordenDB = kzOrderId
                 ? await Order.findOne({ orderId: kzOrderId })
-                : await Order.findOne({ apiOrderId: wOrder.reference_code });
+                : await Order.findOne({ $or: [{ apiOrderId: wOrder.id }, { apiOrderId: wOrder.reference_code }] });
 
             if (ordenDB) {
-                if (eventName === 'order.delivered' || eventName === 'order.partially_delivered') {
-                    const listaCodigos = [];
-                    if (Array.isArray(wOrder.codes)) {
-                        wOrder.codes.forEach(cGroup => {
-                            if (Array.isArray(cGroup.codes)) {
-                                cGroup.codes.forEach(codeStr => listaCodigos.push(codeStr));
-                            }
-                        });
+                if (wOrder.id && (!ordenDB.apiOrderId || ordenDB.apiOrderId.startsWith('kz-ord-'))) {
+                    ordenDB.apiOrderId = wOrder.id;
+                }
+
+                const listaCodigos = [];
+                const codigosPorItem = [];
+                if (Array.isArray(wOrder.codes)) {
+                    wOrder.codes.forEach(cGroup => {
+                        if (Array.isArray(cGroup.codes) && cGroup.codes.length > 0) {
+                            codigosPorItem.push({
+                                catalogItemId: cGroup.catalog_item_id || cGroup.product_id || '',
+                                codes: cGroup.codes
+                            });
+                            cGroup.codes.forEach(codeStr => listaCodigos.push(codeStr));
+                        }
+                    });
+                }
+
+                // 🏦 Si el cliente ya había cancelado por reembolso tras 30 minutos de espera, guardar los códigos en Stock Interno y NO revivir la orden
+                if (ordenDB.cancelledByDelayRefund || ordenDB.status === 'RECHAZADO') {
+                    if (listaCodigos.length > 0) {
+                        await guardarCodigosRecuperadosEnStockInterno(ordenDB, codigosPorItem, listaCodigos);
                     }
+                    if (activeCentralOnePollers.has(ordenDB.orderId)) {
+                        clearTimeout(activeCentralOnePollers.get(ordenDB.orderId));
+                        activeCentralOnePollers.delete(ordenDB.orderId);
+                    }
+                } else if (eventName === 'order.delivered') {
+                    // ✅ Entrega 100% completa: unir cualquier código de etapa previa con los recién llegados
+                    const codigosPrevios = (ordenDB.algoExecutionState && Array.isArray(ordenDB.algoExecutionState.deliveredCodesList))
+                        ? ordenDB.algoExecutionState.deliveredCodesList
+                        : [];
+                    const todosLosCodigos = [...new Set([...codigosPrevios, ...listaCodigos])];
+
                     ordenDB.status = 'ENTREGADO';
                     ordenDB.progressPercent = 100;
-                    if (listaCodigos.length > 0) {
-                        ordenDB.deliveredCode = listaCodigos.join('  |  ');
+                    if (todosLosCodigos.length > 0) {
+                        ordenDB.deliveredCode = todosLosCodigos.join('  |  ');
                     } else if (!ordenDB.deliveredCode || ordenDB.deliveredCode.includes('PROCESANDO')) {
-                        ordenDB.deliveredCode = `RECARGA COMPLETADA (${wOrder.reference_code || 'OK'})`;
+                        ordenDB.deliveredCode = `PEDIDO COMPLETADO (${wOrder.reference_code || 'OK'})`;
+                    }
+                    if (ordenDB.algoExecutionState) {
+                        ordenDB.algoExecutionState.deliveredCodesList = todosLosCodigos;
+                        ordenDB.algoExecutionState.deliveredCardsCount = ordenDB.algoExecutionState.totalCardsExpected || todosLosCodigos.length;
+                        ordenDB.markModified('algoExecutionState');
                     }
                     ordenDB.statusMessage = '¡Tu pedido ha sido entregado automáticamente con éxito!';
                     ordenDB.completedAt = new Date();
                     await ordenDB.save();
+
+                    if (activeCentralOnePollers.has(ordenDB.orderId)) {
+                        clearTimeout(activeCentralOnePollers.get(ordenDB.orderId));
+                        activeCentralOnePollers.delete(ordenDB.orderId);
+                    }
+                } else if (eventName === 'order.partially_delivered') {
+                    // 🔄 Entrega parcial: NO cerrar la orden incompleta; activar de inmediato el vigilante para reemplazar la tarjeta faltante
+                    await ordenDB.save();
+                    if (activeCentralOnePollers.has(ordenDB.orderId)) {
+                        clearTimeout(activeCentralOnePollers.get(ordenDB.orderId));
+                        activeCentralOnePollers.delete(ordenDB.orderId);
+                    }
+                    if (wOrder.id || ordenDB.apiOrderId) {
+                        programarSeguimientoOrdenCentralOne(ordenDB.orderId, wOrder.id || ordenDB.apiOrderId);
+                    }
                 } else if (eventName === 'order.failed') {
-                    await registrarAlertaCentralOne(settings, {
-                        type: 'ORDER_FAILED',
-                        severity: 'CRIT',
-                        title: `🚨 Orden #${ordenDB.orderId} reportada fallida por Webhook (${wOrder.reference_code})`,
-                        detail: `El saldo retenido fue liberado en tu cuenta de Central One.`
-                    });
+                    // Si es una orden de Algoritmo, dejar que el vigilante intente reemplazar por otra tarjeta antes de marcar error
+                    if (ordenDB.algoExecutionState && ordenDB.algoExecutionState.isAlgorithmOrder && (wOrder.id || ordenDB.apiOrderId)) {
+                        if (activeCentralOnePollers.has(ordenDB.orderId)) {
+                            clearTimeout(activeCentralOnePollers.get(ordenDB.orderId));
+                            activeCentralOnePollers.delete(ordenDB.orderId);
+                        }
+                        programarSeguimientoOrdenCentralOne(ordenDB.orderId, wOrder.id || ordenDB.apiOrderId);
+                    } else {
+                        await registrarAlertaCentralOne(settings, {
+                            type: 'ORDER_FAILED',
+                            severity: 'CRIT',
+                            title: `🚨 Orden #${ordenDB.orderId} reportada fallida por Webhook (${wOrder.reference_code})`,
+                            detail: `El saldo retenido fue liberado en tu cuenta de Central One.`
+                        });
+                    }
                 }
             }
         }
