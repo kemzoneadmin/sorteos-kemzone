@@ -4651,14 +4651,6 @@ let estadoAlgoritmoInicial = null;
                 return { ...it, subExact, sub };
             });
 
-            const itemsCalc = validGames.map(it => {
-                const pesoJuego = totalPriceUsd > 0 ? (it.usdR / totalPriceUsd) : (1 / validGames.length);
-                const ajusteTarjetaItem = round4(diferenciaCostoTarjetas * pesoJuego);
-                const subExact = round4(it.usdR + ajusteTarjetaItem + it.tierFee);
-                const sub = ceil2(subExact);
-                return { ...it, subExact, sub };
-            });
-
             const subtotalCalculado = round2(itemsCalc.reduce((a, it) => a + it.sub, 0));
             const resumenJuegosTxt = validGames.map(g => `${g.label} ($${g.usdR.toFixed(2)})`).join(' + ');
 
