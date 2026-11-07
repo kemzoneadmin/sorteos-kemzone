@@ -1926,7 +1926,10 @@ const activeOrderProcessingLocks = new Set();
 
 function extraerNumeroFacialDeTextoServer(txt) {
     if (!txt) return 0;
-    const limpio = String(txt).replace(/(\d)[,.](\d{3})(?!\d)/g, '$1$2');
+    let limpio = String(txt);
+    while (/(\d)[,.](\d{3})(?!\d)/.test(limpio)) {
+        limpio = limpio.replace(/(\d)[,.](\d{3})(?!\d)/g, '$1$2');
+    }
     const matchMoneda = limpio.match(/(\d+(?:\.\d+)?)\s*(?:VND|IDR|BRL|ARS|CLP|COP|MXN|PEN|PHP|THB|MYR|SGD|HKD|TWD|TRY|EUR|GBP|USD)/i);
     if (matchMoneda) return parseFloat(matchMoneda[1]) || 0;
     const nums = limpio.match(/\d+(?:\.\d+)?/g);
@@ -1937,7 +1940,7 @@ function extraerNumeroFacialDeTextoServer(txt) {
     return 0;
 }
 
-// 🎯 Empareja cualquier línea de Central One con la tarjeta exacta que pidió la orden (por ID, SKU, Valor Facial o Índice de Línea)
+// 🎯 Empareja cualquier línea de Central One con la tarjeta exacta que pidió la orden (Prioriza ID, SKU y Valor Facial sobre el índice de fila)
 function emparejarItemCentralOneConMetaKZ(ci, lineIdx, batchItemsMeta, poolCards) {
     const catId = String(ci?.catalog_item_id || ci?.product_id || '').trim();
     const skuUp = String(ci?.sku || '').trim().toUpperCase();
@@ -1955,16 +1958,7 @@ function emparejarItemCentralOneConMetaKZ(ci, lineIdx, batchItemsMeta, poolCards
         if (porIdOSku) return porIdOSku;
     }
 
-    // 2. Por posición exacta de línea cuando la orden tiene la misma cantidad de líneas
-    if (lineIdx >= 0 && lineIdx < listaMeta.length) {
-        const candIdx = listaMeta[lineIdx];
-        const facialCand = extraerNumeroFacialDeTextoServer(`${candIdx.name || ''} ${candIdx.sku || ''} ${candIdx.originText || ''}`);
-        if (!facialItem || !facialCand || Math.abs(facialItem - facialCand) < 0.01) {
-            return candIdx;
-        }
-    }
-
-    // 3. Por valor facial numérico (ej. 132500 VND vs "Steam Vietnam 132,500 VND") o nombre en la tanda pedida
+    // 2. Por valor facial numérico (ej. 132500 VND vs "Steam Vietnam 132,500 VND") o nombre exacto en la tanda pedida
     if (facialItem > 0 || nameLow) {
         const porFacialMeta = listaMeta.find(m => {
             if (nameLow && String(m.name || '').trim().toLowerCase() === nameLow) return true;
@@ -1974,7 +1968,7 @@ function emparejarItemCentralOneConMetaKZ(ci, lineIdx, batchItemsMeta, poolCards
         if (porFacialMeta) return porFacialMeta;
     }
 
-    // 4. Buscar en la Bóveda general (poolCards) por UUID, SKU, nombre o valor facial
+    // 3. Buscar en la Bóveda general (poolCards) por UUID, SKU, nombre o valor facial
     if (Array.isArray(poolCards) && poolCards.length > 0) {
         const matchPool = poolCards.find(c => {
             if (catId && String(c.centralOneProductId || '').trim() === catId) return true;
@@ -1997,7 +1991,7 @@ function emparejarItemCentralOneConMetaKZ(ci, lineIdx, batchItemsMeta, poolCards
         }
     }
 
-    // 5. Respaldo directo por índice de línea
+    // 4. Respaldo por índice de línea solo cuando no vino información de texto ni facial
     if (lineIdx >= 0 && lineIdx < listaMeta.length) {
         return listaMeta[lineIdx];
     }
@@ -2033,6 +2027,7 @@ async function verificarYExtraerEntregaCentralOne(coOrderId, headers, poolCards 
 
     const st = String(coOrder.status || '').toLowerCase();
     const lines = Array.isArray(coOrder.items) ? coOrder.items : [];
+    const linesConEntrega = lines.filter(l => (Number(l.delivered_count) || 0) > 0);
     const totalDeliveredCount = lines.reduce((acc, l) => acc + (Number(l.delivered_count) || 0), 0);
     const totalRequestedCount = lines.reduce((acc, l) => acc + (Number(l.quantity) || 1), 0);
 
@@ -2055,7 +2050,12 @@ async function verificarYExtraerEntregaCentralOne(coOrderId, headers, poolCards 
             rawCodeItems.forEach((ci, itemIdx) => {
                 const arrCodes = Array.isArray(ci?.codes) ? ci.codes : (typeof ci === 'string' ? [ci] : []);
                 if (arrCodes.length > 0) {
-                    const lineFallback = lines[itemIdx] || {};
+                    // Emparejar contra la línea que realmente tuvo entrega (evita desfase cuando Central One omite la línea fallida en /codes)
+                    const lineFallback = (ci?.order_item_id && lines.find(l => (l.id || l.order_item_id) === ci.order_item_id))
+                        || ((ci?.catalog_item_id || ci?.product_id) && lines.find(l => (l.catalog_item_id || l.product_id) === (ci.catalog_item_id || ci.product_id)))
+                        || (rawCodeItems.length === linesConEntrega.length ? linesConEntrega[itemIdx] : lines[itemIdx])
+                        || {};
+
                     const ciEnriquecido = {
                         ...lineFallback,
                         ...(typeof ci === 'object' ? ci : {}),
@@ -2203,6 +2203,26 @@ function extraerCodigoCrudoDeTextoFormateado(codeStr) {
 
 // ⏱️ VIGILANTE BLINDADO PASO A PASO: SIN DUPLICADOS, REPOSICIÓN EXCLUSIVA DE FALTANTES Y RECUPERACIÓN IDEMPOTENTE
 const activeCentralOnePollers = new Map();
+
+// Auto-reanuda el seguimiento de órdenes en curso si Railway se reinicia
+setTimeout(async () => {
+    try {
+        const hace24Horas = new Date(Date.now() - 24 * 60 * 60 * 1000);
+        const enVuelo = await Order.find({
+            fecha: { $gte: hace24Horas },
+            status: 'EJECUTANDO_API',
+            cancelledByDelayRefund: { $ne: true }
+        }).select('orderId apiOrderId algoExecutionState').lean();
+
+        for (const ord of (enVuelo || [])) {
+            if (ord.apiOrderId && !ord.apiOrderId.startsWith('VAULT-') && !ord.apiOrderId.startsWith('INTERNAL-') && !ord.apiOrderId.startsWith('API-')) {
+                const idCo = ord.apiOrderId.startsWith('kz-ord-') ? null : ord.apiOrderId;
+                const idemp = ord.apiOrderId.startsWith('kz-ord-') ? ord.apiOrderId : (ord.algoExecutionState?.pendingReplacementIdempKey || null);
+                programarSeguimientoOrdenCentralOne(ord.orderId, idCo, idemp, ord.algoExecutionState?.pendingReplacementBody || null);
+            }
+        }
+    } catch (e) {}
+}, 9000);
 
 function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId, fallbackIdempKey = null, fallbackBodyOrder = null) {
     if (!orderIdKZ) return;
