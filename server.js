@@ -1940,12 +1940,13 @@ function extraerNumeroFacialDeTextoServer(txt) {
     return 0;
 }
 
-// 🎯 Empareja cualquier línea de Central One con la tarjeta exacta que pidió la orden (Prioriza ID, SKU y Valor Facial sobre el índice de fila)
+// 🎯 Empareja cualquier línea de Central One con la tarjeta exacta que pidió la orden (Prioriza ID, SKU, Valor Facial y Costo Unitario sobre el índice de fila)
 function emparejarItemCentralOneConMetaKZ(ci, lineIdx, batchItemsMeta, poolCards) {
     const catId = String(ci?.catalog_item_id || ci?.product_id || '').trim();
     const skuUp = String(ci?.sku || '').trim().toUpperCase();
     const nameLow = String(ci?.product_name || ci?.name || '').trim().toLowerCase();
     const facialItem = extraerNumeroFacialDeTextoServer(`${ci?.product_name || ''} ${ci?.name || ''} ${ci?.sku || ''}`);
+    const unitPriceCO = Number(ci?.unit_price || ci?.reseller_price || 0);
 
     const listaMeta = Array.isArray(batchItemsMeta) ? batchItemsMeta : [];
 
@@ -1958,7 +1959,7 @@ function emparejarItemCentralOneConMetaKZ(ci, lineIdx, batchItemsMeta, poolCards
         if (porIdOSku) return porIdOSku;
     }
 
-    // 2. Por valor facial numérico (ej. 132500 VND vs "Steam Vietnam 132,500 VND") o nombre exacto en la tanda pedida
+    // 2. Por valor facial numérico (ej. 132500 VND === "Steam Vietnam 132,500 VND") o nombre exacto en la tanda pedida
     if (facialItem > 0 || nameLow) {
         const porFacialMeta = listaMeta.find(m => {
             if (nameLow && String(m.name || '').trim().toLowerCase() === nameLow) return true;
@@ -1968,14 +1969,24 @@ function emparejarItemCentralOneConMetaKZ(ci, lineIdx, batchItemsMeta, poolCards
         if (porFacialMeta) return porFacialMeta;
     }
 
-    // 3. Buscar en la Bóveda general (poolCards) por UUID, SKU, nombre o valor facial
+    // 3. Por costo unitario exacto de Central One (ej. 4.9926 USD === unitCostUSD de la tarjeta)
+    if (unitPriceCO > 0) {
+        const porCostoMeta = listaMeta.find(m =>
+            Number(m.unitCostUSD) > 0 && Math.abs(Number(m.unitCostUSD) - unitPriceCO) < 0.005
+        );
+        if (porCostoMeta) return porCostoMeta;
+    }
+
+    // 4. Buscar en la Bóveda general (poolCards) por UUID, SKU, nombre, valor facial o costo unitario
     if (Array.isArray(poolCards) && poolCards.length > 0) {
         const matchPool = poolCards.find(c => {
             if (catId && String(c.centralOneProductId || '').trim() === catId) return true;
             if (skuUp && String(c.centralOneSku || '').trim().toUpperCase() === skuUp) return true;
             if (nameLow && String(c.name || '').trim().toLowerCase() === nameLow) return true;
             const fPool = Number(c.faceValueOrigin) || extraerNumeroFacialDeTextoServer(`${c.name || ''} ${c.centralOneSku || ''}`);
-            return facialItem > 0 && fPool > 0 && Math.abs(facialItem - fPool) < 0.01;
+            if (facialItem > 0 && fPool > 0 && Math.abs(facialItem - fPool) < 0.01) return true;
+            if (unitPriceCO > 0 && Number(c.costUSD) > 0 && Math.abs(Number(c.costUSD) - unitPriceCO) < 0.005) return true;
+            return false;
         });
         if (matchPool) {
             const eff = Number(matchPool.effectiveClientUSD) ||
@@ -1991,7 +2002,7 @@ function emparejarItemCentralOneConMetaKZ(ci, lineIdx, batchItemsMeta, poolCards
         }
     }
 
-    // 4. Respaldo por índice de línea solo cuando no vino información de texto ni facial
+    // 5. Respaldo por índice de línea solo cuando no vino información de texto, facial ni costo
     if (lineIdx >= 0 && lineIdx < listaMeta.length) {
         return listaMeta[lineIdx];
     }
