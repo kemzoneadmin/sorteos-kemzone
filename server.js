@@ -1917,39 +1917,104 @@ function formatearCodigoConEtiquetaSteam(codeStr, amountUSD, esSteam = true) {
     return `Steam Wallet ${montoComa}$ ➔ ${limpio}`;
 }
 
-// 🎯 Resuelve el monto exacto en $ USD que entrega cada tarjeta individual (100% blindado)
-function resolverMontoUsdTarjetaDeItemCentralOne(ci, idxGlobal, poolCards, algoState, fallbackUnitUSD = 0) {
+Order.schema.add({
+    waitCyclesCount: { type: Number, default: 0 }
+});
+
+// 🔒 Candado en memoria RAM para evitar que un Webhook y el Vigilante procesen la misma orden al mismo milisegundo
+const activeOrderProcessingLocks = new Set();
+
+function extraerNumeroFacialDeTextoServer(txt) {
+    if (!txt) return 0;
+    const limpio = String(txt).replace(/(\d)[,.](\d{3})(?!\d)/g, '$1$2');
+    const matchMoneda = limpio.match(/(\d+(?:\.\d+)?)\s*(?:VND|IDR|BRL|ARS|CLP|COP|MXN|PEN|PHP|THB|MYR|SGD|HKD|TWD|TRY|EUR|GBP|USD)/i);
+    if (matchMoneda) return parseFloat(matchMoneda[1]) || 0;
+    const nums = limpio.match(/\d+(?:\.\d+)?/g);
+    if (nums && nums.length > 0) {
+        const mayor = Math.max(...nums.map(Number).filter(n => !isNaN(n)));
+        if (mayor > 0) return mayor;
+    }
+    return 0;
+}
+
+// 🎯 Empareja cualquier línea de Central One con la tarjeta exacta que pidió la orden (por ID, SKU, Valor Facial o Índice de Línea)
+function emparejarItemCentralOneConMetaKZ(ci, lineIdx, batchItemsMeta, poolCards) {
     const catId = String(ci?.catalog_item_id || ci?.product_id || '').trim();
     const skuUp = String(ci?.sku || '').trim().toUpperCase();
     const nameLow = String(ci?.product_name || ci?.name || '').trim().toLowerCase();
+    const facialItem = extraerNumeroFacialDeTextoServer(`${ci?.product_name || ''} ${ci?.name || ''} ${ci?.sku || ''}`);
 
-    // 1. Buscar primero en las tarjetas exactas que pidió esta orden (orderedItemsMeta)
-    if (algoState && Array.isArray(algoState.orderedItemsMeta)) {
-        const matchMeta = algoState.orderedItemsMeta.find(m =>
+    const listaMeta = Array.isArray(batchItemsMeta) ? batchItemsMeta : [];
+
+    // 1. Por UUID o SKU exacto en la tanda pedida
+    if (catId || skuUp) {
+        const porIdOSku = listaMeta.find(m =>
             (catId && String(m.centralOneProductId || '').trim() === catId) ||
-            (skuUp && String(m.sku || '').trim().toUpperCase() === skuUp) ||
-            (nameLow && String(m.name || '').trim().toLowerCase() === nameLow)
+            (skuUp && String(m.sku || '').trim().toUpperCase() === skuUp)
         );
-        if (matchMeta && Number(matchMeta.unitClientUSD) > 0) {
-            return Number(matchMeta.unitClientUSD);
+        if (porIdOSku) return porIdOSku;
+    }
+
+    // 2. Por posición exacta de línea cuando la orden tiene la misma cantidad de líneas
+    if (lineIdx >= 0 && lineIdx < listaMeta.length) {
+        const candIdx = listaMeta[lineIdx];
+        const facialCand = extraerNumeroFacialDeTextoServer(`${candIdx.name || ''} ${candIdx.sku || ''} ${candIdx.originText || ''}`);
+        if (!facialItem || !facialCand || Math.abs(facialItem - facialCand) < 0.01) {
+            return candIdx;
         }
     }
 
-    // 2. Buscar en la Bóveda de Tarjetas Base (poolCards)
+    // 3. Por valor facial numérico (ej. 132500 VND vs "Steam Vietnam 132,500 VND") o nombre en la tanda pedida
+    if (facialItem > 0 || nameLow) {
+        const porFacialMeta = listaMeta.find(m => {
+            if (nameLow && String(m.name || '').trim().toLowerCase() === nameLow) return true;
+            const fMeta = extraerNumeroFacialDeTextoServer(`${m.name || ''} ${m.sku || ''} ${m.originText || ''}`);
+            return facialItem > 0 && fMeta > 0 && Math.abs(facialItem - fMeta) < 0.01;
+        });
+        if (porFacialMeta) return porFacialMeta;
+    }
+
+    // 4. Buscar en la Bóveda general (poolCards) por UUID, SKU, nombre o valor facial
     if (Array.isArray(poolCards) && poolCards.length > 0) {
-        const matchCard = poolCards.find(c =>
-            (catId && String(c.centralOneProductId || '').trim() === catId) ||
-            (skuUp && String(c.centralOneSku || '').trim().toUpperCase() === skuUp) ||
-            (nameLow && String(c.name || '').trim().toLowerCase() === nameLow)
-        );
-        if (matchCard) {
-            const eff = Number(matchCard.effectiveClientUSD) ||
-                        Number(((Number(matchCard.faceValueOrigin) || 0) * (Number(matchCard.conversionRateToUSD) || 0)).toFixed(2));
-            if (eff > 0) return eff;
+        const matchPool = poolCards.find(c => {
+            if (catId && String(c.centralOneProductId || '').trim() === catId) return true;
+            if (skuUp && String(c.centralOneSku || '').trim().toUpperCase() === skuUp) return true;
+            if (nameLow && String(c.name || '').trim().toLowerCase() === nameLow) return true;
+            const fPool = Number(c.faceValueOrigin) || extraerNumeroFacialDeTextoServer(`${c.name || ''} ${c.centralOneSku || ''}`);
+            return facialItem > 0 && fPool > 0 && Math.abs(facialItem - fPool) < 0.01;
+        });
+        if (matchPool) {
+            const eff = Number(matchPool.effectiveClientUSD) ||
+                        Number(((Number(matchPool.faceValueOrigin) || 0) * (Number(matchPool.conversionRateToUSD) || 0)).toFixed(2));
+            return {
+                cardId: matchPool.cardId,
+                centralOneProductId: matchPool.centralOneProductId || '',
+                sku: matchPool.centralOneSku || '',
+                name: matchPool.name || '',
+                unitClientUSD: eff,
+                unitCostUSD: Number(matchPool.costUSD || 0)
+            };
         }
     }
 
-    // 3. Respaldo por posición exacta en expectedUnitAmountsUSD (ej: [3.85, 3.85])
+    // 5. Respaldo directo por índice de línea
+    if (lineIdx >= 0 && lineIdx < listaMeta.length) {
+        return listaMeta[lineIdx];
+    }
+    return null;
+}
+
+// 🎯 Resuelve el monto exacto en $ USD que entrega cada tarjeta individual (100% blindado)
+function resolverMontoUsdTarjetaDeItemCentralOne(ci, idxGlobal, poolCards, algoState, fallbackUnitUSD = 0, lineIdx = -1) {
+    const batchMeta = (algoState && Array.isArray(algoState.currentBatchItems) && algoState.currentBatchItems.length > 0)
+        ? algoState.currentBatchItems
+        : (algoState && Array.isArray(algoState.orderedItemsMeta) ? algoState.orderedItemsMeta : []);
+
+    const metaMatch = emparejarItemCentralOneConMetaKZ(ci, lineIdx, batchMeta, poolCards);
+    if (metaMatch && Number(metaMatch.unitClientUSD) > 0) {
+        return Number(metaMatch.unitClientUSD);
+    }
+
     if (algoState && Array.isArray(algoState.expectedUnitAmountsUSD) && Number(algoState.expectedUnitAmountsUSD[idxGlobal]) > 0) {
         return Number(algoState.expectedUnitAmountsUSD[idxGlobal]);
     }
@@ -1957,19 +2022,23 @@ function resolverMontoUsdTarjetaDeItemCentralOne(ci, idxGlobal, poolCards, algoS
     return Number(fallbackUnitUSD || 0);
 }
 
-// 🔎 CONSULTAR ESTADO DETALLADO Y CÓDIGOS POR LÍNEA EN CENTRAL ONE (`GET /orders/{id}` y `GET /orders/{id}/codes`)
+// 🔎 CONSULTAR ESTADO DETALLADO, CÓDIGOS ENTREGADOS Y LÍNEAS FALTANTES EN CENTRAL ONE
 async function verificarYExtraerEntregaCentralOne(coOrderId, headers, poolCards = null, esSteamOrder = false, fallbackUnitUSD = 0, algoState = null) {
     const resOrder = await axios.get(`${CENTRAL_ONE_BASE_URL}/orders/${encodeURIComponent(coOrderId)}`, {
         headers,
         timeout: 12000
     });
-    const coOrder = resOrder.data?.order;
-    if (!coOrder) return { state: 'PROCESSING', deliveredCardsCount: 0, totalCardsRequested: 1 };
+    const coOrder = resOrder.data?.order || resOrder.data;
+    if (!coOrder || !coOrder.status) return { state: 'PROCESSING', deliveredCardsCount: 0, totalCardsRequested: 1 };
 
     const st = String(coOrder.status || '').toLowerCase();
     const lines = Array.isArray(coOrder.items) ? coOrder.items : [];
     const totalDeliveredCount = lines.reduce((acc, l) => acc + (Number(l.delivered_count) || 0), 0);
     const totalRequestedCount = lines.reduce((acc, l) => acc + (Number(l.quantity) || 1), 0);
+
+    const batchMeta = (algoState && Array.isArray(algoState.currentBatchItems) && algoState.currentBatchItems.length > 0)
+        ? algoState.currentBatchItems
+        : (algoState && Array.isArray(algoState.orderedItemsMeta) ? algoState.orderedItemsMeta : []);
 
     let codigosPlanos = [];
     let codigosPorItem = [];
@@ -1980,42 +2049,90 @@ async function verificarYExtraerEntregaCentralOne(coOrderId, headers, poolCards 
                 headers,
                 timeout: 12000
             });
-            const codeItems = resCodes.data?.order?.items || [];
+            const rawCodeItems = resCodes.data?.order?.items || resCodes.data?.items || resCodes.data?.codes || [];
             let globalCodeIndex = 0;
 
-            codeItems.forEach((ci, itemIdx) => {
-                if (Array.isArray(ci.codes) && ci.codes.length > 0) {
+            rawCodeItems.forEach((ci, itemIdx) => {
+                const arrCodes = Array.isArray(ci?.codes) ? ci.codes : (typeof ci === 'string' ? [ci] : []);
+                if (arrCodes.length > 0) {
                     const lineFallback = lines[itemIdx] || {};
                     const ciEnriquecido = {
                         ...lineFallback,
-                        ...ci,
-                        catalog_item_id: ci.catalog_item_id || ci.product_id || lineFallback.catalog_item_id || lineFallback.product_id || '',
-                        sku: ci.sku || lineFallback.sku || '',
-                        product_name: ci.product_name || ci.name || lineFallback.product_name || lineFallback.name || ''
+                        ...(typeof ci === 'object' ? ci : {}),
+                        catalog_item_id: ci?.catalog_item_id || ci?.product_id || lineFallback.catalog_item_id || lineFallback.product_id || '',
+                        sku: ci?.sku || lineFallback.sku || '',
+                        product_name: ci?.product_name || ci?.name || lineFallback.product_name || lineFallback.name || ''
                     };
 
-                    const codigosFormateadosItem = ci.codes.map(cStr => {
-                        const unitUsdCard = resolverMontoUsdTarjetaDeItemCentralOne(
-                            ciEnriquecido,
-                            globalCodeIndex,
-                            poolCards,
-                            algoState,
-                            fallbackUnitUSD
-                        );
+                    const metaLinea = emparejarItemCentralOneConMetaKZ(ciEnriquecido, itemIdx, batchMeta, poolCards);
+                    const unitUsdLinea = (metaLinea && Number(metaLinea.unitClientUSD) > 0)
+                        ? Number(metaLinea.unitClientUSD)
+                        : resolverMontoUsdTarjetaDeItemCentralOne(ciEnriquecido, globalCodeIndex, poolCards, algoState, fallbackUnitUSD, itemIdx);
+                    const unitCostLinea = (metaLinea && Number(metaLinea.unitCostUSD) > 0)
+                        ? Number(metaLinea.unitCostUSD)
+                        : Number(lineFallback.unit_price || 0);
+
+                    const codigosFormateadosItem = [];
+                    const codigosCrudosLimpios = [];
+
+                    arrCodes.forEach(cStr => {
+                        const rawClean = String(cStr || '').trim();
+                        if (!rawClean) return;
                         globalCodeIndex++;
-                        return formatearCodigoConEtiquetaSteam(cStr, unitUsdCard, esSteamOrder);
+                        codigosCrudosLimpios.push(rawClean);
+                        codigosFormateadosItem.push(formatearCodigoConEtiquetaSteam(rawClean, unitUsdLinea, esSteamOrder));
                     });
 
                     codigosPorItem.push({
-                        catalogItemId: ciEnriquecido.catalog_item_id,
+                        lineIndex: itemIdx,
+                        cardId: metaLinea ? metaLinea.cardId : '',
+                        catalogItemId: (metaLinea && metaLinea.centralOneProductId) || ciEnriquecido.catalog_item_id || '',
+                        sku: (metaLinea && metaLinea.sku) || ciEnriquecido.sku || '',
+                        name: (metaLinea && metaLinea.name) || ciEnriquecido.product_name || '',
+                        unitClientUSD: unitUsdLinea,
+                        unitCostUSD: unitCostLinea,
                         codes: codigosFormateadosItem,
-                        rawCodes: ci.codes
+                        rawCodes: codigosCrudosLimpios
                     });
+
                     codigosFormateadosItem.forEach(cStr => codigosPlanos.push(cStr));
                 }
             });
         } catch (errCodes) {}
     }
+
+    // Identificar línea por línea cuáles tarjetas exactas NO fueron entregadas
+    const missingLineItems = [];
+    const failedCatalogIds = [];
+
+    lines.forEach((l, lineIdx) => {
+        const reqQty = Math.max(1, Number(l.quantity) || 1);
+        const delQty = Math.max(0, Number(l.delivered_count) || 0);
+        if (delQty < reqQty) {
+            const missingQty = reqQty - delQty;
+            const metaFaltante = emparejarItemCentralOneConMetaKZ(l, lineIdx, batchMeta, poolCards);
+            const failureCode = String(l.failure?.code || coOrder.failure?.code || '').toLowerCase();
+            const isOutOfStockFailure = failureCode.includes('stock') || failureCode.includes('unavailable') || failureCode.includes('disabled');
+
+            const catIdReal = (metaFaltante && metaFaltante.centralOneProductId) || l.catalog_item_id || l.product_id || '';
+            if (catIdReal && isOutOfStockFailure) {
+                failedCatalogIds.push(catIdReal);
+            }
+
+            missingLineItems.push({
+                lineIndex: lineIdx,
+                cardId: metaFaltante ? metaFaltante.cardId : '',
+                centralOneProductId: catIdReal,
+                sku: (metaFaltante && metaFaltante.sku) || l.sku || '',
+                name: (metaFaltante && metaFaltante.name) || l.product_name || l.name || 'Tarjeta Base',
+                quantity: missingQty,
+                unitClientUSD: (metaFaltante && Number(metaFaltante.unitClientUSD) > 0) ? Number(metaFaltante.unitClientUSD) : 0,
+                unitCostUSD: (metaFaltante && Number(metaFaltante.unitCostUSD) > 0) ? Number(metaFaltante.unitCostUSD) : Number(l.unit_price || 0),
+                failureCode,
+                isOutOfStockFailure
+            });
+        }
+    });
 
     if (st === 'completed') {
         const textoFinal = codigosPlanos.length > 0
@@ -2027,6 +2144,7 @@ async function verificarYExtraerEntregaCentralOne(coOrderId, headers, poolCards 
             deliveredCode: textoFinal,
             codigosPlanos,
             codigosPorItem,
+            missingLineItems: [],
             deliveredCardsCount: totalDeliveredCount,
             totalCardsRequested: totalRequestedCount,
             referenceCode: coOrder.reference_code || coOrderId,
@@ -2035,15 +2153,11 @@ async function verificarYExtraerEntregaCentralOne(coOrderId, headers, poolCards 
     }
 
     if (st === 'partially_completed') {
-        const failedCatalogIds = lines
-            .filter(l => (Number(l.delivered_count) || 0) < (Number(l.quantity) || 1))
-            .map(l => l.catalog_item_id || l.product_id)
-            .filter(Boolean);
-
         return {
             state: 'PARTIAL_REFUNDED',
             codigosPlanos,
             codigosPorItem,
+            missingLineItems,
             failedCatalogIds,
             deliveredCardsCount: totalDeliveredCount,
             totalCardsRequested: totalRequestedCount,
@@ -2055,9 +2169,9 @@ async function verificarYExtraerEntregaCentralOne(coOrderId, headers, poolCards 
     if (st === 'failed' || st === 'cancelled') {
         const firstFailedLine = lines.find(l => l.failure) || {};
         const failureInfo = firstFailedLine.failure || coOrder.failure || {};
-        const failedCatalogIds = lines.map(l => l.catalog_item_id || l.product_id).filter(Boolean);
         return {
             state: 'FAILED',
+            missingLineItems,
             failedCatalogIds,
             failureCode: failureInfo.code || 'unknown',
             failureAction: failureInfo.action || 'contact_support',
@@ -2070,6 +2184,7 @@ async function verificarYExtraerEntregaCentralOne(coOrderId, headers, poolCards 
         state: 'PROCESSING',
         codigosPlanos,
         codigosPorItem,
+        missingLineItems,
         deliveredCardsCount: totalDeliveredCount,
         totalCardsRequested: totalRequestedCount,
         referenceCode: coOrder.reference_code || coOrderId,
@@ -2077,15 +2192,35 @@ async function verificarYExtraerEntregaCentralOne(coOrderId, headers, poolCards 
     };
 }
 
-// ⏱️ VIGILANTE PASO A PASO: ESPERA A QUE LAS TARJETAS SE ENTREGUEN O SE REEMBOLSEN PARA REEMPLAZARLAS AUTOMÁTICAMENTE
+// Extrae el código alfanumérico puro (sin "Steam Wallet X,XX$ ➔ ") para evitar duplicados aunque cambie el formato
+function extraerCodigoCrudoDeTextoFormateado(codeStr) {
+    const str = String(codeStr || '').trim();
+    if (str.includes('➔')) {
+        return str.split('➔').slice(1).join('➔').trim().toUpperCase();
+    }
+    return str.toUpperCase();
+}
+
+// ⏱️ VIGILANTE BLINDADO PASO A PASO: SIN DUPLICADOS, REPOSICIÓN EXCLUSIVA DE FALTANTES Y RECUPERACIÓN IDEMPOTENTE
 const activeCentralOnePollers = new Map();
 
 function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId, fallbackIdempKey = null, fallbackBodyOrder = null) {
-    if (!orderIdKZ || activeCentralOnePollers.has(orderIdKZ)) return;
+    if (!orderIdKZ) return;
+    if (activeCentralOnePollers.has(orderIdKZ)) {
+        clearTimeout(activeCentralOnePollers.get(orderIdKZ));
+        activeCentralOnePollers.delete(orderIdKZ);
+    }
+
     const inicioMs = Date.now();
     let currentCoOrderId = coOrderId || '';
 
     const cicloRevision = async () => {
+        if (activeOrderProcessingLocks.has(orderIdKZ)) {
+            activeCentralOnePollers.set(orderIdKZ, setTimeout(cicloRevision, 10000));
+            return;
+        }
+        activeOrderProcessingLocks.add(orderIdKZ);
+
         try {
             const headers = obtenerHeadersCentralOne();
             if (!headers) {
@@ -2098,27 +2233,40 @@ function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId, fallbackIdemp
                 return;
             }
 
-            if (!currentCoOrderId && ordenDB.apiOrderId && !ordenDB.apiOrderId.startsWith('kz-ord-')) {
-                currentCoOrderId = ordenDB.apiOrderId;
-            }
-            if (!currentCoOrderId && fallbackIdempKey && fallbackBodyOrder) {
+            const algoState = ordenDB.algoExecutionState || null;
+
+            // 1. Si hay un reemplazo o pedido previo que dio timeout en pleno vuelo, recuperarlo con su Idempotency-Key determinista ANTES de mirar apiOrderId viejo
+            const pendingIdemp = (algoState && algoState.pendingReplacementIdempKey) || fallbackIdempKey || '';
+            const pendingBody = (algoState && algoState.pendingReplacementBody) || fallbackBodyOrder || null;
+
+            if (pendingIdemp && pendingBody && (!currentCoOrderId || (algoState && Array.isArray(algoState.processedPartialOrderIds) && algoState.processedPartialOrderIds.includes(currentCoOrderId)))) {
                 try {
-                    const headersIdemp = obtenerHeadersCentralOne({ 'Idempotency-Key': fallbackIdempKey });
-                    const resRec = await axios.post(`${CENTRAL_ONE_BASE_URL}/orders`, fallbackBodyOrder, {
+                    const headersIdemp = obtenerHeadersCentralOne({ 'Idempotency-Key': pendingIdemp });
+                    const resRec = await axios.post(`${CENTRAL_ONE_BASE_URL}/orders`, pendingBody, {
                         headers: headersIdemp,
-                        timeout: 20000
+                        timeout: 22000
                     });
                     if (resRec.data?.order?.id) {
                         currentCoOrderId = resRec.data.order.id;
                         ordenDB.apiOrderId = currentCoOrderId;
+                        if (algoState) {
+                            algoState.pendingReplacementIdempKey = '';
+                            algoState.pendingReplacementBody = null;
+                            ordenDB.algoExecutionState = algoState;
+                            ordenDB.markModified('algoExecutionState');
+                        }
                         await ordenDB.save();
                     }
                 } catch (eRec) {}
             }
 
+            if (!currentCoOrderId && ordenDB.apiOrderId && !ordenDB.apiOrderId.startsWith('kz-ord-')) {
+                currentCoOrderId = ordenDB.apiOrderId;
+            }
+
             if (!currentCoOrderId) {
-                const transcurridoSinId = Date.now() - inicioMs;
-                if (transcurridoSinId < 30 * 60 * 1000) {
+                const maxEsperaSinId = ordenDB.clientChoseToWait ? (12 * 60 * 60 * 1000) : (45 * 60 * 1000);
+                if (Date.now() - inicioMs < maxEsperaSinId) {
                     activeCentralOnePollers.set(orderIdKZ, setTimeout(cicloRevision, 15000));
                 } else {
                     activeCentralOnePollers.delete(orderIdKZ);
@@ -2129,10 +2277,11 @@ function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId, fallbackIdemp
             const settings = await StoreSettings.findOne({ key: 'main_settings' });
             const poolCards = settings ? (settings.arbitrageBaseCards || []) : [];
             const esSteamOrd = String(ordenDB.productSlug || '').toLowerCase().includes('steam') ||
-                               String(ordenDB.algoExecutionState?.platformGroup || '').toLowerCase() === 'steam';
+                               String(algoState?.platformGroup || '').toLowerCase() === 'steam';
 
-            const check = await verificarYExtraerEntregaCentralOne(currentCoOrderId, headers, poolCards, esSteamOrd, 0, ordenDB.algoExecutionState);
+            const check = await verificarYExtraerEntregaCentralOne(currentCoOrderId, headers, poolCards, esSteamOrd, 0, algoState);
 
+            // Si el cliente pidió reembolso por demora, guardar cualquier código que llegue en tu Stock Interno
             if (ordenDB.cancelledByDelayRefund || ordenDB.status === 'RECHAZADO') {
                 if (check.state === 'COMPLETED' || check.state === 'PARTIAL_REFUNDED') {
                     await guardarCodigosRecuperadosEnStockInterno(ordenDB, check.codigosPorItem, check.codigosPlanos);
@@ -2143,8 +2292,7 @@ function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId, fallbackIdemp
                     activeCentralOnePollers.delete(orderIdKZ);
                     return;
                 }
-                const tCancel = Date.now() - inicioMs;
-                if (tCancel < 3 * 60 * 60 * 1000) {
+                if (Date.now() - inicioMs < 6 * 60 * 60 * 1000) {
                     activeCentralOnePollers.set(orderIdKZ, setTimeout(cicloRevision, 45000));
                 } else {
                     activeCentralOnePollers.delete(orderIdKZ);
@@ -2152,13 +2300,33 @@ function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId, fallbackIdemp
                 return;
             }
 
-            const algoState = ordenDB.algoExecutionState || null;
-
-            // ✅ CASO A: CENTRAL ONE COMPLETÓ TODA LA ORDEN ACTUAL
+            // ✅ CASO A: CENTRAL ONE COMPLETÓ LA ORDEN ACTUAL
             if (check.state === 'COMPLETED') {
                 const codigosPrevios = (algoState && Array.isArray(algoState.deliveredCodesList)) ? algoState.deliveredCodesList : [];
-                const todosLosCodigos = [...new Set([...codigosPrevios, ...(check.codigosPlanos || [])])];
-                const textoFinal = todosLosCodigos.length > 0 ? todosLosCodigos.join('  |  ') : check.deliveredCode;
+                const vistosRaw = new Set(codigosPrevios.map(extraerCodigoCrudoDeTextoFormateado));
+                const todosLosCodigos = [...codigosPrevios];
+
+                for (const nuevoCod of (check.codigosPlanos || [])) {
+                    const rawKey = extraerCodigoCrudoDeTextoFormateado(nuevoCod);
+                    if (rawKey && !vistosRaw.has(rawKey)) {
+                        vistosRaw.add(rawKey);
+                        todosLosCodigos.push(nuevoCod);
+                    }
+                }
+
+                // Tope de seguridad: jamás entregar más tarjetas que el total esperado de la orden
+                const maxCardsPermitidas = (algoState && Number(algoState.totalCardsExpected) > 0)
+                    ? Number(algoState.totalCardsExpected)
+                    : todosLosCodigos.length;
+                const codigosParaCliente = todosLosCodigos.slice(0, maxCardsPermitidas);
+                const codigosExcedentes = todosLosCodigos.slice(maxCardsPermitidas);
+
+                if (codigosExcedentes.length > 0) {
+                    const crudosExcedentes = codigosExcedentes.map(c => c.includes('➔') ? c.split('➔').slice(1).join('➔').trim() : c);
+                    await guardarCodigosRecuperadosEnStockInterno(ordenDB, [], crudosExcedentes);
+                }
+
+                const textoFinal = codigosParaCliente.length > 0 ? codigosParaCliente.join('  |  ') : check.deliveredCode;
 
                 ordenDB.status = 'ENTREGADO';
                 ordenDB.progressPercent = 100;
@@ -2166,8 +2334,10 @@ function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId, fallbackIdemp
                 ordenDB.statusMessage = '¡Tu pedido ha sido entregado automáticamente con éxito!';
                 ordenDB.completedAt = new Date();
                 if (algoState) {
-                    algoState.deliveredCodesList = todosLosCodigos;
-                    algoState.deliveredCardsCount = algoState.totalCardsExpected || todosLosCodigos.length;
+                    algoState.deliveredCodesList = codigosParaCliente;
+                    algoState.deliveredCardsCount = codigosParaCliente.length;
+                    algoState.pendingReplacementIdempKey = '';
+                    algoState.pendingReplacementBody = null;
                     ordenDB.algoExecutionState = algoState;
                     ordenDB.markModified('algoExecutionState');
                 }
@@ -2176,15 +2346,30 @@ function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId, fallbackIdemp
                 return;
             }
 
-            // 🔄 CASO B: ENTREGA PARCIAL CON REEMBOLSO DE FALTANTES O FALLO/REEMBOLSO EN ALGORITMO
+            // 🔄 CASO B: ENTREGA PARCIAL O FALLIDA EN ORDEN CON ALGORITMO -> PEDIR EXCLUSIVAMENTE LAS TARJETAS FALTANTES (1 SOLA VEZ)
             if ((check.state === 'PARTIAL_REFUNDED' || check.state === 'FAILED') && algoState && algoState.isAlgorithmOrder) {
-                if (check.state === 'PARTIAL_REFUNDED' && Array.isArray(check.codigosPorItem)) {
+                if (!Array.isArray(algoState.processedPartialOrderIds)) {
+                    algoState.processedPartialOrderIds = [];
+                }
+
+                // 🔒 CANDADO ANTI-DUPLICADOS: Si este ID de Central One ya fue procesado como parcial/fallido, jamás volver a pedir reemplazo por él
+                if (algoState.processedPartialOrderIds.includes(currentCoOrderId)) {
+                    activeCentralOnePollers.delete(orderIdKZ);
+                    return;
+                }
+
+                if (!Array.isArray(algoState.deliveredCodesList)) algoState.deliveredCodesList = [];
+                const vistosRaw = new Set(algoState.deliveredCodesList.map(extraerCodigoCrudoDeTextoFormateado));
+
+                // 1. Registrar con exactitud los códigos que SÍ entregó esta orden parcial
+                if (Array.isArray(check.codigosPorItem)) {
                     for (const cItem of check.codigosPorItem) {
-                        const cardMatch = poolCards.find(c => c.centralOneProductId === cItem.catalogItemId);
-                        const unitUsd = cardMatch ? Number(cardMatch.effectiveClientUSD || 0) : 0;
-                        const unitCost = cardMatch ? Number(cardMatch.costUSD || 0) : 0;
+                        const unitUsd = Number(cItem.unitClientUSD || 0);
+                        const unitCost = Number(cItem.unitCostUSD || 0);
                         for (const codeStr of (cItem.codes || [])) {
-                            if (!algoState.deliveredCodesList.includes(codeStr)) {
+                            const rawKey = extraerCodigoCrudoDeTextoFormateado(codeStr);
+                            if (rawKey && !vistosRaw.has(rawKey)) {
+                                vistosRaw.add(rawKey);
                                 algoState.deliveredCodesList.push(codeStr);
                                 algoState.deliveredClientUSD = Number(((algoState.deliveredClientUSD || 0) + unitUsd).toFixed(2));
                                 algoState.deliveredCostUSD = Number(((algoState.deliveredCostUSD || 0) + unitCost).toFixed(4));
@@ -2192,23 +2377,58 @@ function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId, fallbackIdemp
                         }
                     }
                 }
+                algoState.deliveredCardsCount = algoState.deliveredCodesList.length;
 
-                if (!Array.isArray(algoState.failedCardIds)) algoState.failedCardIds = [];
-                (check.failedCatalogIds || []).forEach(catId => {
-                    const cardFailed = poolCards.find(c => c.centralOneProductId === catId);
-                    if (cardFailed && !algoState.failedCardIds.includes(cardFailed.cardId)) {
-                        algoState.failedCardIds.push(cardFailed.cardId);
+                // 2. Determinar EXCLUSIVAMENTE las tarjetas que faltaron en esta orden (`missingLineItems`)
+                const lineasFaltantes = Array.isArray(check.missingLineItems) ? check.missingLineItems : [];
+                let itemsFaltantesPorPedir = [];
+                let usdFaltanteExacto = 0;
+
+                for (const miss of lineasFaltantes) {
+                    let cantRestante = Math.max(1, Number(miss.quantity) || 1);
+                    const cPool = poolCards.find(c =>
+                        (miss.cardId && c.cardId === miss.cardId) ||
+                        (miss.centralOneProductId && c.centralOneProductId === miss.centralOneProductId)
+                    );
+
+                    // Primero revisar si tenemos códigos propios en `internalCodeStock` para esta tarjeta faltante
+                    while (cantRestante > 0 && cPool && Array.isArray(cPool.internalCodeStock) && cPool.internalCodeStock.length > 0) {
+                        const codigoPropio = cPool.internalCodeStock.shift();
+                        if (codigoPropio) {
+                            const codFormateado = formatearCodigoConEtiquetaSteam(codigoPropio, miss.unitClientUSD, esSteamOrd);
+                            const rawK = extraerCodigoCrudoDeTextoFormateado(codFormateado);
+                            if (rawK && !vistosRaw.has(rawK)) {
+                                vistosRaw.add(rawK);
+                                algoState.deliveredCodesList.push(codFormateado);
+                                algoState.deliveredClientUSD = Number(((algoState.deliveredClientUSD || 0) + Number(miss.unitClientUSD || 0)).toFixed(2));
+                                algoState.deliveredCostUSD = Number(((algoState.deliveredCostUSD || 0) + Number(miss.unitCostUSD || 0)).toFixed(4));
+                            }
+                            cantRestante--;
+                            if (settings) settings.markModified('arbitrageBaseCards');
+                        }
                     }
-                });
 
-                const saldoFaltanteUSD = Number(((algoState.targetClientUSD || 0) - (algoState.deliveredClientUSD || 0)).toFixed(2));
+                    if (cantRestante > 0) {
+                        usdFaltanteExacto = Number((usdFaltanteExacto + (cantRestante * Number(miss.unitClientUSD || 0))).toFixed(2));
+                        itemsFaltantesPorPedir.push({
+                            ...miss,
+                            quantity: cantRestante
+                        });
+                    }
+                }
 
-                if (saldoFaltanteUSD <= 0.05 && algoState.deliveredCodesList.length > 0) {
+                if (settings && settings.isModified('arbitrageBaseCards')) {
+                    await settings.save();
+                }
+
+                // Si ya se cubrieron todas las tarjetas con el stock interno o ya se alcanzó la meta, entregar de inmediato
+                if (itemsFaltantesPorPedir.length === 0 && algoState.deliveredCodesList.length > 0) {
                     ordenDB.status = 'ENTREGADO';
                     ordenDB.progressPercent = 100;
                     ordenDB.deliveredCode = algoState.deliveredCodesList.join('  |  ');
                     ordenDB.statusMessage = '¡Tu pedido ha sido entregado automáticamente con éxito!';
                     ordenDB.completedAt = new Date();
+                    algoState.processedPartialOrderIds.push(currentCoOrderId);
                     ordenDB.algoExecutionState = algoState;
                     ordenDB.markModified('algoExecutionState');
                     await ordenDB.save();
@@ -2216,70 +2436,123 @@ function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId, fallbackIdemp
                     return;
                 }
 
-                let comboReemplazo = calcularMejorCombinacionTarjetasPool(
-                    saldoFaltanteUSD,
-                    algoState.platformGroup || 'steam',
-                    poolCards,
-                    settings ? settings.centralOneCatalogCache : null,
-                    algoState.failedCardIds
-                );
+                // 3. Construir el pedido de reemplazo ÚNICA Y EXCLUSIVAMENTE por las tarjetas faltantes (NUNCA por las ya entregadas)
+                let itemsReemplazoFinal = [];
+                const huboFalloDeStockExplicito = itemsFaltantesPorPedir.some(x => x.isOutOfStockFailure || !x.centralOneProductId);
 
-                if (!comboReemplazo.hasSolution && (algoState.retryAttempt || 0) < 2) {
-                    comboReemplazo = calcularMejorCombinacionTarjetasPool(
-                        saldoFaltanteUSD,
-                        algoState.platformGroup || 'steam',
-                        poolCards,
-                        settings ? settings.centralOneCatalogCache : null,
-                        []
-                    );
+                if (!huboFalloDeStockExplicito && itemsFaltantesPorPedir.length > 0 && (algoState.retryAttempt || 0) === 0) {
+                    // Intento 1: Pedir exactamente la(s) tarjeta(s) faltante(s) (ej: 1x 100,000 VND)
+                    itemsReemplazoFinal = itemsFaltantesPorPedir.map(x => ({
+                        cardId: x.cardId,
+                        centralOneProductId: x.centralOneProductId,
+                        sku: x.sku,
+                        name: x.name,
+                        quantity: x.quantity,
+                        unitClientUSD: x.unitClientUSD,
+                        unitCostUSD: x.unitCostUSD
+                    }));
+                } else {
+                    // Si la tarjeta faltante se quedó sin stock en Central One, buscar reemplazo SOLO por el monto faltante (ej: $3.85, jamás $14.49)
+                    if (!Array.isArray(algoState.failedCardIds)) algoState.failedCardIds = [];
+                    itemsFaltantesPorPedir.forEach(x => {
+                        if (x.cardId && !algoState.failedCardIds.includes(x.cardId)) {
+                            algoState.failedCardIds.push(x.cardId);
+                        }
+                    });
+
+                    const metaRestanteUSD = usdFaltanteExacto > 0
+                        ? usdFaltanteExacto
+                        : Math.max(0, Number(((algoState.targetClientUSD || 0) - (algoState.deliveredClientUSD || 0)).toFixed(2)));
+
+                    if (metaRestanteUSD > 0.05) {
+                        let comboAlt = calcularMejorCombinacionTarjetasPool(
+                            metaRestanteUSD,
+                            algoState.platformGroup || 'steam',
+                            poolCards,
+                            settings ? settings.centralOneCatalogCache : null,
+                            algoState.failedCardIds
+                        );
+                        if (!comboAlt.hasSolution) {
+                            comboAlt = calcularMejorCombinacionTarjetasPool(
+                                metaRestanteUSD,
+                                algoState.platformGroup || 'steam',
+                                poolCards,
+                                settings ? settings.centralOneCatalogCache : null,
+                                []
+                            );
+                        }
+                        if (comboAlt.hasSolution && Array.isArray(comboAlt.items)) {
+                            itemsReemplazoFinal = comboAlt.items;
+                        }
+                    }
                 }
 
-                const costoAcumuladoConReemplazo = (Number(algoState.deliveredCostUSD) || 0) + (comboReemplazo.hasSolution ? Number(comboReemplazo.totalCostUSD) : 9999);
-                const sigueConSaldoPositivo = costoAcumuladoConReemplazo <= (Number(ordenDB.totalAmountUSD) + 0.05);
+                const costoFaltanteCalc = itemsReemplazoFinal.reduce((acc, it) => acc + (Number(it.unitCostUSD || 0) * Number(it.quantity || 1)), 0);
+                const costoTotalProyectado = Number(algoState.deliveredCostUSD || 0) + costoFaltanteCalc;
+                const dentroDePresupuestoSeguro = costoTotalProyectado <= (Number(ordenDB.totalAmountUSD || 0) + 0.35);
 
-                if (comboReemplazo.hasSolution && sigueConSaldoPositivo && (algoState.retryAttempt || 0) < 3) {
-                    algoState.retryAttempt = (algoState.retryAttempt || 0) + 1;
-                    const idempRetry = `kz-ord-${ordenDB.orderId}-rep-${algoState.retryAttempt}-${Date.now().toString(36)}`.replace(/[^A-Za-z0-9_-]/g, '');
+                // Máximo 2 intentos de reemplazo y siempre con llave determinista (SIN Date.now())
+                if (itemsReemplazoFinal.length > 0 && dentroDePresupuestoSeguro && (algoState.retryAttempt || 0) < 2) {
+                    const nuevoIntentoNum = (algoState.retryAttempt || 0) + 1;
+                    // 🔒 LLAVE DETERMINISTA FIJA: Impide al 100% que Central One cobre o cree dos veces el mismo reemplazo
+                    const idempRetry = `kz-ord-${ordenDB.orderId}-rep-v${nuevoIntentoNum}`.replace(/[^A-Za-z0-9_-]/g, '');
                     const headersRetry = obtenerHeadersCentralOne({ 'Idempotency-Key': idempRetry });
+                    const resumenFaltantesTxt = itemsReemplazoFinal
+                        .map(it => `${it.quantity}x ${it.name} ($${(Number(it.unitClientUSD || 0) * Number(it.quantity || 1)).toFixed(2)})`)
+                        .join(' + ');
+
                     const bodyRetry = {
-                        items: comboReemplazo.items.map(it => ({
+                        items: itemsReemplazoFinal.map(it => ({
                             catalog_item_id: it.centralOneProductId,
                             quantity: Math.max(1, Math.round(Number(it.quantity) || 1))
                         })),
-                        note: `KemZone Reemplazo #${ordenDB.orderId} (${comboReemplazo.summaryText})`.slice(0, 480)
+                        note: `KemZone Faltante #${ordenDB.orderId} (${resumenFaltantesTxt})`.slice(0, 480)
                     };
+
+                    const nuevosMontosEsp = [];
+                    let cantTarjetasFaltantes = 0;
+                    itemsReemplazoFinal.forEach(it => {
+                        const q = Math.max(1, Math.round(Number(it.quantity) || 1));
+                        cantTarjetasFaltantes += q;
+                        for (let k = 0; k < q; k++) nuevosMontosEsp.push(Number(it.unitClientUSD || 0));
+                    });
+
+                    // 🔒 GUARDAR EN MONGODB ANTES DE LLAMAR A AXIOS (Elimina condición de carrera por timeout o webhook)
+                    algoState.retryAttempt = nuevoIntentoNum;
+                    algoState.processedPartialOrderIds.push(currentCoOrderId);
+                    algoState.currentBatchItems = itemsReemplazoFinal;
+                    algoState.expectedUnitAmountsUSD = nuevosMontosEsp;
+                    algoState.deliveredCardsCount = algoState.deliveredCodesList.length;
+                    algoState.totalCardsExpected = algoState.deliveredCodesList.length + cantTarjetasFaltantes;
+                    algoState.pendingReplacementIdempKey = idempRetry;
+                    algoState.pendingReplacementBody = bodyRetry;
+
+                    ordenDB.algoExecutionState = algoState;
+                    ordenDB.statusMessage = `Completando la liberación de ${cantTarjetasFaltantes} tarjeta(s) restante(s) (${algoState.deliveredCodesList.length}/${algoState.totalCardsExpected} listas)...`;
+                    ordenDB.markModified('algoExecutionState');
+                    await ordenDB.save();
 
                     try {
                         const resRetry = await axios.post(`${CENTRAL_ONE_BASE_URL}/orders`, bodyRetry, {
                             headers: headersRetry,
-                            timeout: 30000
+                            timeout: 28000
                         });
 
                         const newCoOrder = resRetry.data?.order;
                         if (newCoOrder && newCoOrder.id) {
-                            algoState.orderedItemsMeta = comboReemplazo.items;
-                            const nuevosMontosEsp = [];
-                            (comboReemplazo.items || []).forEach(it => {
-                                const q = Math.max(1, Math.round(Number(it.quantity) || 1));
-                                for (let k = 0; k < q; k++) nuevosMontosEsp.push(Number(it.unitClientUSD || 0));
-                            });
-                            algoState.expectedUnitAmountsUSD = nuevosMontosEsp;
-                            algoState.deliveredCardsCount = algoState.deliveredCodesList.length;
-                            algoState.totalCardsExpected = algoState.deliveredCodesList.length + comboReemplazo.totalCards;
                             ordenDB.apiOrderId = newCoOrder.id;
+                            algoState.pendingReplacementIdempKey = '';
+                            algoState.pendingReplacementBody = null;
                             ordenDB.algoExecutionState = algoState;
-                            ordenDB.statusMessage = `Reemplazando automáticamente ${comboReemplazo.totalCards} tarjeta(s) liberadas para completar tu entrega...`;
                             ordenDB.markModified('algoExecutionState');
                             await ordenDB.save();
 
-                            activeCentralOnePollers.delete(orderIdKZ);
                             programarSeguimientoOrdenCentralOne(orderIdKZ, newCoOrder.id, idempRetry, bodyRetry);
                             return;
                         }
                     } catch (errRep) {
                         const esTimeoutRep = errRep.code === 'ECONNABORTED' || String(errRep.message || '').toLowerCase().includes('timeout');
                         if (esTimeoutRep) {
-                            activeCentralOnePollers.delete(orderIdKZ);
                             programarSeguimientoOrdenCentralOne(orderIdKZ, null, idempRetry, bodyRetry);
                             return;
                         }
@@ -2290,20 +2563,20 @@ function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId, fallbackIdemp
             // ❌ CASO C: FALLO DEFINITIVO
             if (check.state === 'FAILED' || check.state === 'PARTIAL_REFUNDED') {
                 ordenDB.status = 'ERROR_API';
-                ordenDB.statusMessage = 'Pago verificado. Nuestro sistema está completando la liberación de tu pedido.';
+                ordenDB.statusMessage = 'Pago verificado. Nuestro sistema está completando la liberación de las tarjetas restantes de tu pedido.';
                 await ordenDB.save();
                 await registrarAlertaCentralOne(settings, {
                     type: 'ORDER_FAILED',
                     severity: 'CRIT',
-                    title: `🚨 Orden #${ordenDB.orderId} requiere atención (${check.failureCode || 'reembolso parcial'})`,
-                    detail: `${ordenDB.productName} (${ordenDB.packageName}): ${check.errorMsg || 'Ítem reembolsado por Central One.'}`
+                    title: `🚨 Orden #${ordenDB.orderId} requiere atención (${check.failureCode || 'entrega parcial'})`,
+                    detail: `${ordenDB.productName} (${ordenDB.packageName}): ${check.errorMsg || 'Ítem reembolsado por Central One.'} (${algoState?.deliveredCodesList?.length || 0} código(s) ya resguardados).`
                 });
                 if (settings) await settings.save();
                 activeCentralOnePollers.delete(orderIdKZ);
                 return;
             }
 
-            // ⏳ CASO D: SIGUE EN ESPERA EN CENTRAL ONE
+            // ⏳ CASO D: SIGUE EN PROCESO EN CENTRAL ONE -> ESPERAR PACIENTEMENTE SIN PEDIR NADA EXTRA
             if (algoState && check.deliveredCardsCount !== undefined) {
                 const prevCount = (algoState.deliveredCodesList ? algoState.deliveredCodesList.length : 0) + Number(check.deliveredCardsCount || 0);
                 if (algoState.deliveredCardsCount !== prevCount) {
@@ -2315,16 +2588,19 @@ function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId, fallbackIdemp
             }
 
             const transcurridoMs = Date.now() - inicioMs;
-            if (transcurridoMs > 3 * 60 * 60 * 1000) {
+            const limitePollerMs = ordenDB.clientChoseToWait ? (12 * 60 * 60 * 1000) : (4 * 60 * 60 * 1000);
+            if (transcurridoMs > limitePollerMs) {
                 activeCentralOnePollers.delete(orderIdKZ);
                 return;
             }
-            const proximoIntervalo = transcurridoMs < (10 * 60 * 1000) ? 15000 : 60000;
+            const proximoIntervalo = transcurridoMs < (10 * 60 * 1000) ? 15000 : 45000;
             const timerId = setTimeout(cicloRevision, proximoIntervalo);
             activeCentralOnePollers.set(orderIdKZ, timerId);
         } catch (e) {
             const timerId = setTimeout(cicloRevision, 25000);
             activeCentralOnePollers.set(orderIdKZ, timerId);
+        } finally {
+            activeOrderProcessingLocks.delete(orderIdKZ);
         }
     };
 
@@ -2335,8 +2611,8 @@ function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId, fallbackIdemp
 // 📈 TABLA OFICIAL DE GANANCIAS MÍNIMAS POR RANGO PARA LA CALCULADORA DE JUEGOS DE STEAM
 const RANGOS_GANANCIA_STEAM_CALC = [
     { min: 0.01,   max: 1.40,   fee: 0.25 },
-    { min: 1.41,   max: 2.90,   fee: 0.40 },
-    { min: 2.91,   max: 3.90,   fee: 0.75 },
+    { min: 1.41,   max: 2.84,   fee: 0.40 },
+    { min: 2.85,   max: 3.90,   fee: 0.60 },
     { min: 3.91,   max: 9.90,   fee: 1.00 },
     { min: 9.91,   max: 14.90,  fee: 1.40 },
     { min: 14.91,  max: 19.90,  fee: 2.05 },
@@ -2555,9 +2831,20 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
 
     const headersBase = obtenerHeadersCentralOne();
 
-    if (headersBase && orden.apiOrderId && !orden.apiOrderId.startsWith('VAULT-') && !orden.apiOrderId.startsWith('INTERNAL-') && !orden.apiOrderId.startsWith('API-') && !orden.apiOrderId.startsWith('kz-ord-')) {
+    // 🔒 Si la orden ya tiene un apiOrderId de Central One asignado, jamás crear una orden nueva desde cero: verificarla o delegar al vigilante
+    if (headersBase && orden.apiOrderId && !orden.apiOrderId.startsWith('VAULT-') && !orden.apiOrderId.startsWith('INTERNAL-') && !orden.apiOrderId.startsWith('API-')) {
+        if (orden.apiOrderId.startsWith('kz-ord-')) {
+            programarSeguimientoOrdenCentralOne(orden.orderId, null, orden.apiOrderId, orden.algoExecutionState?.pendingReplacementBody || null);
+            return {
+                success: true,
+                isProcessingAsync: true,
+                deliveredCode: '',
+                apiOrderId: orden.apiOrderId,
+                raw: { recoveringIdempOrder: true }
+            };
+        }
         try {
-            const checkPrev = await verificarYExtraerEntregaCentralOne(orden.apiOrderId, headersBase, poolCards, esSteamOrder, 0);
+            const checkPrev = await verificarYExtraerEntregaCentralOne(orden.apiOrderId, headersBase, poolCards, esSteamOrder, 0, orden.algoExecutionState);
             if (checkPrev.state === 'COMPLETED') {
                 return {
                     success: true,
@@ -2566,17 +2853,24 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
                     raw: checkPrev.raw
                 };
             }
-            if (checkPrev.state === 'PROCESSING') {
-                programarSeguimientoOrdenCentralOne(orden.orderId, orden.apiOrderId);
-                return {
-                    success: true,
-                    isProcessingAsync: true,
-                    deliveredCode: '',
-                    apiOrderId: orden.apiOrderId,
-                    raw: checkPrev.raw
-                };
-            }
-        } catch (ePrev) {}
+            programarSeguimientoOrdenCentralOne(orden.orderId, orden.apiOrderId);
+            return {
+                success: true,
+                isProcessingAsync: true,
+                deliveredCode: '',
+                apiOrderId: orden.apiOrderId,
+                raw: checkPrev.raw
+            };
+        } catch (ePrev) {
+            programarSeguimientoOrdenCentralOne(orden.orderId, orden.apiOrderId);
+            return {
+                success: true,
+                isProcessingAsync: true,
+                deliveredCode: '',
+                apiOrderId: orden.apiOrderId,
+                raw: { asyncCheckPending: true }
+            };
+        }
     }
 
     if (headersBase) {
@@ -2651,7 +2945,7 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
                     await settings.save();
                 }
 
-const montosEsperadosPorTarjeta = [];
+                const montosEsperadosPorTarjeta = [];
                 (itemsParaPedirCentralOne.length > 0 ? itemsParaPedirCentralOne : combo.items).forEach(it => {
                     const q = Math.max(1, Math.round(Number(it.quantity) || 1));
                     for (let k = 0; k < q; k++) {
@@ -2665,11 +2959,15 @@ const montosEsperadosPorTarjeta = [];
                     targetClientUSD: Number(pkg.targetClientUSD),
                     gamesTargetsUSD: juegosSeparados.length > 0 ? juegosSeparados : (orden.algoExecutionState?.gamesTargetsUSD || []),
                     orderedItemsMeta: combo.items,
+                    currentBatchItems: itemsParaPedirCentralOne,
                     expectedUnitAmountsUSD: montosEsperadosPorTarjeta,
                     deliveredClientUSD: usdCubiertoInterno,
                     deliveredCostUSD: costoCubiertoInterno,
                     deliveredCodesList: [...codigosDesdeStockInterno],
                     failedCardIds: [...excluidosFallidos],
+                    processedPartialOrderIds: [],
+                    pendingReplacementIdempKey: '',
+                    pendingReplacementBody: null,
                     totalCardsExpected: combo.totalCards,
                     deliveredCardsCount: codigosDesdeStockInterno.length,
                     retryAttempt: 0
@@ -2718,12 +3016,21 @@ const montosEsperadosPorTarjeta = [];
                     const check = await verificarYExtraerEntregaCentralOne(createdOrder.id, headersBase, poolCards, esSteamPool, 0, orden.algoExecutionState);
 
                     if (check.state === 'COMPLETED') {
-                        const todosLosCodigos = [...new Set([...codigosDesdeStockInterno, ...(check.codigosPlanos || [])])];
-                        orden.algoExecutionState.deliveredCodesList = todosLosCodigos;
-                        orden.algoExecutionState.deliveredCardsCount = combo.totalCards;
+                        const vistosRaw = new Set(codigosDesdeStockInterno.map(extraerCodigoCrudoDeTextoFormateado));
+                        const todosLosCodigos = [...codigosDesdeStockInterno];
+                        for (const cNuevo of (check.codigosPlanos || [])) {
+                            const rk = extraerCodigoCrudoDeTextoFormateado(cNuevo);
+                            if (rk && !vistosRaw.has(rk)) {
+                                vistosRaw.add(rk);
+                                todosLosCodigos.push(cNuevo);
+                            }
+                        }
+                        const codigosLimitados = todosLosCodigos.slice(0, combo.totalCards);
+                        orden.algoExecutionState.deliveredCodesList = codigosLimitados;
+                        orden.algoExecutionState.deliveredCardsCount = codigosLimitados.length;
                         return {
                             success: true,
-                            deliveredCode: todosLosCodigos.length > 0 ? todosLosCodigos.join('  |  ') : check.deliveredCode,
+                            deliveredCode: codigosLimitados.length > 0 ? codigosLimitados.join('  |  ') : check.deliveredCode,
                             apiOrderId: createdOrder.id,
                             raw: check.raw
                         };
@@ -2747,6 +3054,9 @@ const montosEsperadosPorTarjeta = [];
                     const esTimeout = errCO.code === 'ECONNABORTED' || String(errCO.message || '').toLowerCase().includes('timeout');
 
                     if (esTimeout) {
+                        orden.algoExecutionState.pendingReplacementIdempKey = idempKey;
+                        orden.algoExecutionState.pendingReplacementBody = bodyOrder;
+                        orden.markModified('algoExecutionState');
                         programarSeguimientoOrdenCentralOne(orden.orderId, null, idempKey, bodyOrder);
                         return {
                             success: true,
@@ -2909,7 +3219,7 @@ const montosEsperadosPorTarjeta = [];
     };
 }
 
-// ⏳ ENDPOINT DE DECISIÓN DEL CLIENTE TRAS 30 MINUTOS DE ESPERA ('WAIT' vs 'REFUND')
+// ⏳ ENDPOINT DE DECISIÓN DEL CLIENTE TRAS 30 MINUTOS DE ESPERA ('WAIT' vs 'REFUND') CON CONTADOR PROGRESIVO
 app.post('/api/orders/delay-choice', cors(), express.json(), async (req, res) => {
     try {
         const { orderId, choice, deviceId, userEmail, userName, userWhatsapp } = req.body;
@@ -2923,12 +3233,26 @@ app.post('/api/orders/delay-choice', cors(), express.json(), async (req, res) =>
             return res.json({ success: true, order: orden, message: 'Tu pedido ya fue entregado.' });
         }
 
-        // OPCIÓN 1: EL CLIENTE ELIGE SEGUIR ESPERANDO
+        // OPCIÓN 1: EL CLIENTE ELIGE SEGUIR ESPERANDO (REINICIA OTROS 30 MINUTOS Y AUMENTA EL CICLO SIN RE-PEDIR A LA API)
         if (choice === 'WAIT') {
+            const nuevoCiclo = (Number(orden.waitCyclesCount) || 0) + 1;
+            orden.waitCyclesCount = nuevoCiclo;
             orden.timerStartedAt = new Date();
             orden.clientChoseToWait = true;
-            orden.statusMessage = '⏳ Seguimiento prioritario activado: Nuestro sistema continúa gestionando la entrega automática de tu compra...';
+            orden.statusMessage = nuevoCiclo >= 2
+                ? `⏳ Seguimiento prioritario extendido (Ciclo #${nuevoCiclo + 1}): Nuestro sistema continúa esperando la liberación de tu entrega sin cargos adicionales...`
+                : '⏳ Seguimiento prioritario activado: Nuestro sistema continúa gestionando la entrega automática de tu compra...';
             await orden.save();
+
+            // Si la orden ya fue enviada a Central One y el vigilante no estaba activo en RAM, reactivar solo la lectura pasiva
+            if (orden.apiOrderId && !orden.apiOrderId.startsWith('VAULT-') && !orden.apiOrderId.startsWith('INTERNAL-') && !orden.apiOrderId.startsWith('API-')) {
+                if (!activeCentralOnePollers.has(orden.orderId)) {
+                    const idCo = orden.apiOrderId.startsWith('kz-ord-') ? null : orden.apiOrderId;
+                    const idempKey = orden.apiOrderId.startsWith('kz-ord-') ? orden.apiOrderId : (orden.algoExecutionState?.pendingReplacementIdempKey || null);
+                    programarSeguimientoOrdenCentralOne(orden.orderId, idCo, idempKey, orden.algoExecutionState?.pendingReplacementBody || null);
+                }
+            }
+
             return res.json({ success: true, order: orden });
         }
 
@@ -2938,17 +3262,16 @@ app.post('/api/orders/delay-choice', cors(), express.json(), async (req, res) =>
             orden.status = 'RECHAZADO';
             orden.progressPercent = 100;
 
-            // Si el algoritmo ya tenía códigos parciales retenidos, guardarlos en el Stock Interno de la Bóveda para no perderlos
             const codigosParciales = (orden.algoExecutionState && Array.isArray(orden.algoExecutionState.deliveredCodesList))
                 ? orden.algoExecutionState.deliveredCodesList
                 : [];
             if (codigosParciales.length > 0) {
-                await guardarCodigosRecuperadosEnStockInterno(orden, [], codigosParciales);
+                const crudosParciales = codigosParciales.map(c => c.includes('➔') ? c.split('➔').slice(1).join('➔').trim() : c);
+                await guardarCodigosRecuperadosEnStockInterno(orden, [], crudosParciales);
                 orden.algoExecutionState.deliveredCodesList = [];
                 orden.markModified('algoExecutionState');
             }
 
-            // Si pagó con Tokems KZ, reembolsar automáticamente a su billetera
             if (orden.paidWithTokems && orden.tokemsAmount > 0) {
                 if (orden.deviceId.includes('@')) {
                     await User.updateOne({ email: orden.deviceId }, { $inc: { tokems: orden.tokemsAmount } });
@@ -2962,14 +3285,16 @@ app.post('/api/orders/delay-choice', cors(), express.json(), async (req, res) =>
             const nombreCliente = (userName || (identificador.includes('@') ? identificador.split('@')[0] : 'Cliente')).trim();
             const wsFinal = (userWhatsapp || orden.userWhatsapp || '').trim();
 
+            const ciclosEsperados = (Number(orden.waitCyclesCount) || 0) + 1;
+            const minTotalesEsperados = ciclosEsperados * 30;
             const montoTexto = `${orden.paymentReference || 'Tokems'} ($${Number(orden.totalAmountUSD || 0).toFixed(2)} USD / Bs. ${Number(orden.totalAmountVES || 0).toFixed(2)})`;
-            const mensajeAuto = `⏱️ SOLICITUD AUTOMÁTICA DE REEMBOLSO (+30 MIN DE ESPERA):\n` +
+            const mensajeAuto = `⏱️ SOLICITUD DE REEMBOLSO / AGENTE (+${minTotalesEsperados} MIN DE ESPERA):\n` +
                 `• Pedido cancelado: #${orden.orderId}\n` +
                 `• Producto: ${orden.productName} (${orden.packageName})\n` +
                 `• Método de pago: ${orden.paymentMethodName}\n` +
                 `• Referencia y Monto: ${montoTexto}\n` +
                 `• Destino / ID: ${orden.playerUid}\n` +
-                `El pedido superó los 30 minutos de espera y solicito el reembolso de mi compra.`;
+                `El pedido superó el tiempo de espera (${ciclosEsperados} ciclo(s) de 30 min) y solicito mi reembolso o atención de un agente.`;
 
             const nuevoTicket = await new SupportTicket({
                 ticketId,
@@ -2978,8 +3303,8 @@ app.post('/api/orders/delay-choice', cors(), express.json(), async (req, res) =>
                 userEmail: orden.userEmail || (identificador.includes('@') ? identificador : ''),
                 userName: nombreCliente,
                 userWhatsapp: wsFinal,
-                subject: `Reembolso por retraso (+30 min) - Orden #${orden.orderId}`,
-                category: `Reembolso por espera (+30 min) • #${orden.orderId}`,
+                subject: `Reembolso por retraso (+${minTotalesEsperados} min) - Orden #${orden.orderId}`,
+                category: `Reembolso por espera (+${minTotalesEsperados} min) • #${orden.orderId}`,
                 gameName: `${orden.productName} (${orden.packageName})`,
                 paymentMethod: orden.paymentMethodName || orden.paymentMethodKey,
                 paymentReference: montoTexto,
@@ -2994,7 +3319,7 @@ app.post('/api/orders/delay-choice', cors(), express.json(), async (req, res) =>
             }).save();
 
             orden.refundTicketId = ticketId;
-            orden.workerNotes = `Pedido cancelado por el cliente tras 30 min de espera. Solicitud de reembolso abierta en Ticket #${ticketId}.`;
+            orden.workerNotes = `Pedido cancelado por el cliente tras ${minTotalesEsperados} min de espera. Solicitud de reembolso abierta en Ticket #${ticketId}.`;
             orden.statusMessage = `Pedido cancelado a solicitud del cliente. Se abrió el chat de reembolso en el Ticket #${ticketId}.`;
             orden.completedAt = new Date();
             await orden.save();
@@ -3121,7 +3446,7 @@ app.post('/api/shopify-webhook-kz07x', express.raw({ type: 'application/json' })
 });
 
 // =================================================================
-// 🔔 WEBHOOK OFICIAL DE CENTRAL ONE (FIRMA HMAC-SHA256 + CUERPO CRUDO)
+// 🔔 WEBHOOK OFICIAL DE CENTRAL ONE (FIRMA HMAC-SHA256 + BLINDAJE DE ENTREGA)
 // =================================================================
 function verificarFirmaWebhookCentralOne(secreto, timestamp, cuerpoCrudoBuffer, firmaRecibida) {
     if (!secreto || !timestamp || !cuerpoCrudoBuffer || !firmaRecibida) return false;
@@ -3145,7 +3470,6 @@ app.post('/webhooks/central-one', express.raw({ type: 'application/json' }), asy
         const secret = process.env.CENTRAL_ONE_WEBHOOK_SECRET || '';
         const prevSecret = process.env.CENTRAL_ONE_WEBHOOK_SECRET_PREVIOUS || '';
 
-        // 1. Validar antigüedad máxima de 5 minutos (300 segundos) como exige Central One
         if (timestamp) {
             const ahoraSeg = Math.floor(Date.now() / 1000);
             const tsNum = parseInt(timestamp, 10);
@@ -3154,7 +3478,6 @@ app.post('/webhooks/central-one', express.raw({ type: 'application/json' }), asy
             }
         }
 
-        // 2. Verificar firma HMAC-SHA256 sobre el cuerpo crudo
         if (secret) {
             const firmaValida = verificarFirmaWebhookCentralOne(secret, timestamp, req.body, signature) ||
                                 (prevSecret && signaturePrev && verificarFirmaWebhookCentralOne(prevSecret, timestamp, req.body, signaturePrev));
@@ -3167,13 +3490,11 @@ app.post('/webhooks/central-one', express.raw({ type: 'application/json' }), asy
         const eventId = req.header('X-CentralOne-Event-Id') || payload.event_id || '';
         const eventName = req.header('X-CentralOne-Event') || payload.event || '';
 
-        // Confirmar 200 OK de inmediato en menos de 10 segundos y procesar enseguida
         res.status(200).json({ received: true, event_id: eventId });
 
         let settings = await StoreSettings.findOne({ key: 'main_settings' });
         if (!settings) settings = new StoreSettings({ key: 'main_settings' });
 
-        // Deduplicar por event_id
         if (eventId && Array.isArray(settings.processedWebhookIds) && settings.processedWebhookIds.includes(eventId)) {
             return;
         }
@@ -3241,7 +3562,7 @@ app.post('/webhooks/central-one', express.raw({ type: 'application/json' }), asy
             return;
         }
 
-// B. Eventos de Órdenes: order.delivered, order.partially_delivered, order.failed, order.refunded
+        // B. Eventos de Órdenes: delegar de forma sincronizada al Vigilante con candado para evitar carreras
         if (eventName.startsWith('order.') && payload.order) {
             const wOrder = payload.order;
             const idemp = wOrder.idempotency_key || '';
@@ -3255,108 +3576,15 @@ app.post('/webhooks/central-one', express.raw({ type: 'application/json' }), asy
             if (ordenDB) {
                 if (wOrder.id && (!ordenDB.apiOrderId || ordenDB.apiOrderId.startsWith('kz-ord-'))) {
                     ordenDB.apiOrderId = wOrder.id;
-                }
-
-                const poolCardsWebhook = settings ? (settings.arbitrageBaseCards || []) : [];
-                const esSteamOrd = String(ordenDB.productSlug || '').toLowerCase().includes('steam') ||
-                                   String(ordenDB.algoExecutionState?.platformGroup || '').toLowerCase() === 'steam';
-
-                const listaCodigos = [];
-                const codigosPorItem = [];
-                let globalWebhookCodeIdx = 0;
-
-                if (Array.isArray(wOrder.codes)) {
-                    wOrder.codes.forEach(cGroup => {
-                        if (Array.isArray(cGroup.codes) && cGroup.codes.length > 0) {
-                            const codigosFormateadosGrupo = cGroup.codes.map(codeStr => {
-                                const unitUsdCard = resolverMontoUsdTarjetaDeItemCentralOne(
-                                    cGroup,
-                                    globalWebhookCodeIdx,
-                                    poolCardsWebhook,
-                                    ordenDB.algoExecutionState,
-                                    0
-                                );
-                                globalWebhookCodeIdx++;
-                                return formatearCodigoConEtiquetaSteam(codeStr, unitUsdCard, esSteamOrd);
-                            });
-
-                            codigosPorItem.push({
-                                catalogItemId: cGroup.catalog_item_id || cGroup.product_id || '',
-                                codes: codigosFormateadosGrupo,
-                                rawCodes: cGroup.codes
-                            });
-                            codigosFormateadosGrupo.forEach(codeStr => listaCodigos.push(codeStr));
-                        }
-                    });
-                }
-
-                // 🏦 Si el cliente ya había cancelado por reembolso tras 30 minutos de espera, guardar los códigos en Stock Interno y NO revivir la orden
-                if (ordenDB.cancelledByDelayRefund || ordenDB.status === 'RECHAZADO') {
-                    if (listaCodigos.length > 0) {
-                        await guardarCodigosRecuperadosEnStockInterno(ordenDB, codigosPorItem, listaCodigos);
-                    }
-                    if (activeCentralOnePollers.has(ordenDB.orderId)) {
-                        clearTimeout(activeCentralOnePollers.get(ordenDB.orderId));
-                        activeCentralOnePollers.delete(ordenDB.orderId);
-                    }
-                } else if (eventName === 'order.delivered') {
-                    // ✅ Entrega 100% completa: unir cualquier código de etapa previa con los recién llegados
-                    const codigosPrevios = (ordenDB.algoExecutionState && Array.isArray(ordenDB.algoExecutionState.deliveredCodesList))
-                        ? ordenDB.algoExecutionState.deliveredCodesList
-                        : [];
-                    const todosLosCodigos = [...new Set([...codigosPrevios, ...listaCodigos])];
-
-                    ordenDB.status = 'ENTREGADO';
-                    ordenDB.progressPercent = 100;
-                    if (todosLosCodigos.length > 0) {
-                        ordenDB.deliveredCode = todosLosCodigos.join('  |  ');
-                    } else if (!ordenDB.deliveredCode || ordenDB.deliveredCode.includes('PROCESANDO')) {
-                        ordenDB.deliveredCode = `PEDIDO COMPLETADO (${wOrder.reference_code || 'OK'})`;
-                    }
-                    if (ordenDB.algoExecutionState) {
-                        ordenDB.algoExecutionState.deliveredCodesList = todosLosCodigos;
-                        ordenDB.algoExecutionState.deliveredCardsCount = ordenDB.algoExecutionState.totalCardsExpected || todosLosCodigos.length;
-                        ordenDB.markModified('algoExecutionState');
-                    }
-                    ordenDB.statusMessage = '¡Tu pedido ha sido entregado automáticamente con éxito!';
-                    ordenDB.completedAt = new Date();
                     await ordenDB.save();
-
-                    if (activeCentralOnePollers.has(ordenDB.orderId)) {
-                        clearTimeout(activeCentralOnePollers.get(ordenDB.orderId));
-                        activeCentralOnePollers.delete(ordenDB.orderId);
-                    }
-                } else if (eventName === 'order.partially_delivered') {
-                    // 🔄 Entrega parcial: NO cerrar la orden incompleta; activar de inmediato el vigilante para reemplazar la tarjeta faltante
-                    await ordenDB.save();
-                    if (activeCentralOnePollers.has(ordenDB.orderId)) {
-                        clearTimeout(activeCentralOnePollers.get(ordenDB.orderId));
-                        activeCentralOnePollers.delete(ordenDB.orderId);
-                    }
-                    if (wOrder.id || ordenDB.apiOrderId) {
-                        programarSeguimientoOrdenCentralOne(ordenDB.orderId, wOrder.id || ordenDB.apiOrderId);
-                    }
-                } else if (eventName === 'order.failed') {
-                    // Si es una orden de Algoritmo, dejar que el vigilante intente reemplazar por otra tarjeta antes de marcar error
-                    if (ordenDB.algoExecutionState && ordenDB.algoExecutionState.isAlgorithmOrder && (wOrder.id || ordenDB.apiOrderId)) {
-                        if (activeCentralOnePollers.has(ordenDB.orderId)) {
-                            clearTimeout(activeCentralOnePollers.get(ordenDB.orderId));
-                            activeCentralOnePollers.delete(ordenDB.orderId);
-                        }
-                        programarSeguimientoOrdenCentralOne(ordenDB.orderId, wOrder.id || ordenDB.apiOrderId);
-                    } else {
-                        await registrarAlertaCentralOne(settings, {
-                            type: 'ORDER_FAILED',
-                            severity: 'CRIT',
-                            title: `🚨 Orden #${ordenDB.orderId} reportada fallida por Webhook (${wOrder.reference_code})`,
-                            detail: `El saldo retenido fue liberado en tu cuenta de Central One.`
-                        });
-                    }
                 }
+
+                // Activar el vigilante protegido por candado (procesa entregas completas, parciales, topes de tarjetas y reembolsos en 1 solo lugar)
+                programarSeguimientoOrdenCentralOne(ordenDB.orderId, wOrder.id || ordenDB.apiOrderId);
             }
         }
 
-        // C. Eventos de Saldo: deposit.approved, balance.credited, balance.low
+        // C. Eventos de Saldo
         if (payload.balance && payload.balance.available) {
             if (!settings.centralOneSync) settings.centralOneSync = {};
             settings.centralOneSync.availableBalance = String(payload.balance.available);
@@ -5850,8 +6078,43 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
             orden.claimedAt = new Date();
         }
 
-        // ✅ SI EL TRABAJADOR VERIFICÓ LOS 6 DÍGITOS DEL PAGO MÓVIL Y LE DA A APROBAR
+// ✅ SI EL TRABAJADOR VERIFICÓ LOS 6 DÍGITOS DEL PAGO MÓVIL Y LE DA A APROBAR
         if (action === 'APROBAR') {
+            // 🔒 1. Si la orden YA estaba ENTREGADA, solo actualizar Nota o PIN manual sin volver a llamar a Central One API
+            if (orden.status === 'ENTREGADO') {
+                if (manualPinCode && manualPinCode.trim()) {
+                    orden.deliveredCode = manualPinCode.trim();
+                }
+                if (workerNotes !== undefined) {
+                    orden.workerNotes = String(workerNotes || '').trim();
+                }
+                await orden.save();
+                return res.json({
+                    success: true,
+                    message: `Nota/PIN de la orden #${orden.orderId} actualizados sin volver a cobrar en API.`,
+                    order: orden
+                });
+            }
+
+            // 🔒 2. Si la orden YA está EJECUTANDO_API en este instante (doble clic o proceso en curso), bloquear segundo disparo
+            if (orden.status === 'EJECUTANDO_API' || activeOrderProcessingLocks.has(orden.orderId)) {
+                if (manualPinCode && manualPinCode.trim()) {
+                    orden.status = 'ENTREGADO';
+                    orden.progressPercent = 100;
+                    orden.deliveredCode = manualPinCode.trim();
+                    if (workerNotes) orden.workerNotes = workerNotes.trim();
+                    orden.approvedByWorker = staffEmail;
+                    orden.completedAt = new Date();
+                    await orden.save();
+                    return res.json({ success: true, message: `Orden #${orden.orderId} completada manualmente.`, order: orden });
+                }
+                return res.json({
+                    success: true,
+                    message: `La orden #${orden.orderId} ya se está procesando automáticamente con el proveedor.`,
+                    order: orden
+                });
+            }
+
             orden.status = 'EJECUTANDO_API';
             orden.statusMessage = 'Pago verificado. Ejecutando entrega automática...';
             orden.progressPercent = 80;
@@ -5884,6 +6147,21 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
                 await orden.save();
 
                 return res.json({ success: true, message: 'Tokems acreditados al cliente.', order: orden });
+            }
+
+            // Si el operador escribió un PIN manual directamente al aprobar, entregarlo sin gastar saldo en la API
+            if (manualPinCode && manualPinCode.trim()) {
+                orden.status = 'ENTREGADO';
+                orden.progressPercent = 100;
+                orden.deliveredCode = manualPinCode.trim();
+                orden.apiOrderId = orden.apiOrderId || ('MANUAL-STAFF-' + Date.now());
+                orden.statusMessage = orden.fulfillmentType === 'API_GIFT_CARD'
+                    ? '¡Entrega completada! Cópiala aquí abajo.'
+                    : '¡Pedido entregado con éxito! Verifica tu cuenta.';
+                orden.approvedByWorker = staffEmail;
+                orden.completedAt = new Date();
+                await orden.save();
+                return res.json({ success: true, message: `Orden #${orden.orderId} aprobada con código manual.`, order: orden });
             }
 
             // Caso B: Recarga por ID, Gift Card o Servicio -> Dispara la API automáticamente
