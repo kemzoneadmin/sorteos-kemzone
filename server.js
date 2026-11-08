@@ -5074,6 +5074,10 @@ const _origFindOrders = Order.find;
 // =================================================================
 
 app.get('/api/store/bootstrap', async (req, res) => {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.set('Pragma', 'no-cache');
+    res.set('Expires', '0');
+    res.set('Surrogate-Control', 'no-store');
     try {
         const [settings, products, paymentMethods] = await Promise.all([
             StoreSettings.findOne({ key: 'main_settings' })
@@ -5088,6 +5092,7 @@ app.get('/api/store/bootstrap', async (req, res) => {
 
         return res.json({
             success: true,
+            serverTimestamp: Date.now(),
             settings: settings || { exchangeRateVES: 55.00, tokemValueUSD: 1.00, storeOpen: true },
             products: products || [],
             paymentMethods: paymentMethods || []
