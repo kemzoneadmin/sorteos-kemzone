@@ -923,7 +923,34 @@ const verificarSoloAdmin = async (req, res, next) => {
 // =================================================================
 // 🤖 MOTOR CENTRAL ONE API v1 + ALGORITMO DE ARBITRAJE (STEAM/PSN/NINTENDO)
 // =================================================================
+const https = require('https');
+axios.defaults.httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50, timeout: 30000 });
+
 const CENTRAL_ONE_BASE_URL = (process.env.CENTRAL_ONE_BASE_URL || 'https://portal.centraloneglobal.com/api/v1').replace(/\/+$/, '');
+
+// ⚡ CACHÉ EN MEMORIA RAM DE ÍNDICES DE CENTRAL ONE (0ms DE BÚSQUEDA EN ALGORITMO Y CREACIÓN DE ÓRDENES)
+let _ramCatalogRef = null;
+let _ramMapaCO_Id = {};
+let _ramMapaCO_Sku = {};
+
+function obtenerIndicesCatalogoEnRAM(catalogCache) {
+    if (!Array.isArray(catalogCache) || catalogCache.length === 0) {
+        return { tieneCacheAPI: false, mapaCO_Id: {}, mapaCO_Sku: {} };
+    }
+    if (_ramCatalogRef !== catalogCache && Object.keys(_ramMapaCO_Id).length !== catalogCache.length) {
+        const nuevoId = {};
+        const nuevoSku = {};
+        for (let i = 0; i < catalogCache.length; i++) {
+            const it = catalogCache[i];
+            if (it && it.product_id) nuevoId[it.product_id] = it;
+            if (it && it.sku) nuevoSku[String(it.sku).trim().toUpperCase()] = it;
+        }
+        _ramCatalogRef = catalogCache;
+        _ramMapaCO_Id = nuevoId;
+        _ramMapaCO_Sku = nuevoSku;
+    }
+    return { tieneCacheAPI: true, mapaCO_Id: _ramMapaCO_Id, mapaCO_Sku: _ramMapaCO_Sku };
+}
 
 // Matemática exacta de 4 decimales (como exige Central One)
 function aMicro4(val) {
@@ -3060,6 +3087,65 @@ setTimeout(() => {
     recalcularPreciosYAlgoritmoTiendaKZ().catch(() => {});
 }, 3500);
 
+// ⚡ CACHÉ EN RAM DEL CATÁLOGO CENTRAL ONE PARA EVITAR DESCARGAR ~8MB DE MONGODB EN CADA COMPRA/APROBACIÓN
+let _ramCentralOneCatalogCache = [];
+
+setTimeout(async () => {
+    try {
+        const docInit = await StoreSettings.collection.findOne(
+            { key: 'main_settings' },
+            { projection: { centralOneCatalogCache: 1 } }
+        );
+        if (docInit && Array.isArray(docInit.centralOneCatalogCache) && docInit.centralOneCatalogCache.length > 0) {
+            _ramCentralOneCatalogCache = docInit.centralOneCatalogCache;
+            obtenerIndicesCatalogoEnRAM(_ramCentralOneCatalogCache);
+        }
+    } catch (e) {}
+}, 1500);
+
+StoreSettings.schema.pre('findOne', function() {
+    const fields = this._fields;
+    const sinProjectionExplicita = !fields || Object.keys(fields).length === 0;
+    if (sinProjectionExplicita && _ramCentralOneCatalogCache.length > 0) {
+        this.select('-centralOneCatalogCache -centralOneCoverageCache');
+        this._injectRamCatalog = true;
+    }
+});
+
+StoreSettings.schema.post('findOne', function(doc) {
+    if (!doc) return;
+    if (Array.isArray(doc.centralOneCatalogCache) && doc.centralOneCatalogCache.length > 0) {
+        _ramCentralOneCatalogCache = doc.centralOneCatalogCache;
+        obtenerIndicesCatalogoEnRAM(_ramCentralOneCatalogCache);
+    } else if (_ramCentralOneCatalogCache.length > 0 && (this._injectRamCatalog || !doc.centralOneCatalogCache || doc.centralOneCatalogCache.length === 0)) {
+        if (doc._doc) {
+            doc._doc.centralOneCatalogCache = _ramCentralOneCatalogCache;
+        } else {
+            doc.centralOneCatalogCache = _ramCentralOneCatalogCache;
+        }
+    }
+});
+
+StoreSettings.schema.pre('save', function() {
+    if (this.isModified('centralOneCatalogCache') && Array.isArray(this.centralOneCatalogCache) && this.centralOneCatalogCache.length > 0) {
+        _ramCentralOneCatalogCache = this.centralOneCatalogCache;
+        obtenerIndicesCatalogoEnRAM(_ramCentralOneCatalogCache);
+    }
+});
+
+// Evita que el envío de correos de pedidos entregados congele el botón de "Aprobar"
+if (resend && resend.emails && typeof resend.emails.send === 'function' && !resend._kzFastAsyncWrapped) {
+    resend._kzFastAsyncWrapped = true;
+    const _origResendSend = resend.emails.send.bind(resend.emails);
+    resend.emails.send = function(payload) {
+        if (payload && typeof payload.subject === 'string' && payload.subject.includes('Pedido Entregado')) {
+            _origResendSend(payload).catch(() => {});
+            return Promise.resolve({ id: 'async_queued' });
+        }
+        return _origResendSend(payload);
+    };
+}
+
 // 🚀 EJECUTOR PRINCIPAL DE ENTREGA (USA STOCK INTERNO PRIMERO + ALGORITMO PASO A PASO + CENTRAL ONE API)
 async function ejecutarEntregaPorAPI(orden, productoDB) {
     orden.timerStartedAt = new Date();
@@ -3095,8 +3181,13 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
     const listaPaquetes = usandoAlt ? productoDB.altPackages : (productoDB ? productoDB.packages : []);
     const pkg = (listaPaquetes || []).find(p => p.packageId === orden.packageId);
 
-    const settings = await StoreSettings.findOne({ key: 'main_settings' });
+    const settings = await StoreSettings.findOne({ key: 'main_settings' })
+        .select('arbitrageBaseCards centralOneAlerts');
     const poolCards = settings ? (settings.arbitrageBaseCards || []) : [];
+    const catalogCacheActiva = _ramCentralOneCatalogCache.length > 0
+        ? _ramCentralOneCatalogCache
+        : (settings?.centralOneCatalogCache || null);
+
     const platGroupActual = (productoDB && productoDB.smartPlatformGroup) || (String(orden.productSlug || '').toLowerCase().includes('playstation') ? 'playstation' : (String(orden.productSlug || '').toLowerCase().includes('nintendo') ? 'nintendo' : 'steam'));
     const esSteamOrder = String(orden.productSlug || '').toLowerCase().includes('steam') ||
                          String(platGroupActual).toLowerCase() === 'steam';
@@ -3190,14 +3281,14 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
                 ? calcularCombinacionListaJuegosSeparadosSteam(
                     juegosSeparados,
                     poolCards,
-                    settings ? settings.centralOneCatalogCache : null,
+                    catalogCacheActiva,
                     excluidosFallidos
                   )
                 : calcularMejorCombinacionTarjetasPool(
                     pkg.targetClientUSD,
                     platGroup,
                     poolCards,
-                    settings ? settings.centralOneCatalogCache : null,
+                    catalogCacheActiva,
                     excluidosFallidos
                   );
 
@@ -3249,8 +3340,6 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
 
             // Persistir de inmediato en MongoDB la eliminación de las líneas usadas dejando solo las restantes
             if (usoStockInterno && settings) {
-                settings.markModified('arbitrageBaseCards');
-                await settings.save();
                 await StoreSettings.collection.updateOne(
                     { key: 'main_settings' },
                     { $set: { arbitrageBaseCards: settings.arbitrageBaseCards } }
@@ -3325,7 +3414,7 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
             try {
                 const resCreate = await axios.post(`${CENTRAL_ONE_BASE_URL}/orders`, bodyOrder, {
                     headers: headersOrder,
-                    timeout: 28000
+                    timeout: 22000
                 });
 
                 const createdOrder = resCreate.data?.order;
@@ -3333,7 +3422,9 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
                     return { success: false, errorMsg: 'Respuesta inválida al crear orden en Central One.' };
                 }
 
-                await new Promise(r => setTimeout(r, 1800));
+                if (String(createdOrder.status || '').toLowerCase() !== 'completed') {
+                    await new Promise(r => setTimeout(r, 350));
+                }
                 const check = await verificarYExtraerEntregaCentralOne(createdOrder.id, headersBase, poolCards, esSteamPool, 0, orden.algoExecutionState);
 
                 if (check.state === 'COMPLETED') {
@@ -3394,8 +3485,10 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
                         const cPool = poolCards.find(c => c.cardId === it.cardId);
                         if (cPool) cPool.inStock = false;
                     });
-                    settings.markModified('arbitrageBaseCards');
-                    await settings.save();
+                    await StoreSettings.collection.updateOne(
+                        { key: 'main_settings' },
+                        { $set: { arbitrageBaseCards: settings.arbitrageBaseCards } }
+                    ).catch(() => {});
                     continue;
                 }
                 return {
@@ -3410,13 +3503,15 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
     if (headersBase || poolCards.length > 0) {
         let coProductId = (pkg && pkg.centralOneProductId) || '';
         let coCatItem = null;
-        if (settings && Array.isArray(settings.centralOneCatalogCache)) {
+        const { tieneCacheAPI, mapaCO_Id, mapaCO_Sku } = obtenerIndicesCatalogoEnRAM(catalogCacheActiva);
+
+        if (tieneCacheAPI) {
             if (coProductId) {
-                coCatItem = settings.centralOneCatalogCache.find(x => x.product_id === coProductId);
+                coCatItem = mapaCO_Id[coProductId] || null;
             }
             if (!coCatItem && (orden.apiProductSku || (pkg && pkg.apiProductSku))) {
                 const skuBuscado = String(orden.apiProductSku || pkg.apiProductSku).trim().toUpperCase();
-                coCatItem = settings.centralOneCatalogCache.find(x => String(x.sku || '').trim().toUpperCase() === skuBuscado);
+                coCatItem = mapaCO_Sku[skuBuscado] || null;
                 if (coCatItem) coProductId = coCatItem.product_id;
             }
         }
@@ -3442,8 +3537,6 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
                         String(platCard).toLowerCase() === 'steam' || esSteamOrder
                     );
 
-                    settings.markModified('arbitrageBaseCards');
-                    await settings.save();
                     await StoreSettings.collection.updateOne(
                         { key: 'main_settings' },
                         { $set: { arbitrageBaseCards: settings.arbitrageBaseCards } }
@@ -3497,7 +3590,7 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
             try {
                 const resCreate = await axios.post(`${CENTRAL_ONE_BASE_URL}/orders`, bodyDirect, {
                     headers: headersOrder,
-                    timeout: 28000
+                    timeout: 22000
                 });
 
                 const createdOrder = resCreate.data?.order;
@@ -3505,7 +3598,9 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
                     return { success: false, errorMsg: 'Central One no devolvió ID de pedido.' };
                 }
 
-                await new Promise(r => setTimeout(r, 1800));
+                if (String(createdOrder.status || '').toLowerCase() !== 'completed') {
+                    await new Promise(r => setTimeout(r, 350));
+                }
                 const check = await verificarYExtraerEntregaCentralOne(createdOrder.id, headersBase, poolCards, esSteamOrder, Number(pkg?.targetClientUSD || 0));
 
                 if (check.state === 'COMPLETED') {
