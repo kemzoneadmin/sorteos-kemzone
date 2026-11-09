@@ -3607,48 +3607,61 @@ const settings = await StoreSettings.findOne({ key: 'main_settings' })
             }
         }
 
-        if (headersBase && coProductId) {
-            const idempKey = `kz-ord-${orden.orderId}-direct-v1`.replace(/[^A-Za-z0-9_-]/g, '');
-            const headersOrder = obtenerHeadersCentralOne({ 'Idempotency-Key': idempKey });
-
-            const itemPayload = {
-                catalog_item_id: coProductId,
-                quantity: 1
-            };
+if (headersBase && coProductId) {
+            let primaryTargetPayload = null;
+            let fallbackTargetPayload = null;
 
             if (!coCatItem || coCatItem.requires_target !== false) {
-                const targetFields = (coCatItem && Array.isArray(coCatItem.target_fields) && coCatItem.target_fields.length > 0)
-                    ? coCatItem.target_fields
-                    : (orden.fulfillmentType === 'API_DIRECT_TOPUP' ? ['player_id'] : []);
-
-                if (targetFields.length > 0) {
-                    const tPayload = {};
-                    targetFields.forEach((fieldKey, idx) => {
-                        const fkLower = String(fieldKey).toLowerCase();
-                        if (fkLower.includes('server') || fkLower.includes('zone') || fkLower.includes('region')) {
-                            tPayload[fieldKey] = String(orden.playerServer || orden.playerRegion || '').trim();
-                        } else if (idx === 0 || fkLower.includes('player') || fkLower.includes('uid') || fkLower.includes('user') || fkLower.includes('id')) {
-                            tPayload[fieldKey] = String(orden.playerUid || '').trim();
-                        } else {
-                            tPayload[fieldKey] = String(orden.playerServer || orden.playerRegion || orden.playerUid || '').trim();
-                        }
-                    });
-                    itemPayload.target_payload = tPayload;
+                const tieneCamposTarget = (coCatItem && Array.isArray(coCatItem.target_fields) && coCatItem.target_fields.length > 0) ||
+                                          (orden.fulfillmentType === 'API_DIRECT_TOPUP');
+                if (tieneCamposTarget) {
+                    const resueltoTarget = construirTargetPayloadCentralOne(
+                        coCatItem,
+                        orden.playerUid,
+                        orden.playerServer,
+                        orden.playerRegion,
+                        orden.productSlug
+                    );
+                    primaryTargetPayload = resueltoTarget.primaryPayload;
+                    fallbackTargetPayload = resueltoTarget.fallbackPayload;
                 }
             }
 
-            const bodyDirect = {
-                items: [itemPayload],
-                note: `KemZone #${orden.orderId} - ${orden.productName}`.slice(0, 480)
-            };
-
-            try {
+            const enviarOrdenDirectaCO = async (tPayloadUsar, sufijoIntento = 'v1') => {
+                const idempKey = `kz-ord-${orden.orderId}-direct-${sufijoIntento}`.replace(/[^A-Za-z0-9_-]/g, '');
+                const headersOrder = obtenerHeadersCentralOne({ 'Idempotency-Key': idempKey });
+                const itemPayload = {
+                    catalog_item_id: coProductId,
+                    quantity: 1,
+                    ...(tPayloadUsar ? { target_payload: tPayloadUsar } : {})
+                };
+                const bodyDirect = {
+                    items: [itemPayload],
+                    note: `KemZone #${orden.orderId} - ${orden.productName}`.slice(0, 480)
+                };
                 const resCreate = await axios.post(`${CENTRAL_ONE_BASE_URL}/orders`, bodyDirect, {
                     headers: headersOrder,
                     timeout: 22000
                 });
+                return { resCreate, idempKey, bodyDirect };
+            };
 
-                const createdOrder = resCreate.data?.order;
+            try {
+                let intentoRes = null;
+                try {
+                    intentoRes = await enviarOrdenDirectaCO(primaryTargetPayload, 'v1');
+                } catch (errV1) {
+                    const statusHttp = errV1.response?.status || 0;
+                    // Si rechazó el formato del servidor (ej. "Europe" vs "os_euro") y existe fallbackTargetPayload, reintentar automáticamente con el formato alternativo
+                    if ((statusHttp === 400 || statusHttp === 422) && fallbackTargetPayload) {
+                        intentoRes = await enviarOrdenDirectaCO(fallbackTargetPayload, 'v2');
+                    } else {
+                        throw errV1;
+                    }
+                }
+
+                let { resCreate, idempKey, bodyDirect } = intentoRes;
+                let createdOrder = resCreate.data?.order;
                 if (!createdOrder || !createdOrder.id) {
                     return { success: false, errorMsg: 'Central One no devolvió ID de pedido.' };
                 }
@@ -3656,7 +3669,21 @@ const settings = await StoreSettings.findOne({ key: 'main_settings' })
                 if (String(createdOrder.status || '').toLowerCase() !== 'completed') {
                     await new Promise(r => setTimeout(r, 350));
                 }
-                const check = await verificarYExtraerEntregaCentralOne(createdOrder.id, headersBase, poolCards, esSteamOrder, Number(pkg?.targetClientUSD || 0));
+                let check = await verificarYExtraerEntregaCentralOne(createdOrder.id, headersBase, poolCards, esSteamOrder, Number(pkg?.targetClientUSD || 0));
+
+                // Si falló inmediatamente por código de servidor/target inválido y tenemos fallbackTargetPayload, probar con el código técnico alternativo
+                if (check.state === 'FAILED' && fallbackTargetPayload && /target|server|region|zone|invalid|player/i.test(`${check.failureCode || ''} ${check.errorMsg || ''}`)) {
+                    try {
+                        const retryFb = await enviarOrdenDirectaCO(fallbackTargetPayload, 'v2');
+                        if (retryFb.resCreate.data?.order?.id) {
+                            createdOrder = retryFb.resCreate.data.order;
+                            idempKey = retryFb.idempKey;
+                            bodyDirect = retryFb.bodyDirect;
+                            await new Promise(r => setTimeout(r, 350));
+                            check = await verificarYExtraerEntregaCentralOne(createdOrder.id, headersBase, poolCards, esSteamOrder, Number(pkg?.targetClientUSD || 0));
+                        }
+                    } catch (eRetryFb) {}
+                }
 
                 if (check.state === 'COMPLETED') {
                     return {
@@ -3683,14 +3710,23 @@ const settings = await StoreSettings.findOne({ key: 'main_settings' })
                     raw: check.raw
                 };
             } catch (errDirect) {
+                const idempFallback = `kz-ord-${orden.orderId}-direct-v1`.replace(/[^A-Za-z0-9_-]/g, '');
+                const bodyFallback = {
+                    items: [{
+                        catalog_item_id: coProductId,
+                        quantity: 1,
+                        ...(primaryTargetPayload ? { target_payload: primaryTargetPayload } : {})
+                    }],
+                    note: `KemZone #${orden.orderId} - ${orden.productName}`.slice(0, 480)
+                };
                 const esTimeoutDir = errDirect.code === 'ECONNABORTED' || String(errDirect.message || '').toLowerCase().includes('timeout');
                 if (esTimeoutDir) {
-                    programarSeguimientoOrdenCentralOne(orden.orderId, null, idempKey, bodyDirect);
+                    programarSeguimientoOrdenCentralOne(orden.orderId, null, idempFallback, bodyFallback);
                     return {
                         success: true,
                         isProcessingAsync: true,
                         deliveredCode: '',
-                        apiOrderId: idempKey,
+                        apiOrderId: idempFallback,
                         raw: { asyncTimeoutPending: true }
                     };
                 }
@@ -3728,6 +3764,28 @@ const settings = await StoreSettings.findOne({ key: 'main_settings' })
         raw: { mode: 'api_topup_ready' }
     };
 }
+
+// 🔌 Enriquecedor automático de target_schema y región en /api/admin/overview para el Selector Maestro de Juegos
+app.use('/api/admin/overview', (req, res, next) => {
+    const _origJson = res.json.bind(res);
+    res.json = function(body) {
+        try {
+            if (body && body.settings && Array.isArray(body.settings.centralOneCatalogCache) && Array.isArray(_ramCentralOneCatalogCache) && _ramCentralOneCatalogCache.length > 0) {
+                const { mapaCO_Id } = obtenerIndicesCatalogoEnRAM(_ramCentralOneCatalogCache);
+                body.settings.centralOneCatalogCache = body.settings.centralOneCatalogCache.map(item => {
+                    const full = mapaCO_Id[item.product_id] || item;
+                    return {
+                        ...item,
+                        region: full.region || full.country || item.region || '',
+                        target_schema: full.target_schema || item.target_schema || null
+                    };
+                });
+            }
+        } catch (e) {}
+        return _origJson(body);
+    };
+    next();
+});
 
 // ⏳ ENDPOINT DE DECISIÓN DEL CLIENTE TRAS 30 MINUTOS DE ESPERA ('WAIT' vs 'REFUND') CON CONTADOR PROGRESIVO
 app.post('/api/orders/delay-choice', cors(), express.json(), async (req, res) => {
@@ -5379,6 +5437,146 @@ app.get('/api/store/bootstrap', async (req, res) => {
     }
 });
 
+// 🌍 TRADUCTOR INTELIGENTE DE REGIONES Y SERVIDORES HACIA CENTRAL ONE API
+function normalizarValorServidorJuego(rawRegionOrServer, targetSchemaField = null, slugJuego = '') {
+    const val = String(rawRegionOrServer || '').trim();
+    if (!val) return { primary: '', fallback: '' };
+
+    // Si el dueño escribió formato "Etiqueta Visible|valor_api" (ej: "Europa|Europe")
+    if (val.includes('|')) {
+        const partes = val.split('|').map(s => s.trim()).filter(Boolean);
+        return { primary: partes[1] || partes[0], fallback: partes[0] };
+    }
+
+    const vLow = val.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
+
+    // Diccionario oficial para Genshin Impact, Honkai Star Rail, Zenless Zone Zero y juegos globales
+    let stdName = val;
+    let hoyoCode = val;
+
+    if (vLow === 'america' || vLow === 'americas' || vLow === 'na' || vLow === 'north america' || vLow === 'norteamerica' || vLow === 'os_usa') {
+        stdName = 'America';
+        hoyoCode = 'os_usa';
+    } else if (vLow === 'europa' || vLow === 'europe' || vLow === 'eu' || vLow === 'os_euro') {
+        stdName = 'Europe';
+        hoyoCode = 'os_euro';
+    } else if (vLow === 'asia' || vLow === 'as' || vLow === 'os_asia') {
+        stdName = 'Asia';
+        hoyoCode = 'os_asia';
+    } else if (vLow.includes('tw') || vLow.includes('hk') || vLow.includes('mo') || vLow === 'os_cht' || vLow.includes('sar')) {
+        stdName = 'TW, HK, MO';
+        hoyoCode = 'os_cht';
+    } else if (vLow === 'latam' || vLow === ' latinoamerica' || vLow === 'sudamerica' || vLow === 'south america' || vLow === 'sa') {
+        stdName = 'South America';
+        hoyoCode = 'SA';
+    } else if (vLow === 'brasil' || vLow === 'brazil' || vLow === 'br') {
+        stdName = 'Brazil';
+        hoyoCode = 'BR';
+    }
+
+    // Si el SKU de Central One trae target_schema con opciones explícitas (options / enum / values), empatar con la opción exacta del proveedor
+    let schemaOptions = [];
+    if (targetSchemaField && typeof targetSchemaField === 'object') {
+        if (Array.isArray(targetSchemaField.options)) schemaOptions = targetSchemaField.options;
+        else if (Array.isArray(targetSchemaField.enum)) schemaOptions = targetSchemaField.enum;
+        else if (Array.isArray(targetSchemaField.values)) schemaOptions = targetSchemaField.values;
+    }
+
+    if (schemaOptions.length > 0) {
+        const valoresSchema = schemaOptions.map(opt => {
+            if (typeof opt === 'string') return { value: opt, label: opt };
+            return {
+                value: String(opt.value ?? opt.id ?? opt.code ?? opt.key ?? opt.label ?? ''),
+                label: String(opt.label ?? opt.name ?? opt.title ?? opt.value ?? '')
+            };
+        }).filter(x => x.value);
+
+        const matchExacto = valoresSchema.find(x =>
+            x.value.toLowerCase() === val.toLowerCase() ||
+            x.value.toLowerCase() === stdName.toLowerCase() ||
+            x.value.toLowerCase() === hoyoCode.toLowerCase() ||
+            x.label.toLowerCase() === stdName.toLowerCase() ||
+            x.label.toLowerCase().includes(vLow)
+        );
+        if (matchExacto) {
+            return {
+                primary: matchExacto.value,
+                fallback: matchExacto.value === stdName ? hoyoCode : stdName
+            };
+        }
+    }
+
+    return {
+        primary: stdName,
+        fallback: hoyoCode !== stdName ? hoyoCode : val
+    };
+}
+
+// Construye el target_payload exacto que exige Central One (con soporte de fallback automático para servidores)
+function construirTargetPayloadCentralOne(coCatItem, rawUid, rawServer, rawRegion, slugJuego = '') {
+    const targetFields = (coCatItem && Array.isArray(coCatItem.target_fields) && coCatItem.target_fields.length > 0)
+        ? coCatItem.target_fields
+        : ['player_id'];
+
+    const rawSchema = coCatItem?.target_schema || null;
+    const encontrarSchemaDeCampo = (fieldKey) => {
+        if (!rawSchema) return null;
+        if (Array.isArray(rawSchema)) {
+            return rawSchema.find(f => (f.name || f.key || f.field || f.id) === fieldKey) || null;
+        }
+        if (rawSchema.properties && rawSchema.properties[fieldKey]) return rawSchema.properties[fieldKey];
+        if (rawSchema[fieldKey]) return rawSchema[fieldKey];
+        return null;
+    };
+
+    const uidLimpio = String(rawUid || '').trim();
+    let srvORegionElegido = String(rawServer || rawRegion || '').trim();
+
+    // Si es Genshin / Honkai / ZZZ y no llegó servidor pero el UID tiene 9-10 dígitos, deducir servidor por el 1er dígito
+    const esJuegoHoyo = /genshin|honkai|star-rail|zenless|zzz/i.test(`${slugJuego} ${coCatItem?.name || ''} ${coCatItem?.sku || ''}`);
+    if (!srvORegionElegido && esJuegoHoyo && /^[6789]\d{8,9}$/.test(uidLimpio)) {
+        const primerDigito = uidLimpio.charAt(0);
+        if (primerDigito === '6') srvORegionElegido = 'America';
+        else if (primerDigito === '7') srvORegionElegido = 'Europe';
+        else if (primerDigito === '8') srvORegionElegido = 'Asia';
+        else if (primerDigito === '9') srvORegionElegido = 'TW, HK, MO';
+    }
+
+    const payloadPrimario = {};
+    const payloadAlternativo = {};
+    let tieneAlternativo = false;
+
+    targetFields.forEach((fieldKey, idx) => {
+        const fkLower = String(fieldKey).toLowerCase();
+        const fieldSchema = encontrarSchemaDeCampo(fieldKey);
+
+        if (fkLower.includes('server') || fkLower.includes('zone') || fkLower.includes('region') || fkLower.includes('world')) {
+            // Si el juego tiene tanto servidor como región, priorizar el que corresponda
+            const valorCrudo = (fkLower.includes('zone') && rawServer)
+                ? String(rawServer).trim()
+                : (srvORegionElegido || String(rawRegion || rawServer || '').trim());
+
+            const resuelto = normalizarValorServidorJuego(valorCrudo, fieldSchema, slugJuego);
+            payloadPrimario[fieldKey] = resuelto.primary;
+            payloadAlternativo[fieldKey] = resuelto.fallback || resuelto.primary;
+            if (resuelto.fallback && resuelto.fallback !== resuelto.primary) {
+                tieneAlternativo = true;
+            }
+        } else if (idx === 0 || fkLower.includes('player') || fkLower.includes('uid') || fkLower.includes('user') || fkLower.includes('id') || fkLower.includes('account')) {
+            payloadPrimario[fieldKey] = uidLimpio;
+            payloadAlternativo[fieldKey] = uidLimpio;
+        } else {
+            payloadPrimario[fieldKey] = srvORegionElegido || uidLimpio;
+            payloadAlternativo[fieldKey] = srvORegionElegido || uidLimpio;
+        }
+    });
+
+    return {
+        primaryPayload: payloadPrimario,
+        fallbackPayload: tieneAlternativo ? payloadAlternativo : null
+    };
+}
+
 // 1.5 Verificar ID de Jugador en el Paso 1 conectado en vivo a POST /api/v1/player/validate de Central One
 app.post('/api/orders/verify-player', async (req, res) => {
     try {
@@ -5389,8 +5587,12 @@ app.post('/api/orders/verify-player', async (req, res) => {
 
         const headers = obtenerHeadersCentralOne();
         if (headers && productSlug) {
-            const prodDB = await CatalogProduct.findOne({ slug: String(productSlug).trim().toLowerCase() }).lean();
+            const slugClean = String(productSlug).trim().toLowerCase();
+            const prodDB = await CatalogProduct.findOne({ slug: slugClean }).lean();
             const settings = await StoreSettings.findOne({ key: 'main_settings' }).select('centralOneCatalogCache').lean();
+            const catalogCache = (Array.isArray(_ramCentralOneCatalogCache) && _ramCentralOneCatalogCache.length > 0)
+                ? _ramCentralOneCatalogCache
+                : (settings?.centralOneCatalogCache || []);
 
             if (prodDB) {
                 const listaPaq = (prodDB.useAltPricing && Array.isArray(prodDB.altPackages) && prodDB.altPackages.length > 0)
@@ -5403,41 +5605,47 @@ app.post('/api/orders/verify-player', async (req, res) => {
                 let coProductId = pkgElegido ? (pkgElegido.centralOneProductId || '') : '';
                 let coCatItem = null;
 
-                if (settings && Array.isArray(settings.centralOneCatalogCache)) {
+                if (Array.isArray(catalogCache) && catalogCache.length > 0) {
                     if (coProductId) {
-                        coCatItem = settings.centralOneCatalogCache.find(x => x.product_id === coProductId);
+                        coCatItem = catalogCache.find(x => x.product_id === coProductId);
                     }
                     if (!coCatItem && pkgElegido && pkgElegido.apiProductSku) {
                         const skuClean = String(pkgElegido.apiProductSku).trim().toUpperCase();
-                        coCatItem = settings.centralOneCatalogCache.find(x => String(x.sku || '').trim().toUpperCase() === skuClean);
+                        coCatItem = catalogCache.find(x => String(x.sku || '').trim().toUpperCase() === skuClean);
                         if (coCatItem) coProductId = coCatItem.product_id;
                     }
                 }
 
                 if (coProductId && (!coCatItem || coCatItem.requires_target !== false)) {
-                    const targetFields = (coCatItem && Array.isArray(coCatItem.target_fields) && coCatItem.target_fields.length > 0)
-                        ? coCatItem.target_fields
-                        : ['player_id'];
+                    const { primaryPayload, fallbackPayload } = construirTargetPayloadCentralOne(
+                        coCatItem,
+                        playerUid,
+                        playerServer,
+                        playerRegion,
+                        slugClean
+                    );
 
-                    const targetPayload = {};
-                    targetFields.forEach((fieldKey, idx) => {
-                        const fkLower = String(fieldKey).toLowerCase();
-                        if (fkLower.includes('server') || fkLower.includes('zone') || fkLower.includes('region')) {
-                            targetPayload[fieldKey] = String(playerServer || playerRegion || '').trim();
-                        } else if (idx === 0 || fkLower.includes('player') || fkLower.includes('uid') || fkLower.includes('id')) {
-                            targetPayload[fieldKey] = String(playerUid).trim();
-                        } else {
-                            targetPayload[fieldKey] = String(playerServer || playerRegion || playerUid).trim();
-                        }
-                    });
-
-                    try {
+                    const intentarValidacionCO = async (tPayload) => {
                         const respCO = await axios.post(`${CENTRAL_ONE_BASE_URL}/player/validate`, {
                             product_id: coProductId,
-                            target_payload: targetPayload
+                            target_payload: tPayload
                         }, { headers, timeout: 9000 });
+                        return respCO.data || {};
+                    };
 
-                        const dataCO = respCO.data || {};
+                    try {
+                        let dataCO = await intentarValidacionCO(primaryPayload);
+
+                        // Si el primer formato de región (ej. "Europe") dio inválido y existe código técnico alternativo (ej. "os_euro"), probar el alternativo automáticamente
+                        if (dataCO.status === 'invalid' && fallbackPayload) {
+                            try {
+                                const dataFallback = await intentarValidacionCO(fallbackPayload);
+                                if (dataFallback && dataFallback.status === 'valid') {
+                                    dataCO = dataFallback;
+                                }
+                            } catch (eFb) {}
+                        }
+
                         if (dataCO.status === 'valid') {
                             const nick = dataCO.player?.name || '';
                             return res.json({
@@ -5456,11 +5664,26 @@ app.post('/api/orders/verify-player', async (req, res) => {
                                 success: false,
                                 status: 'invalid',
                                 verified: false,
-                                error: '❌ El ID de jugador ingresado NO existe en este servidor/región. Corrígelo antes de continuar.'
+                                error: '❌ El ID de jugador o la Región seleccionada NO coinciden con ninguna cuenta activa en este servidor. Revísalos e intenta de nuevo.'
                             });
                         }
                     } catch (errVal) {
-                        // Si devuelve 429 o fallo temporal, continúa con validación permisiva para no trancar la venta
+                        // Si el primer intento dio error 400/422 por formato de servidor y tenemos fallbackPayload, reintentar con el código alternativo
+                        if (fallbackPayload) {
+                            try {
+                                const dataFb2 = await intentarValidacionCO(fallbackPayload);
+                                if (dataFb2 && dataFb2.status === 'valid') {
+                                    const nick = dataFb2.player?.name || '';
+                                    return res.json({
+                                        success: true,
+                                        status: 'valid',
+                                        verified: true,
+                                        nickname: nick,
+                                        message: nick ? `✅ Cuenta verificada: ${nick}` : `✅ Cuenta verificada en el servidor.`
+                                    });
+                                }
+                            } catch (eFb2) {}
+                        }
                     }
                 }
             }
@@ -5471,7 +5694,7 @@ app.post('/api/orders/verify-player', async (req, res) => {
             status: 'unverified',
             verified: false,
             nickname: '',
-            message: 'ℹ️ No se puede mostrar el apodo en este juego, igualmente si escribió bien su ID, su recarga llegará sin problemas.'
+            message: 'ℹ️ No se puede mostrar el apodo en este juego, igualmente si escribió bien su ID y región, su recarga llegará sin problemas.'
         });
     } catch (error) {
         return res.status(500).json({ error: 'Error al validar el ID.' });
