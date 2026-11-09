@@ -4944,28 +4944,56 @@ return res.status(400).json({ error: 'Ingresa al menos un juego con precio váli
                 (nombrePkgBuscado && String(p.name || '').trim().toLowerCase() === nombrePkgBuscado)
             );
 
-            const ofertaMatch = (settings.flashOffers || []).find(of =>
+const ofertaMatch = (settings.flashOffers || []).find(of =>
                 String(of.slug || '').trim().toLowerCase() === slugBuscado &&
                 (String(of.pkgId || '').trim() === idPkgBuscado ||
+                 String(of.linkedPackageId || '').trim() === idPkgBuscado ||
                  (nombrePkgBuscado && String(of.title || '').trim().toLowerCase() === nombrePkgBuscado))
             );
 
             if (ofertaMatch) {
-                const vencio = Boolean(ofertaMatch.expiresAt && new Date(ofertaMatch.expiresAt).getTime() <= Date.now());
-                if (ofertaMatch.active !== false && !vencio) {
+                const vencioPorTiempo = Boolean(ofertaMatch.expiresAt && new Date(ofertaMatch.expiresAt).getTime() <= Date.now());
+                const estaActivaOferta = ofertaMatch.active !== false && !vencioPorTiempo;
+
+                // Si venció por tiempo, la apaga permanentemente en MongoDB en segundo plano
+                if (vencioPorTiempo && ofertaMatch.active !== false && typeof settings.save === 'function') {
+                    ofertaMatch.active = false;
+                    settings.markModified('flashOffers');
+                    settings.save().catch(() => {});
+                }
+
+                if (!estaActivaOferta) {
+                    if (!pkg) {
+                        return res.status(400).json({
+                            error: '⏰ El tiempo de esta oferta relámpago ya finalizó o fue desactivada.'
+                        });
+                    }
+                } else {
+                    // Si la oferta está vinculada a un paquete existente del producto, hereda su configuración técnica (API, Algoritmo, Bóveda)
+                    if (!pkg && ofertaMatch.linkedPackageId) {
+                        pkg = listaPaquetesActiva.find(p => String(p.packageId || p.id || '').trim() === String(ofertaMatch.linkedPackageId).trim());
+                    }
+                    const bovedaOferta = Array.isArray(ofertaMatch.backupPinVault) && ofertaMatch.backupPinVault.length > 0
+                        ? ofertaMatch.backupPinVault
+                        : (pkg && Array.isArray(pkg.backupPinVault) ? pkg.backupPinVault : []);
+
                     pkg = {
-                        packageId: ofertaMatch.pkgId || idPkgBuscado,
-                        name: ofertaMatch.title,
+                        ...(pkg ? (pkg.toObject ? pkg.toObject() : pkg) : {}),
+                        packageId: (pkg && pkg.packageId) || ofertaMatch.linkedPackageId || ofertaMatch.pkgId || idPkgBuscado,
+                        name: ofertaMatch.title || (pkg ? pkg.name : 'Paquete en Oferta'),
                         priceUSD: Number(ofertaMatch.usd),
                         costUSD: Number(ofertaMatch.costUSD || (pkg ? pkg.costUSD : 0) || 0),
                         tokemsPrice: Number(ofertaMatch.tokemsPrice || ofertaMatch.usd),
-                        apiProviderName: (pkg && pkg.apiProviderName) || 'DEFAULT_API',
+                        apiProviderName: (pkg && pkg.apiProviderName) || 'CENTRAL_ONE',
                         apiProductSku: ofertaMatch.apiProductSku || (pkg ? pkg.apiProductSku : '') || ofertaMatch.pkgId,
+                        centralOneProductId: ofertaMatch.centralOneProductId || (pkg ? pkg.centralOneProductId : '') || '',
+                        useSmartAlgorithm: Boolean((pkg && pkg.useSmartAlgorithm) || productoDB.isSmartCodeProduct),
+                        targetClientUSD: Number((pkg && pkg.targetClientUSD) || 0),
                         isGiftCardPin: ofertaMatch.isGiftCardPin !== undefined ? Boolean(ofertaMatch.isGiftCardPin) : Boolean(pkg && pkg.isGiftCardPin),
-                        inStock: true
+                        backupPinVault: bovedaOferta,
+                        inStock: true,
+                        providerInStock: pkg && pkg.providerInStock !== undefined ? pkg.providerInStock : true
                     };
-                } else if (!pkg) {
-                    return res.status(400).json({ error: '⏰ El tiempo de esta oferta relámpago ya finalizó.' });
                 }
             }
 
