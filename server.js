@@ -6842,74 +6842,114 @@ app.post('/api/admin/settings', verificarSoloAdmin, async (req, res) => {
 
         const requiereRecalculoAlgoritmo = Array.isArray(arbitrageBaseCards);
 
-        // Si no estamos recalculando el pool con el caché de Central One, no cargamos los +5,000 SKUs de MongoDB
-        let querySettings = StoreSettings.findOne({ key: 'main_settings' });
-        if (!requiereRecalculoAlgoritmo) {
-            querySettings = querySettings.select('-centralOneCatalogCache -centralOneCoverageCache -processedWebhookIds');
+        // Si se envió la Bóveda de Tarjetas Base, normalizar cada tarjeta (respetando cuando internalCodeStock queda vacío []) y guardarla directo en MongoDB en 5ms
+        let poolNormalizado = null;
+        if (requiereRecalculoAlgoritmo) {
+            poolNormalizado = arbitrageBaseCards.map((c, idx) => ({
+                cardId: String(c.cardId || ('arb_' + idx)),
+                platformGroup: String(c.platformGroup || 'steam').toLowerCase(),
+                name: String(c.name || `Tarjeta Base #${idx + 1}`).trim(),
+                centralOneProductId: String(c.centralOneProductId || '').trim(),
+                centralOneSku: String(c.centralOneSku || '').trim(),
+                faceValueOrigin: Number(c.faceValueOrigin) || 0,
+                originCurrency: String(c.originCurrency || 'VND').trim().toUpperCase(),
+                conversionRateToUSD: Number(c.conversionRateToUSD) || 0,
+                effectiveClientUSD: Number(c.effectiveClientUSD) || 0,
+                costUSD: Number(c.costUSD) || 0,
+                minProfitUSD: Number(c.minProfitUSD) || 0,
+                internalCodeStock: Array.isArray(c.internalCodeStock)
+                    ? c.internalCodeStock.map(s => String(s || '').trim()).filter(Boolean)
+                    : [],
+                inStock: c.inStock !== false,
+                availableStock: (c.availableStock !== null && c.availableStock !== undefined && c.availableStock !== '') ? Number(c.availableStock) : null,
+                active: c.active !== false,
+                lastPriceUpdateAt: c.lastPriceUpdateAt ? new Date(c.lastPriceUpdateAt) : new Date()
+            }));
+
+            // Guardado atómico directo en la colección para que jamás falle por VersionError ni re-suba el caché gigante de Central One
+            await StoreSettings.collection.updateOne(
+                { key: 'main_settings' },
+                {
+                    $set: {
+                        arbitrageBaseCards: poolNormalizado,
+                        updatedBy: req.adminUser.email,
+                        updatedAt: new Date()
+                    }
+                }
+            );
         }
 
-        let settings = await querySettings;
+        let settings = await StoreSettings.findOne({ key: 'main_settings' })
+            .select('-centralOneCatalogCache -centralOneCoverageCache -processedWebhookIds');
         if (!settings) settings = new StoreSettings({ key: 'main_settings' });
 
-        if (exchangeRateVES !== undefined) settings.exchangeRateVES = Number(exchangeRateVES);
-        if (bcvRateVES !== undefined) settings.bcvRateVES = Number(bcvRateVES);
-        if (tokemValueUSD !== undefined) settings.tokemValueUSD = Number(tokemValueUSD);
-        if (typeof storeOpen === 'boolean') settings.storeOpen = storeOpen;
-        if (typeof autoTriggerApiOnTokems === 'boolean') settings.autoTriggerApiOnTokems = autoTriggerApiOnTokems;
-        if (announcementText !== undefined) settings.announcementText = announcementText;
-        if (typeof hideAnnouncement === 'boolean') settings.hideAnnouncement = hideAnnouncement;
-        if (heroConfig && typeof heroConfig === 'object') settings.heroConfig = heroConfig;
+        let huboOtrosCambios = false;
+        if (exchangeRateVES !== undefined) { settings.exchangeRateVES = Number(exchangeRateVES); huboOtrosCambios = true; }
+        if (bcvRateVES !== undefined) { settings.bcvRateVES = Number(bcvRateVES); huboOtrosCambios = true; }
+        if (tokemValueUSD !== undefined) { settings.tokemValueUSD = Number(tokemValueUSD); huboOtrosCambios = true; }
+        if (typeof storeOpen === 'boolean') { settings.storeOpen = storeOpen; huboOtrosCambios = true; }
+        if (typeof autoTriggerApiOnTokems === 'boolean') { settings.autoTriggerApiOnTokems = autoTriggerApiOnTokems; huboOtrosCambios = true; }
+        if (announcementText !== undefined) { settings.announcementText = announcementText; huboOtrosCambios = true; }
+        if (typeof hideAnnouncement === 'boolean') { settings.hideAnnouncement = hideAnnouncement; huboOtrosCambios = true; }
+        if (heroConfig && typeof heroConfig === 'object') { settings.heroConfig = heroConfig; huboOtrosCambios = true; }
         if (flashSectionConfig && typeof flashSectionConfig === 'object') {
             settings.flashSectionConfig = flashSectionConfig;
             settings.markModified('flashSectionConfig');
+            huboOtrosCambios = true;
         }
         if (Array.isArray(flashOffers)) {
             settings.flashOffers = flashOffers;
             settings.markModified('flashOffers');
+            huboOtrosCambios = true;
         }
         if (catalogSectionConfig && typeof catalogSectionConfig === 'object') {
             settings.catalogSectionConfig = catalogSectionConfig;
             settings.markModified('catalogSectionConfig');
+            huboOtrosCambios = true;
         }
         if (navigationConfig && typeof navigationConfig === 'object') {
             settings.navigationConfig = navigationConfig;
             settings.markModified('navigationConfig');
+            huboOtrosCambios = true;
         }
         if (flyersCanvaConfig && typeof flyersCanvaConfig === 'object') {
             settings.flyersCanvaConfig = flyersCanvaConfig;
             settings.markModified('flyersCanvaConfig');
+            huboOtrosCambios = true;
         }
         if (steamCalculatorConfig && typeof steamCalculatorConfig === 'object') {
             settings.steamCalculatorConfig = steamCalculatorConfig;
             settings.markModified('steamCalculatorConfig');
+            huboOtrosCambios = true;
         }
-        if (Array.isArray(arbitrageBaseCards)) {
-            settings.arbitrageBaseCards = arbitrageBaseCards;
-            settings.markModified('arbitrageBaseCards');
-        }
-        settings.updatedBy = req.adminUser.email;
 
-        let productosActualizados = undefined;
-        if (requiereRecalculoAlgoritmo) {
-            // recalcularPreciosYAlgoritmoTiendaKZ ya ejecuta settings.save() una sola vez al finalizar
-            await recalcularPreciosYAlgoritmoTiendaKZ(settings);
-            productosActualizados = await CatalogProduct.find().sort({ sortOrder: 1 }).lean();
-        } else {
+        if (huboOtrosCambios) {
+            settings.updatedBy = req.adminUser.email;
             await settings.save();
         }
 
-        // Enviar respuesta ligera al navegador (sin reenviar los Megabytes de centralOneCatalogCache)
+        if (poolNormalizado) {
+            settings.arbitrageBaseCards = poolNormalizado;
+            // Ejecutar recálculo de combinaciones en segundo plano sin bloquear el botón del navegador
+            setImmediate(() => {
+                recalcularPreciosYAlgoritmoTiendaKZ().catch(() => {});
+            });
+        }
+
         const settingsLigero = settings.toObject ? settings.toObject() : { ...settings };
         delete settingsLigero.centralOneCatalogCache;
         delete settingsLigero.centralOneCoverageCache;
         delete settingsLigero.processedWebhookIds;
+        if (poolNormalizado) {
+            settingsLigero.arbitrageBaseCards = poolNormalizado;
+        }
 
         return res.json({
             success: true,
-            settings: settingsLigero,
-            ...(productosActualizados ? { products: productosActualizados } : {})
+            settings: settingsLigero
         });
     } catch (error) {
+        console.error('Error en /api/admin/settings:', error);
         return res.status(500).json({ error: 'Error guardando configuración de la tienda.' });
     }
 });
