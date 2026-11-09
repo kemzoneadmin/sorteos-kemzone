@@ -6870,16 +6870,24 @@ app.post('/api/worker/delete-order', verificarSoloAdmin, async (req, res) => {
 
 app.get('/api/admin/overview', verificarSoloAdmin, async (req, res) => {
     try {
-        const omitHeavyCache = req.query.lite === '1';
+        const isFastMode = req.query.fast === '1' || req.query.lite === '1';
 
         // Sincronizado con zona horaria de Venezuela (UTC-4) para que no reinicie a las 8:00 PM
         const ahoraVzla = new Date(Date.now() - (4 * 60 * 60 * 1000));
         const hoyInicio = new Date(Date.UTC(ahoraVzla.getUTCFullYear(), ahoraVzla.getUTCMonth(), ahoraVzla.getUTCDate(), 4, 0, 0, 0));
         const mesInicio = new Date(Date.UTC(ahoraVzla.getUTCFullYear(), ahoraVzla.getUTCMonth(), 1, 4, 0, 0, 0));
 
+        const projectionSettings = isFastMode
+            ? '-centralOneCatalogCache -centralOneCoverageCache -processedWebhookIds -flyersCanvaConfig'
+            : '-centralOneCoverageCache -processedWebhookIds';
+
+        const projectionProducts = isFastMode
+            ? '-cardImageUrl -flyerImageUrl -infoImageUrl -packages.imageUrl -altPackages.imageUrl -packages.targetSchemaCache -altPackages.targetSchemaCache'
+            : '-packages.targetSchemaCache -altPackages.targetSchemaCache';
+
         const [
             settingsRaw,
-            products,
+            productsRaw,
             paymentMethods,
             todasLasOrdenes,
             pendientesCount,
@@ -6892,11 +6900,11 @@ app.get('/api/admin/overview', verificarSoloAdmin, async (req, res) => {
             transaccionesTokems
         ] = await Promise.all([
             StoreSettings.findOne({ key: 'main_settings' })
-                .select('-centralOneCoverageCache -processedWebhookIds')
+                .select(projectionSettings)
                 .lean(),
             CatalogProduct.find()
                 .sort({ sortOrder: 1 })
-                .select('-packages.targetSchemaCache -altPackages.targetSchemaCache')
+                .select(projectionProducts)
                 .lean(),
             PaymentMethod.find().sort({ sortOrder: 1 }).lean(),
             Order.find()
@@ -6919,12 +6927,17 @@ app.get('/api/admin/overview', verificarSoloAdmin, async (req, res) => {
             ? _ramCentralOneCatalogCache
             : (settings.centralOneCatalogCache || []);
 
-        if (omitHeavyCache) {
-            // Si el navegador ya tiene el catálogo de 5,156 ítems y los flyers en caché local, no los re-descarga
+        if (isFastMode) {
             delete settings.centralOneCatalogCache;
             delete settings.flyersCanvaConfig;
+            // Aligerar posibles Base64 pesados dentro de settings en modo rápido
+            if (settings.heroConfig && settings.heroConfig.mascotUrl && settings.heroConfig.mascotUrl.startsWith('data:')) {
+                delete settings.heroConfig.mascotUrl;
+            }
+            if (settings.binanceAutoConfig && settings.binanceAutoConfig.qrImageUrl && settings.binanceAutoConfig.qrImageUrl.startsWith('data:')) {
+                delete settings.binanceAutoConfig.qrImageUrl;
+            }
         } else if (Array.isArray(fuenteCatCO) && fuenteCatCO.length > 0) {
-            // Envía únicamente los campos esenciales de cada SKU (reduce el peso de 5MB a ~350KB)
             settings.centralOneCatalogCache = fuenteCatCO.map(c => ({
                 product_id: c.product_id,
                 sku: c.sku,
@@ -6977,6 +6990,7 @@ app.get('/api/admin/overview', verificarSoloAdmin, async (req, res) => {
 
         return res.json({
             success: true,
+            isFastMode,
             analytics: {
                 ordenesHoyCount: ordenesEntregadasHoy.length,
                 ventasHoyUSD: Number(ventasHoyUSD.toFixed(2)),
@@ -7007,7 +7021,7 @@ app.get('/api/admin/overview', verificarSoloAdmin, async (req, res) => {
                 }
             },
             settings,
-            products,
+            products: productsRaw,
             paymentMethods,
             workersList
         });
