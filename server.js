@@ -3177,12 +3177,43 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
         };
     }
 
+const settings = await StoreSettings.findOne({ key: 'main_settings' })
+        .select('arbitrageBaseCards centralOneAlerts flashOffers');
+
     const usandoAlt = Boolean(productoDB && productoDB.useAltPricing && Array.isArray(productoDB.altPackages) && productoDB.altPackages.length > 0);
     const listaPaquetes = usandoAlt ? productoDB.altPackages : (productoDB ? productoDB.packages : []);
-    const pkg = (listaPaquetes || []).find(p => p.packageId === orden.packageId);
 
-    const settings = await StoreSettings.findOne({ key: 'main_settings' })
-        .select('arbitrageBaseCards centralOneAlerts');
+    // Buscar si la orden corresponde a una Oferta Relámpago activa para heredar su vínculo con el paquete original y su bóveda
+    const ofertaActivaMatch = (settings && Array.isArray(settings.flashOffers))
+        ? settings.flashOffers.find(of =>
+            String(of.slug || '').trim().toLowerCase() === String(orden.productSlug || '').trim().toLowerCase() &&
+            (String(of.pkgId || '').trim() === String(orden.packageId || '').trim() ||
+             String(of.linkedPackageId || '').trim() === String(orden.packageId || '').trim() ||
+             String(of.title || '').trim().toLowerCase() === String(orden.packageName || '').trim().toLowerCase())
+          )
+        : null;
+
+    let pkg = (listaPaquetes || []).find(p =>
+        String(p.packageId || '').trim() === String(orden.packageId || '').trim() ||
+        (ofertaActivaMatch && ofertaActivaMatch.linkedPackageId && String(p.packageId || '').trim() === String(ofertaActivaMatch.linkedPackageId).trim()) ||
+        String(p.name || '').trim().toLowerCase() === String(orden.packageName || '').trim().toLowerCase()
+    );
+
+    if (!pkg && ofertaActivaMatch) {
+        pkg = {
+            packageId: ofertaActivaMatch.pkgId || orden.packageId,
+            name: ofertaActivaMatch.title || orden.packageName,
+            priceUSD: Number(ofertaActivaMatch.usd || orden.baseAmountUSD || 1),
+            costUSD: Number(ofertaActivaMatch.costUSD || orden.costUSD || 0),
+            apiProductSku: ofertaActivaMatch.apiProductSku || orden.apiProductSku || '',
+            centralOneProductId: ofertaActivaMatch.centralOneProductId || '',
+            useSmartAlgorithm: Boolean(productoDB && productoDB.isSmartCodeProduct),
+            targetClientUSD: Number(ofertaActivaMatch.oldUsd || ofertaActivaMatch.usd || 0),
+            isGiftCardPin: Boolean(ofertaActivaMatch.isGiftCardPin || orden.isGiftCardPin),
+            backupPinVault: Array.isArray(ofertaActivaMatch.backupPinVault) ? ofertaActivaMatch.backupPinVault : []
+        };
+    }
+
     const poolCards = settings ? (settings.arbitrageBaseCards || []) : [];
     const catalogCacheActiva = _ramCentralOneCatalogCache.length > 0
         ? _ramCentralOneCatalogCache
@@ -3192,7 +3223,31 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
     const esSteamOrder = String(orden.productSlug || '').toLowerCase().includes('steam') ||
                          String(platGroupActual).toLowerCase() === 'steam';
 
-    // 1. PRIORIDAD 1: Bóveda de Pines del propio paquete (Elimina la línea usada y deja las restantes)
+    // 1. PRIORIDAD 1A: Si la Oferta Relámpago tiene códigos propios en su Bóveda de Oferta, sacarlos primero
+    if (ofertaActivaMatch && Array.isArray(ofertaActivaMatch.backupPinVault) && ofertaActivaMatch.backupPinVault.length > 0) {
+        const pinOfertaRaw = String(ofertaActivaMatch.backupPinVault.shift() || '').trim();
+        if (pinOfertaRaw) {
+            const montoOf = Number(pkg?.targetClientUSD || ofertaActivaMatch.oldUsd || ofertaActivaMatch.usd || 0);
+            const esGiftOf = Boolean(ofertaActivaMatch.isGiftCardPin || pkg?.isGiftCardPin || orden.isGiftCardPin || orden.fulfillmentType === 'API_GIFT_CARD');
+            const pinFormateadoOf = (esSteamOrder || (esGiftOf && montoOf > 0))
+                ? formatearCodigoConEtiquetaPlataforma(pinOfertaRaw, montoOf, platGroupActual, esSteamOrder)
+                : pinOfertaRaw;
+
+            await StoreSettings.collection.updateOne(
+                { key: 'main_settings' },
+                { $set: { flashOffers: settings.flashOffers } }
+            ).catch(() => {});
+
+            return {
+                success: true,
+                deliveredCode: pinFormateadoOf,
+                apiOrderId: 'VAULT-FLASH-' + Date.now(),
+                raw: { source: 'flash_offer_pin_vault', remainingInVault: ofertaActivaMatch.backupPinVault.length }
+            };
+        }
+    }
+
+    // 1. PRIORIDAD 1B: Bóveda de Pines del propio paquete del producto (Elimina la línea usada y deja las restantes)
     if (pkg && Array.isArray(pkg.backupPinVault) && pkg.backupPinVault.length > 0) {
         const pinRaw = String(pkg.backupPinVault.shift() || '').trim();
         if (pinRaw) {
@@ -3202,12 +3257,12 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
                 ? formatearCodigoConEtiquetaPlataforma(pinRaw, montoPkg, platGroupActual, esSteamOrder)
                 : pinRaw;
 
-            if (typeof productoDB.markModified === 'function') {
+            if (productoDB && typeof productoDB.markModified === 'function') {
                 productoDB.markModified('packages');
                 productoDB.markModified('altPackages');
+                await productoDB.save();
             }
-            await productoDB.save();
-            if (productoDB._id) {
+            if (productoDB && productoDB._id) {
                 await CatalogProduct.collection.updateOne(
                     { _id: productoDB._id },
                     { $set: { packages: productoDB.packages, altPackages: productoDB.altPackages } }
