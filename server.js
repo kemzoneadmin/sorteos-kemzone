@@ -6870,13 +6870,15 @@ app.post('/api/worker/delete-order', verificarSoloAdmin, async (req, res) => {
 
 app.get('/api/admin/overview', verificarSoloAdmin, async (req, res) => {
     try {
+        const omitHeavyCache = req.query.lite === '1';
+
         // Sincronizado con zona horaria de Venezuela (UTC-4) para que no reinicie a las 8:00 PM
         const ahoraVzla = new Date(Date.now() - (4 * 60 * 60 * 1000));
         const hoyInicio = new Date(Date.UTC(ahoraVzla.getUTCFullYear(), ahoraVzla.getUTCMonth(), ahoraVzla.getUTCDate(), 4, 0, 0, 0));
         const mesInicio = new Date(Date.UTC(ahoraVzla.getUTCFullYear(), ahoraVzla.getUTCMonth(), 1, 4, 0, 0, 0));
 
         const [
-            settings,
+            settingsRaw,
             products,
             paymentMethods,
             todasLasOrdenes,
@@ -6889,19 +6891,53 @@ app.get('/api/admin/overview', verificarSoloAdmin, async (req, res) => {
             todosLosPines,
             transaccionesTokems
         ] = await Promise.all([
-            StoreSettings.findOne({ key: 'main_settings' }).lean(),
-            CatalogProduct.find().sort({ sortOrder: 1 }).lean(),
+            StoreSettings.findOne({ key: 'main_settings' })
+                .select('-centralOneCoverageCache -processedWebhookIds')
+                .lean(),
+            CatalogProduct.find()
+                .sort({ sortOrder: 1 })
+                .select('-packages.targetSchemaCache -altPackages.targetSchemaCache')
+                .lean(),
             PaymentMethod.find().sort({ sortOrder: 1 }).lean(),
-            Order.find().sort({ fecha: -1 }).limit(3000).select('-internalAccountLogin.accountPass -apiRawResponse').lean(),
+            Order.find()
+                .sort({ fecha: -1 })
+                .limit(1500)
+                .select('-internalAccountLogin.accountPass -apiRawResponse -algoExecutionState.pendingReplacementBody')
+                .lean(),
             Order.countDocuments({ status: 'EN_PROCESO' }),
             SupportTicket.countDocuments({ status: { $in: ['ABIERTO', 'EN_REVISION'] } }),
-            SupportTicket.find().sort({ createdAt: -1 }).limit(300).select('ticketId orderId userEmail category status createdAt').lean(),
+            SupportTicket.find().sort({ createdAt: -1 }).limit(200).select('ticketId orderId userEmail category status assignedWorker assignedWorkerName createdAt').lean(),
             User.find({ role: { $in: ['worker', 'admin'] } }).select('email accountName role tokems').lean(),
             User.find().sort({ createdAt: -1 }).select('accountName email role isVerified tokems savedProfiles createdAt').lean(),
             Balance.find({ tokens: { $gt: 0 } }).select('deviceId tokens').lean(),
             Pin.find().select('code tokens used createdBy createdAt').lean(),
-            Transaction.find().sort({ fecha: -1 }).limit(1000).select('deviceId tipo tokens plan precio fecha').lean()
+            Transaction.find().sort({ fecha: -1 }).limit(500).select('deviceId tipo tokens plan precio fecha').lean()
         ]);
+
+        const settings = settingsRaw ? { ...settingsRaw } : {};
+        const fuenteCatCO = Array.isArray(_ramCentralOneCatalogCache) && _ramCentralOneCatalogCache.length > 0
+            ? _ramCentralOneCatalogCache
+            : (settings.centralOneCatalogCache || []);
+
+        if (omitHeavyCache) {
+            // Si el navegador ya tiene el catálogo de 5,156 ítems y los flyers en caché local, no los re-descarga
+            delete settings.centralOneCatalogCache;
+            delete settings.flyersCanvaConfig;
+        } else if (Array.isArray(fuenteCatCO) && fuenteCatCO.length > 0) {
+            // Envía únicamente los campos esenciales de cada SKU (reduce el peso de 5MB a ~350KB)
+            settings.centralOneCatalogCache = fuenteCatCO.map(c => ({
+                product_id: c.product_id,
+                sku: c.sku,
+                name: c.name,
+                reseller_price: c.reseller_price,
+                in_stock: c.in_stock,
+                status: c.status,
+                available_stock: c.available_stock,
+                product_family_name: c.product_family_name,
+                requires_target: c.requires_target,
+                target_fields: c.target_fields
+            }));
+        }
 
         const ordenesEntregadasHoy = todasLasOrdenes.filter(o => o.status === 'ENTREGADO' && new Date(o.completedAt || o.fecha) >= hoyInicio);
         const ordenesEntregadasMes = todasLasOrdenes.filter(o => o.status === 'ENTREGADO' && new Date(o.completedAt || o.fecha) >= mesInicio);
@@ -6958,7 +6994,6 @@ app.get('/api/admin/overview', verificarSoloAdmin, async (req, res) => {
                 rendimientoTrabajadores,
                 ventasPorJuego,
                 ventasPorMetodo,
-                // Datasets completos para filtrado por Día, Semana, Mes, Año y Paginación
                 rawOrders: todasLasOrdenes,
                 rawUsers: todosLosUsuarios,
                 rawTickets: todosLosTickets,
