@@ -2351,109 +2351,6 @@ function extraerCodigoCrudoDeTextoFormateado(codeStr) {
 }
 
 const activeCentralOnePollers = new Map();
-let isScanningOrphanCoOrders = false;
-
-// 🛰️ ESCÁNER AUTOMÁTICO DE ÓRDENES RETRASADAS EN CENTRAL ONE (Recupera códigos como CO-ORD-20261108-4C8F40 hacia tu Stock Propio)
-async function sincronizarCodigosTardiosCentralOneABovedaKZ() {
-    if (isScanningOrphanCoOrders) return;
-    const headers = obtenerHeadersCentralOne();
-    if (!headers) return;
-
-    isScanningOrphanCoOrders = true;
-    try {
-        const settings = await StoreSettings.findOne({ key: 'main_settings' }).select('arbitrageBaseCards processedWebhookIds').lean();
-        if (!settings || !Array.isArray(settings.arbitrageBaseCards)) return;
-
-        const yaProcesadosSet = new Set(Array.isArray(settings.processedWebhookIds) ? settings.processedWebhookIds : []);
-        const resList = await axios.get(`${CENTRAL_ONE_BASE_URL}/orders?limit=20`, { headers, timeout: 12000 }).catch(() => null);
-        const listaCoOrders = resList?.data?.orders || resList?.data?.items || (Array.isArray(resList?.data) ? resList.data : []);
-        if (!Array.isArray(listaCoOrders) || listaCoOrders.length === 0) return;
-
-        // Reunir todos los códigos ya entregados a clientes en las últimas 72h para jamás guardar en stock un código que sí recibió un cliente
-        const hace72h = new Date(Date.now() - 72 * 60 * 60 * 1000);
-        const ordenesRecientes = await Order.find({ fecha: { $gte: hace72h } }).select('orderId status apiOrderId deliveredCode algoExecutionState').lean();
-        const codigosEntregadosAClientes = new Set();
-        ordenesRecientes.forEach(o => {
-            if (o.deliveredCode) {
-                String(o.deliveredCode).split(/\s*\|\s*|\r?\n/).forEach(c => {
-                    const limpio = extraerCodigoCrudoDeTextoFormateado(c);
-                    if (limpio && limpio.length >= 5) codigosEntregadosAClientes.add(limpio);
-                });
-            }
-        });
-
-        let nuevosIdsProcesados = [];
-
-        for (const coSummary of listaCoOrders) {
-            const coId = coSummary.id || coSummary.order_id || '';
-            const refCode = coSummary.reference_code || coId;
-            const st = String(coSummary.status || '').toLowerCase();
-            if (!coId || (st !== 'completed' && st !== 'partially_completed')) continue;
-
-            const recoveryKey = `late_rec_${coId}`;
-            if (yaProcesadosSet.has(recoveryKey)) continue;
-
-            // Buscar a qué orden de Kem!Zone pertenece por nota ("KemZone #KZ-199047"), idempotency_key o apiOrderId
-            const notaTxt = `${coSummary.note || ''} ${coSummary.idempotency_key || ''}`;
-            const matchKz = notaTxt.match(/KZ-\d{6}/i);
-            const kzId = matchKz ? matchKz[0].toUpperCase() : null;
-
-            const ordVinc = ordenesRecientes.find(o =>
-                (kzId && o.orderId === kzId) ||
-                o.apiOrderId === coId ||
-                o.apiOrderId === refCode
-            );
-
-            // Si la orden de Kem!Zone sigue en EJECUTANDO_API o ERROR_API esperando estos códigos, entregárselos al cliente;
-            // Si la orden de Kem!Zone ya fue ENTREGADA manualmente (o RECHAZADA), guardar los códigos sobrantes de Central One en tu Stock Propio
-            const check = await verificarYExtraerEntregaCentralOne(coId, headers, settings.arbitrageBaseCards, true, 0, ordVinc?.algoExecutionState || null).catch(() => null);
-            if (!check || !Array.isArray(check.codigosPorItem) || check.codigosPorItem.length === 0) continue;
-
-            if (ordVinc && (ordVinc.status === 'EJECUTANDO_API' || ordVinc.status === 'ERROR_API') && st === 'completed') {
-                programarSeguimientoOrdenCentralOne(ordVinc.orderId, coId);
-                continue;
-            }
-
-            // Filtrar códigos de esta orden de Central One que NO estén en el deliveredCode de ningún cliente
-            const itemsSobrantesParaBoveda = check.codigosPorItem.map(it => ({
-                ...it,
-                rawCodes: (it.rawCodes || []).filter(c => !codigosEntregadosAClientes.has(extraerCodigoCrudoDeTextoFormateado(c))),
-                codes: (it.codes || []).filter(c => !codigosEntregadosAClientes.has(extraerCodigoCrudoDeTextoFormateado(c)))
-            })).filter(it => it.rawCodes.length > 0);
-
-            if (itemsSobrantesParaBoveda.length > 0) {
-                await guardarCodigosRecuperadosEnStockInterno(ordVinc || null, itemsSobrantesParaBoveda, [], refCode);
-            }
-
-            // Si ya terminó por completo en Central One, marcarla como procesada para no volver a escanearla
-            if (st === 'completed') {
-                nuevosIdsProcesados.push(recoveryKey);
-            }
-        }
-
-        if (nuevosIdsProcesados.length > 0) {
-            const listaFinalIds = [...nuevosIdsProcesados, ...Array.from(yaProcesadosSet)].slice(0, 400);
-            await StoreSettings.collection.updateOne(
-                { key: 'main_settings' },
-                { $set: { processedWebhookIds: listaFinalIds } }
-            );
-        }
-    } catch (e) {
-    } finally {
-        isScanningOrphanCoOrders = false;
-    }
-}
-
-// Ejecutar escáner al arrancar el servidor (a los 6 seg) y cada 45 seg en segundo plano
-setTimeout(() => {
-    sincronizarCodigosTardiosCentralOneABovedaKZ().catch(() => {});
-}, 6000);
-
-setInterval(() => {
-    if (process.env.CENTRAL_ONE_API_KEY) {
-        sincronizarCodigosTardiosCentralOneABovedaKZ().catch(() => {});
-    }
-}, 45000);
 
 function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId, fallbackIdempKey = null, fallbackBodyOrder = null) {
     if (!orderIdKZ) return;
@@ -2517,7 +2414,6 @@ function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId, fallbackIdemp
             }
 
             if (!currentCoOrderId) {
-                await sincronizarCodigosTardiosCentralOneABovedaKZ();
                 activeCentralOnePollers.delete(orderIdKZ);
                 return;
             }
