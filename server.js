@@ -2252,18 +2252,19 @@ function extraerCodigoCrudoDeTextoFormateado(codeStr) {
 // ⏱️ VIGILANTE BLINDADO PASO A PASO: SIN DUPLICADOS, REPOSICIÓN EXCLUSIVA DE FALTANTES Y RECUPERACIÓN IDEMPOTENTE
 const activeCentralOnePollers = new Map();
 
-// Auto-reanuda el seguimiento de órdenes en curso si Railway se reinicia
+// Auto-reanuda el seguimiento de órdenes en curso (o entregadas manualmente con pedido aún retenido en Central One) si Railway se reinicia
 setTimeout(async () => {
     try {
         const hace24Horas = new Date(Date.now() - 24 * 60 * 60 * 1000);
         const enVuelo = await Order.find({
             fecha: { $gte: hace24Horas },
-            status: 'EJECUTANDO_API',
-            cancelledByDelayRefund: { $ne: true }
-        }).select('orderId apiOrderId algoExecutionState').lean();
+            status: { $in: ['EJECUTANDO_API', 'ERROR_API', 'ENTREGADO', 'RECHAZADO'] },
+            apiOrderId: { $nin: ['', null] }
+        }).select('orderId status apiOrderId algoExecutionState').lean();
 
         for (const ord of (enVuelo || [])) {
-            if (ord.apiOrderId && !ord.apiOrderId.startsWith('VAULT-') && !ord.apiOrderId.startsWith('INTERNAL-') && !ord.apiOrderId.startsWith('API-')) {
+            if (ord.apiOrderId && !ord.apiOrderId.startsWith('VAULT-') && !ord.apiOrderId.startsWith('INTERNAL-') && !ord.apiOrderId.startsWith('API-') && !ord.apiOrderId.startsWith('MANUAL-')) {
+                if (ord.status === 'ENTREGADO' && ord.algoExecutionState?.coLateCodesRecovered) continue;
                 const idCo = ord.apiOrderId.startsWith('kz-ord-') ? null : ord.apiOrderId;
                 const idemp = ord.apiOrderId.startsWith('kz-ord-') ? ord.apiOrderId : (ord.algoExecutionState?.pendingReplacementIdempKey || null);
                 programarSeguimientoOrdenCentralOne(ord.orderId, idCo, idemp, ord.algoExecutionState?.pendingReplacementBody || null);
@@ -2296,18 +2297,22 @@ function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId, fallbackIdemp
                 return;
             }
             const ordenDB = await Order.findOne({ orderId: orderIdKZ });
-            if (!ordenDB || ordenDB.status === 'ENTREGADO') {
+            if (!ordenDB) {
                 activeCentralOnePollers.delete(orderIdKZ);
                 return;
             }
 
-            const algoState = ordenDB.algoExecutionState || null;
+            const algoState = ordenDB.algoExecutionState || {};
+            if (ordenDB.status === 'ENTREGADO' && algoState.coLateCodesRecovered) {
+                activeCentralOnePollers.delete(orderIdKZ);
+                return;
+            }
 
-            // 1. Si hay un reemplazo o pedido previo que dio timeout en pleno vuelo, recuperarlo con su Idempotency-Key determinista ANTES de mirar apiOrderId viejo
-            const pendingIdemp = (algoState && algoState.pendingReplacementIdempKey) || fallbackIdempKey || '';
-            const pendingBody = (algoState && algoState.pendingReplacementBody) || fallbackBodyOrder || null;
+            // 1. Si hay un reemplazo o pedido previo que dio timeout en pleno vuelo, recuperarlo con su Idempotency-Key determinista
+            const pendingIdemp = algoState.pendingReplacementIdempKey || fallbackIdempKey || '';
+            const pendingBody = algoState.pendingReplacementBody || fallbackBodyOrder || null;
 
-            if (pendingIdemp && pendingBody && (!currentCoOrderId || (algoState && Array.isArray(algoState.processedPartialOrderIds) && algoState.processedPartialOrderIds.includes(currentCoOrderId)))) {
+            if (pendingIdemp && pendingBody && (!currentCoOrderId || (Array.isArray(algoState.processedPartialOrderIds) && algoState.processedPartialOrderIds.includes(currentCoOrderId)))) {
                 try {
                     const headersIdemp = obtenerHeadersCentralOne({ 'Idempotency-Key': pendingIdemp });
                     const resRec = await axios.post(`${CENTRAL_ONE_BASE_URL}/orders`, pendingBody, {
@@ -2317,24 +2322,22 @@ function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId, fallbackIdemp
                     if (resRec.data?.order?.id) {
                         currentCoOrderId = resRec.data.order.id;
                         ordenDB.apiOrderId = currentCoOrderId;
-                        if (algoState) {
-                            algoState.pendingReplacementIdempKey = '';
-                            algoState.pendingReplacementBody = null;
-                            ordenDB.algoExecutionState = algoState;
-                            ordenDB.markModified('algoExecutionState');
-                        }
+                        algoState.pendingReplacementIdempKey = '';
+                        algoState.pendingReplacementBody = null;
+                        ordenDB.algoExecutionState = algoState;
+                        ordenDB.markModified('algoExecutionState');
                         await ordenDB.save();
                     }
                 } catch (eRec) {}
             }
 
-            if (!currentCoOrderId && ordenDB.apiOrderId && !ordenDB.apiOrderId.startsWith('kz-ord-')) {
+            if (!currentCoOrderId && ordenDB.apiOrderId && !ordenDB.apiOrderId.startsWith('kz-ord-') && !ordenDB.apiOrderId.startsWith('MANUAL-') && !ordenDB.apiOrderId.startsWith('VAULT-') && !ordenDB.apiOrderId.startsWith('INTERNAL-')) {
                 currentCoOrderId = ordenDB.apiOrderId;
             }
 
             if (!currentCoOrderId) {
                 const maxEsperaSinId = ordenDB.clientChoseToWait ? (12 * 60 * 60 * 1000) : (45 * 60 * 1000);
-                if (Date.now() - inicioMs < maxEsperaSinId) {
+                if (Date.now() - inicioMs < maxEsperaSinId && ordenDB.status !== 'ENTREGADO') {
                     activeCentralOnePollers.set(orderIdKZ, setTimeout(cicloRevision, 15000));
                 } else {
                     activeCentralOnePollers.delete(orderIdKZ);
@@ -2349,14 +2352,43 @@ function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId, fallbackIdemp
 
             const check = await verificarYExtraerEntregaCentralOne(currentCoOrderId, headers, poolCards, esSteamOrd, 0, algoState);
 
-            // Si el cliente pidió reembolso por demora, guardar cualquier código que llegue en tu Stock Interno
-            if (ordenDB.cancelledByDelayRefund || ordenDB.status === 'RECHAZADO') {
+            // 🏦 Si la orden fue RECHAZADA, cancelada por demora, o YA FUE ENTREGADA MANUALMENTE por ti mientras Central One estaba "En curso":
+            // Cualquier código nuevo que libere Central One se guarda directo en tu Stock Propio (internalCodeStock)
+            if (ordenDB.cancelledByDelayRefund || ordenDB.status === 'RECHAZADO' || ordenDB.status === 'ENTREGADO') {
                 if (check.state === 'COMPLETED' || check.state === 'PARTIAL_REFUNDED') {
-                    await guardarCodigosRecuperadosEnStockInterno(ordenDB, check.codigosPorItem, check.codigosPlanos);
+                    const codigosYaDadosAlCliente = new Set(
+                        String(ordenDB.deliveredCode || '')
+                            .split(/\s*\|\s*|\r?\n/)
+                            .map(extraerCodigoCrudoDeTextoFormateado)
+                            .filter(Boolean)
+                    );
+
+                    // Filtrar únicamente los códigos de Central One que NO se le entregaron al cliente
+                    const itemsParaGuardar = (check.codigosPorItem || []).map(it => ({
+                        ...it,
+                        codes: (it.rawCodes || it.codes || []).filter(c => !codigosYaDadosAlCliente.has(extraerCodigoCrudoDeTextoFormateado(c)))
+                    })).filter(it => it.codes.length > 0);
+
+                    const planosParaGuardar = (check.codigosPlanos || [])
+                        .map(c => c.includes('➔') ? c.split('➔').slice(1).join('➔').trim() : c)
+                        .filter(c => !codigosYaDadosAlCliente.has(extraerCodigoCrudoDeTextoFormateado(c)));
+
+                    if (itemsParaGuardar.length > 0 || planosParaGuardar.length > 0) {
+                        await guardarCodigosRecuperadosEnStockInterno(ordenDB, itemsParaGuardar, planosParaGuardar);
+                    }
+
+                    algoState.coLateCodesRecovered = true;
+                    ordenDB.algoExecutionState = algoState;
+                    ordenDB.markModified('algoExecutionState');
+                    await ordenDB.save();
                     activeCentralOnePollers.delete(orderIdKZ);
                     return;
                 }
                 if (check.state === 'FAILED') {
+                    algoState.coLateCodesRecovered = true;
+                    ordenDB.algoExecutionState = algoState;
+                    ordenDB.markModified('algoExecutionState');
+                    await ordenDB.save();
                     activeCentralOnePollers.delete(orderIdKZ);
                     return;
                 }
