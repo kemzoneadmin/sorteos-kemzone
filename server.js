@@ -2064,6 +2064,103 @@ function resolverMontoUsdTarjetaDeItemCentralOne(ci, idxGlobal, poolCards, algoS
     return Number(fallbackUnitUSD || 0);
 }
 
+// Extrae el string limpio de un código sin importar si Central One devuelve un string o un objeto { code, pin, voucher }
+function extraerStringCodigoDeElementoCO(cEntry) {
+    if (!cEntry) return '';
+    if (typeof cEntry === 'string') return cEntry.trim();
+    if (typeof cEntry === 'object') {
+        const val = cEntry.code || cEntry.pin || cEntry.voucher_code || cEntry.voucher || cEntry.key || cEntry.serial || cEntry.value || '';
+        return String(val || '').trim();
+    }
+    return '';
+}
+
+// 🏦 Guarda de forma atómica en el Stock Propio (internalCodeStock) de tu Bóveda cualquier código que llegue tarde de Central One
+async function guardarCodigosRecuperadosEnStockInterno(ordenDB, listaObjetosCodigos = [], codigosPlanos = [], coOrderReference = '') {
+    try {
+        const settings = await StoreSettings.findOne({ key: 'main_settings' });
+        if (!settings || !Array.isArray(settings.arbitrageBaseCards)) return 0;
+
+        // Reunir todos los códigos que ya estén guardados en la Bóveda para no duplicar jamás el mismo código
+        const codigosExistentesEnBoveda = new Set();
+        settings.arbitrageBaseCards.forEach(c => {
+            (c.internalCodeStock || []).forEach(cod => {
+                codigosExistentesEnBoveda.add(extraerCodigoCrudoDeTextoFormateado(cod));
+            });
+        });
+
+        let guardadosCount = 0;
+        const detallesGuardados = [];
+
+        if (Array.isArray(listaObjetosCodigos) && listaObjetosCodigos.length > 0) {
+            for (const itemCode of listaObjetosCodigos) {
+                // Emparejar por UUID, SKU, Nombre, Valor Facial (ej. 100000 / 75000) o Costo Unitario
+                const metaMatch = emparejarItemCentralOneConMetaKZ(
+                    {
+                        catalog_item_id: itemCode.catalogItemId || itemCode.centralOneProductId || '',
+                        sku: itemCode.sku || '',
+                        product_name: itemCode.name || '',
+                        unit_price: itemCode.unitCostUSD || 0
+                    },
+                    -1,
+                    [],
+                    settings.arbitrageBaseCards
+                );
+
+                const cPool = settings.arbitrageBaseCards.find(c =>
+                    (itemCode.cardId && c.cardId === itemCode.cardId) ||
+                    (metaMatch && metaMatch.cardId && c.cardId === metaMatch.cardId) ||
+                    (itemCode.catalogItemId && String(c.centralOneProductId || '').trim() === String(itemCode.catalogItemId).trim()) ||
+                    (itemCode.sku && String(c.centralOneSku || '').trim().toUpperCase() === String(itemCode.sku).trim().toUpperCase())
+                );
+
+                const listaCruda = Array.isArray(itemCode.rawCodes) && itemCode.rawCodes.length > 0
+                    ? itemCode.rawCodes
+                    : (Array.isArray(itemCode.codes) ? itemCode.codes : []);
+
+                if (cPool && listaCruda.length > 0) {
+                    if (!Array.isArray(cPool.internalCodeStock)) cPool.internalCodeStock = [];
+                    for (const rawC of listaCruda) {
+                        const limpio = rawC.includes('➔') ? rawC.split('➔').slice(1).join('➔').trim() : String(rawC || '').trim();
+                        const clave = extraerCodigoCrudoDeTextoFormateado(limpio);
+                        if (limpio && clave && !codigosExistentesEnBoveda.has(clave)) {
+                            cPool.internalCodeStock.push(limpio);
+                            codigosExistentesEnBoveda.add(clave);
+                            guardadosCount++;
+                            detallesGuardados.push(`${cPool.name}: ${limpio}`);
+                        }
+                    }
+                }
+            }
+        }
+
+        if (guardadosCount > 0) {
+            settings.markModified('arbitrageBaseCards');
+            await registrarAlertaCentralOne(settings, {
+                type: 'BACK_IN_STOCK',
+                severity: 'OK',
+                title: `🏦 +${guardadosCount} código(s) recuperados automáticamente en tu Stock Propio (${coOrderReference || (ordenDB ? '#' + ordenDB.orderId : 'Central One')})`,
+                detail: `Central One liberó códigos retrasados y se guardaron en tu Bóveda listos para la próxima venta: ${detallesGuardados.join(' • ')}`
+            });
+
+            // Guardado atómico directo en MongoDB para asegurar 100% persistencia
+            await StoreSettings.collection.updateOne(
+                { key: 'main_settings' },
+                {
+                    $set: {
+                        arbitrageBaseCards: settings.arbitrageBaseCards.map(c => (c.toObject ? c.toObject() : c)),
+                        centralOneAlerts: settings.centralOneAlerts
+                    }
+                }
+            );
+        }
+        return guardadosCount;
+    } catch (e) {
+        console.error('Aviso guardando en stock interno:', e.message);
+        return 0;
+    }
+}
+
 // 🔎 CONSULTAR ESTADO DETALLADO, CÓDIGOS ENTREGADOS Y LÍNEAS FALTANTES EN CENTRAL ONE
 async function verificarYExtraerEntregaCentralOne(coOrderId, headers, poolCards = null, esSteamOrder = false, fallbackUnitUSD = 0, algoState = null) {
     const resOrder = await axios.get(`${CENTRAL_ONE_BASE_URL}/orders/${encodeURIComponent(coOrderId)}`, {
@@ -2086,7 +2183,7 @@ async function verificarYExtraerEntregaCentralOne(coOrderId, headers, poolCards 
     let codigosPlanos = [];
     let codigosPorItem = [];
 
-    if (totalDeliveredCount > 0 && (st === 'completed' || st === 'partially_completed' || st === 'processing' || st === 'confirmed')) {
+    if (totalDeliveredCount > 0 || st === 'completed' || st === 'partially_completed') {
         try {
             const resCodes = await axios.get(`${CENTRAL_ONE_BASE_URL}/orders/${encodeURIComponent(coOrderId)}/codes`, {
                 headers,
@@ -2096,11 +2193,18 @@ async function verificarYExtraerEntregaCentralOne(coOrderId, headers, poolCards 
             let globalCodeIndex = 0;
 
             rawCodeItems.forEach((ci, itemIdx) => {
-                const arrCodes = Array.isArray(ci?.codes) ? ci.codes : (typeof ci === 'string' ? [ci] : []);
+                let rawArr = [];
+                if (Array.isArray(ci?.codes)) rawArr = ci.codes;
+                else if (Array.isArray(ci?.vouchers)) rawArr = ci.vouchers;
+                else if (Array.isArray(ci?.pins)) rawArr = ci.pins;
+                else if (typeof ci === 'string') rawArr = [ci];
+                else if (ci && (ci.code || ci.pin || ci.voucher_code)) rawArr = [ci];
+
+                const arrCodes = rawArr.map(extraerStringCodigoDeElementoCO).filter(Boolean);
                 if (arrCodes.length > 0) {
-                    // Emparejar contra la línea que realmente tuvo entrega (evita desfase cuando Central One omite la línea fallida en /codes)
                     const lineFallback = (ci?.order_item_id && lines.find(l => (l.id || l.order_item_id) === ci.order_item_id))
                         || ((ci?.catalog_item_id || ci?.product_id) && lines.find(l => (l.catalog_item_id || l.product_id) === (ci.catalog_item_id || ci.product_id)))
+                        || (ci?.sku && lines.find(l => String(l.sku || '').toUpperCase() === String(ci.sku).toUpperCase()))
                         || (rawCodeItems.length === linesConEntrega.length ? linesConEntrega[itemIdx] : lines[itemIdx])
                         || {};
 
@@ -2109,7 +2213,8 @@ async function verificarYExtraerEntregaCentralOne(coOrderId, headers, poolCards 
                         ...(typeof ci === 'object' ? ci : {}),
                         catalog_item_id: ci?.catalog_item_id || ci?.product_id || lineFallback.catalog_item_id || lineFallback.product_id || '',
                         sku: ci?.sku || lineFallback.sku || '',
-                        product_name: ci?.product_name || ci?.name || lineFallback.product_name || lineFallback.name || ''
+                        product_name: ci?.product_name || ci?.name || lineFallback.product_name || lineFallback.name || '',
+                        unit_price: ci?.unit_price || lineFallback.unit_price || 0
                     };
 
                     const metaLinea = emparejarItemCentralOneConMetaKZ(ciEnriquecido, itemIdx, batchMeta, poolCards);
@@ -2123,9 +2228,7 @@ async function verificarYExtraerEntregaCentralOne(coOrderId, headers, poolCards 
                     const codigosFormateadosItem = [];
                     const codigosCrudosLimpios = [];
 
-                    arrCodes.forEach(cStr => {
-                        const rawClean = String(cStr || '').trim();
-                        if (!rawClean) return;
+                    arrCodes.forEach(rawClean => {
                         globalCodeIndex++;
                         codigosCrudosLimpios.push(rawClean);
                         codigosFormateadosItem.push(formatearCodigoConEtiquetaSteam(rawClean, unitUsdLinea, esSteamOrder));
@@ -2149,7 +2252,6 @@ async function verificarYExtraerEntregaCentralOne(coOrderId, headers, poolCards 
         } catch (errCodes) {}
     }
 
-    // Identificar línea por línea cuáles tarjetas exactas NO fueron entregadas
     const missingLineItems = [];
     const failedCatalogIds = [];
 
@@ -2240,7 +2342,6 @@ async function verificarYExtraerEntregaCentralOne(coOrderId, headers, poolCards 
     };
 }
 
-// Extrae el código alfanumérico puro (sin "Steam Wallet X,XX$ ➔ ") para evitar duplicados aunque cambie el formato
 function extraerCodigoCrudoDeTextoFormateado(codeStr) {
     const str = String(codeStr || '').trim();
     if (str.includes('➔')) {
@@ -2249,29 +2350,110 @@ function extraerCodigoCrudoDeTextoFormateado(codeStr) {
     return str.toUpperCase();
 }
 
-// ⏱️ VIGILANTE BLINDADO PASO A PASO: SIN DUPLICADOS, REPOSICIÓN EXCLUSIVA DE FALTANTES Y RECUPERACIÓN IDEMPOTENTE
 const activeCentralOnePollers = new Map();
+let isScanningOrphanCoOrders = false;
 
-// Auto-reanuda el seguimiento de órdenes en curso (o entregadas manualmente con pedido aún retenido en Central One) si Railway se reinicia
-setTimeout(async () => {
+// 🛰️ ESCÁNER AUTOMÁTICO DE ÓRDENES RETRASADAS EN CENTRAL ONE (Recupera códigos como CO-ORD-20261108-4C8F40 hacia tu Stock Propio)
+async function sincronizarCodigosTardiosCentralOneABovedaKZ() {
+    if (isScanningOrphanCoOrders) return;
+    const headers = obtenerHeadersCentralOne();
+    if (!headers) return;
+
+    isScanningOrphanCoOrders = true;
     try {
-        const hace24Horas = new Date(Date.now() - 24 * 60 * 60 * 1000);
-        const enVuelo = await Order.find({
-            fecha: { $gte: hace24Horas },
-            status: { $in: ['EJECUTANDO_API', 'ERROR_API', 'ENTREGADO', 'RECHAZADO'] },
-            apiOrderId: { $nin: ['', null] }
-        }).select('orderId status apiOrderId algoExecutionState').lean();
+        const settings = await StoreSettings.findOne({ key: 'main_settings' }).select('arbitrageBaseCards processedWebhookIds').lean();
+        if (!settings || !Array.isArray(settings.arbitrageBaseCards)) return;
 
-        for (const ord of (enVuelo || [])) {
-            if (ord.apiOrderId && !ord.apiOrderId.startsWith('VAULT-') && !ord.apiOrderId.startsWith('INTERNAL-') && !ord.apiOrderId.startsWith('API-') && !ord.apiOrderId.startsWith('MANUAL-')) {
-                if (ord.status === 'ENTREGADO' && ord.algoExecutionState?.coLateCodesRecovered) continue;
-                const idCo = ord.apiOrderId.startsWith('kz-ord-') ? null : ord.apiOrderId;
-                const idemp = ord.apiOrderId.startsWith('kz-ord-') ? ord.apiOrderId : (ord.algoExecutionState?.pendingReplacementIdempKey || null);
-                programarSeguimientoOrdenCentralOne(ord.orderId, idCo, idemp, ord.algoExecutionState?.pendingReplacementBody || null);
+        const yaProcesadosSet = new Set(Array.isArray(settings.processedWebhookIds) ? settings.processedWebhookIds : []);
+        const resList = await axios.get(`${CENTRAL_ONE_BASE_URL}/orders?limit=20`, { headers, timeout: 12000 }).catch(() => null);
+        const listaCoOrders = resList?.data?.orders || resList?.data?.items || (Array.isArray(resList?.data) ? resList.data : []);
+        if (!Array.isArray(listaCoOrders) || listaCoOrders.length === 0) return;
+
+        // Reunir todos los códigos ya entregados a clientes en las últimas 72h para jamás guardar en stock un código que sí recibió un cliente
+        const hace72h = new Date(Date.now() - 72 * 60 * 60 * 1000);
+        const ordenesRecientes = await Order.find({ fecha: { $gte: hace72h } }).select('orderId status apiOrderId deliveredCode algoExecutionState').lean();
+        const codigosEntregadosAClientes = new Set();
+        ordenesRecientes.forEach(o => {
+            if (o.deliveredCode) {
+                String(o.deliveredCode).split(/\s*\|\s*|\r?\n/).forEach(c => {
+                    const limpio = extraerCodigoCrudoDeTextoFormateado(c);
+                    if (limpio && limpio.length >= 5) codigosEntregadosAClientes.add(limpio);
+                });
+            }
+        });
+
+        let nuevosIdsProcesados = [];
+
+        for (const coSummary of listaCoOrders) {
+            const coId = coSummary.id || coSummary.order_id || '';
+            const refCode = coSummary.reference_code || coId;
+            const st = String(coSummary.status || '').toLowerCase();
+            if (!coId || (st !== 'completed' && st !== 'partially_completed')) continue;
+
+            const recoveryKey = `late_rec_${coId}`;
+            if (yaProcesadosSet.has(recoveryKey)) continue;
+
+            // Buscar a qué orden de Kem!Zone pertenece por nota ("KemZone #KZ-199047"), idempotency_key o apiOrderId
+            const notaTxt = `${coSummary.note || ''} ${coSummary.idempotency_key || ''}`;
+            const matchKz = notaTxt.match(/KZ-\d{6}/i);
+            const kzId = matchKz ? matchKz[0].toUpperCase() : null;
+
+            const ordVinc = ordenesRecientes.find(o =>
+                (kzId && o.orderId === kzId) ||
+                o.apiOrderId === coId ||
+                o.apiOrderId === refCode
+            );
+
+            // Si la orden de Kem!Zone sigue en EJECUTANDO_API o ERROR_API esperando estos códigos, entregárselos al cliente;
+            // Si la orden de Kem!Zone ya fue ENTREGADA manualmente (o RECHAZADA), guardar los códigos sobrantes de Central One en tu Stock Propio
+            const check = await verificarYExtraerEntregaCentralOne(coId, headers, settings.arbitrageBaseCards, true, 0, ordVinc?.algoExecutionState || null).catch(() => null);
+            if (!check || !Array.isArray(check.codigosPorItem) || check.codigosPorItem.length === 0) continue;
+
+            if (ordVinc && (ordVinc.status === 'EJECUTANDO_API' || ordVinc.status === 'ERROR_API') && st === 'completed') {
+                programarSeguimientoOrdenCentralOne(ordVinc.orderId, coId);
+                continue;
+            }
+
+            // Filtrar códigos de esta orden de Central One que NO estén en el deliveredCode de ningún cliente
+            const itemsSobrantesParaBoveda = check.codigosPorItem.map(it => ({
+                ...it,
+                rawCodes: (it.rawCodes || []).filter(c => !codigosEntregadosAClientes.has(extraerCodigoCrudoDeTextoFormateado(c))),
+                codes: (it.codes || []).filter(c => !codigosEntregadosAClientes.has(extraerCodigoCrudoDeTextoFormateado(c)))
+            })).filter(it => it.rawCodes.length > 0);
+
+            if (itemsSobrantesParaBoveda.length > 0) {
+                await guardarCodigosRecuperadosEnStockInterno(ordVinc || null, itemsSobrantesParaBoveda, [], refCode);
+            }
+
+            // Si ya terminó por completo en Central One, marcarla como procesada para no volver a escanearla
+            if (st === 'completed') {
+                nuevosIdsProcesados.push(recoveryKey);
             }
         }
-    } catch (e) {}
-}, 9000);
+
+        if (nuevosIdsProcesados.length > 0) {
+            const listaFinalIds = [...nuevosIdsProcesados, ...Array.from(yaProcesadosSet)].slice(0, 400);
+            await StoreSettings.collection.updateOne(
+                { key: 'main_settings' },
+                { $set: { processedWebhookIds: listaFinalIds } }
+            );
+        }
+    } catch (e) {
+    } finally {
+        isScanningOrphanCoOrders = false;
+    }
+}
+
+// Ejecutar escáner al arrancar el servidor (a los 6 seg) y cada 45 seg en segundo plano
+setTimeout(() => {
+    sincronizarCodigosTardiosCentralOneABovedaKZ().catch(() => {});
+}, 6000);
+
+setInterval(() => {
+    if (process.env.CENTRAL_ONE_API_KEY) {
+        sincronizarCodigosTardiosCentralOneABovedaKZ().catch(() => {});
+    }
+}, 45000);
 
 function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId, fallbackIdempKey = null, fallbackBodyOrder = null) {
     if (!orderIdKZ) return;
@@ -2308,7 +2490,6 @@ function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId, fallbackIdemp
                 return;
             }
 
-            // 1. Si hay un reemplazo o pedido previo que dio timeout en pleno vuelo, recuperarlo con su Idempotency-Key determinista
             const pendingIdemp = algoState.pendingReplacementIdempKey || fallbackIdempKey || '';
             const pendingBody = algoState.pendingReplacementBody || fallbackBodyOrder || null;
 
@@ -2336,12 +2517,8 @@ function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId, fallbackIdemp
             }
 
             if (!currentCoOrderId) {
-                const maxEsperaSinId = ordenDB.clientChoseToWait ? (12 * 60 * 60 * 1000) : (45 * 60 * 1000);
-                if (Date.now() - inicioMs < maxEsperaSinId && ordenDB.status !== 'ENTREGADO') {
-                    activeCentralOnePollers.set(orderIdKZ, setTimeout(cicloRevision, 15000));
-                } else {
-                    activeCentralOnePollers.delete(orderIdKZ);
-                }
+                await sincronizarCodigosTardiosCentralOneABovedaKZ();
+                activeCentralOnePollers.delete(orderIdKZ);
                 return;
             }
 
@@ -2352,8 +2529,6 @@ function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId, fallbackIdemp
 
             const check = await verificarYExtraerEntregaCentralOne(currentCoOrderId, headers, poolCards, esSteamOrd, 0, algoState);
 
-            // 🏦 Si la orden fue RECHAZADA, cancelada por demora, o YA FUE ENTREGADA MANUALMENTE por ti mientras Central One estaba "En curso":
-            // Cualquier código nuevo que libere Central One se guarda directo en tu Stock Propio (internalCodeStock)
             if (ordenDB.cancelledByDelayRefund || ordenDB.status === 'RECHAZADO' || ordenDB.status === 'ENTREGADO') {
                 if (check.state === 'COMPLETED' || check.state === 'PARTIAL_REFUNDED') {
                     const codigosYaDadosAlCliente = new Set(
@@ -2363,18 +2538,14 @@ function programarSeguimientoOrdenCentralOne(orderIdKZ, coOrderId, fallbackIdemp
                             .filter(Boolean)
                     );
 
-                    // Filtrar únicamente los códigos de Central One que NO se le entregaron al cliente
                     const itemsParaGuardar = (check.codigosPorItem || []).map(it => ({
                         ...it,
-                        codes: (it.rawCodes || it.codes || []).filter(c => !codigosYaDadosAlCliente.has(extraerCodigoCrudoDeTextoFormateado(c)))
-                    })).filter(it => it.codes.length > 0);
+                        rawCodes: (it.rawCodes || []).filter(c => !codigosYaDadosAlCliente.has(extraerCodigoCrudoDeTextoFormateado(c))),
+                        codes: (it.codes || []).filter(c => !codigosYaDadosAlCliente.has(extraerCodigoCrudoDeTextoFormateado(c)))
+                    })).filter(it => it.rawCodes.length > 0);
 
-                    const planosParaGuardar = (check.codigosPlanos || [])
-                        .map(c => c.includes('➔') ? c.split('➔').slice(1).join('➔').trim() : c)
-                        .filter(c => !codigosYaDadosAlCliente.has(extraerCodigoCrudoDeTextoFormateado(c)));
-
-                    if (itemsParaGuardar.length > 0 || planosParaGuardar.length > 0) {
-                        await guardarCodigosRecuperadosEnStockInterno(ordenDB, itemsParaGuardar, planosParaGuardar);
+                    if (itemsParaGuardar.length > 0) {
+                        await guardarCodigosRecuperadosEnStockInterno(ordenDB, itemsParaGuardar, [], check.referenceCode || currentCoOrderId);
                     }
 
                     algoState.coLateCodesRecovered = true;
