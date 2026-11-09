@@ -6160,12 +6160,87 @@ app.post('/api/tickets/cleanup', verificarTrabajadorOAdmin, async (req, res) => 
 // 👷 DASHBOARD 2: ENDPOINTS PARA TRABAJADORES / OPERADORES
 // =================================================================
 
-// 1. Cola de órdenes, tickets y lista de operadores en tiempo real
+// 1. Cola de órdenes, tickets y lista de operadores en tiempo real (Con Auto-Destrabe de EJECUTANDO_API)
 app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
     try {
         const { statusFilter } = req.query;
         const workerEmail = (req.staffUser.email || '').trim().toLowerCase();
         const isOwner = req.effectiveRole === 'admin';
+
+        // 🔄 Auto-verificar en vivo cualquier orden que haya quedado en EJECUTANDO_API
+        const enEjecucion = await Order.find({ status: 'EJECUTANDO_API' }).limit(10);
+        if (enEjecucion.length > 0) {
+            const headersCO = obtenerHeadersCentralOne();
+            const settingsDoc = await StoreSettings.findOne({ key: 'main_settings' }).select('arbitrageBaseCards').lean();
+            const poolCards = settingsDoc ? (settingsDoc.arbitrageBaseCards || []) : [];
+
+            for (const ordExec of enEjecucion) {
+                if (activeOrderProcessingLocks.has(ordExec.orderId)) continue;
+                const algoSt = ordExec.algoExecutionState || null;
+                const codigosGuardados = (algoSt && Array.isArray(algoSt.deliveredCodesList)) ? algoSt.deliveredCodesList : [];
+
+                // Si ya tenía todos sus códigos listos, pasarla a ENTREGADO de inmediato
+                if (ordExec.deliveredCode || (algoSt && Number(algoSt.totalCardsExpected) > 0 && codigosGuardados.length >= Number(algoSt.totalCardsExpected))) {
+                    ordExec.status = 'ENTREGADO';
+                    ordExec.progressPercent = 100;
+                    if (!ordExec.deliveredCode && codigosGuardados.length > 0) {
+                        ordExec.deliveredCode = codigosGuardados.join('  |  ');
+                    }
+                    ordExec.statusMessage = '¡Tu pedido ha sido entregado automáticamente con éxito!';
+                    ordExec.completedAt = ordExec.completedAt || new Date();
+                    await ordExec.save();
+                    continue;
+                }
+
+                // Si tiene un ID de orden en Central One, consultar su estado real ahora mismo
+                if (headersCO && ordExec.apiOrderId && !ordExec.apiOrderId.startsWith('VAULT-') && !ordExec.apiOrderId.startsWith('INTERNAL-') && !ordExec.apiOrderId.startsWith('API-') && !ordExec.apiOrderId.startsWith('kz-ord-')) {
+                    try {
+                        const esSteamOrd = String(ordExec.productSlug || '').toLowerCase().includes('steam') || String(algoSt?.platformGroup || '').toLowerCase() === 'steam';
+                        const check = await verificarYExtraerEntregaCentralOne(ordExec.apiOrderId, headersCO, poolCards, esSteamOrd, 0, algoSt);
+
+                        if (check.state === 'COMPLETED') {
+                            const vistosRaw = new Set(codigosGuardados.map(extraerCodigoCrudoDeTextoFormateado));
+                            const todos = [...codigosGuardados];
+                            for (const cNuevo of (check.codigosPlanos || [])) {
+                                const rk = extraerCodigoCrudoDeTextoFormateado(cNuevo);
+                                if (rk && !vistosRaw.has(rk)) {
+                                    vistosRaw.add(rk);
+                                    todos.push(cNuevo);
+                                }
+                            }
+                            ordExec.status = 'ENTREGADO';
+                            ordExec.progressPercent = 100;
+                            ordExec.deliveredCode = todos.length > 0 ? todos.join('  |  ') : check.deliveredCode;
+                            ordExec.statusMessage = '¡Tu pedido ha sido entregado automáticamente con éxito!';
+                            ordExec.completedAt = new Date();
+                            if (algoSt) {
+                                algoSt.deliveredCodesList = todos;
+                                algoSt.deliveredCardsCount = todos.length;
+                                ordExec.algoExecutionState = algoSt;
+                                ordExec.markModified('algoExecutionState');
+                            }
+                            await ordExec.save();
+                            continue;
+                        } else if (check.state === 'FAILED' || check.state === 'PARTIAL_REFUNDED') {
+                            if (!activeCentralOnePollers.has(ordExec.orderId)) {
+                                programarSeguimientoOrdenCentralOne(ordExec.orderId, ordExec.apiOrderId);
+                            }
+                        }
+                    } catch (eCheck) {}
+                }
+
+                // Si lleva más de 2 minutos en EJECUTANDO_API sin vigilante activo, pasarla a ERROR_API para habilitar el botón de reintento/entrega manual
+                const msDesdeUpdate = Date.now() - new Date(ordExec.updatedAt || ordExec.fecha || Date.now()).getTime();
+                if (msDesdeUpdate > 120000 && !activeCentralOnePollers.has(ordExec.orderId)) {
+                    if (codigosGuardados.length > 0 && !ordExec.deliveredCode) {
+                        ordExec.deliveredCode = codigosGuardados.join('  |  ');
+                    }
+                    ordExec.status = 'ERROR_API';
+                    ordExec.statusMessage = 'Pago verificado. Un operador completará la liberación de tu entrega en breve.';
+                    await ordExec.save();
+                }
+            }
+        }
 
         const query = {};
         if (statusFilter && statusFilter !== 'TODAS') {
@@ -6231,7 +6306,6 @@ app.post('/api/worker/claim-order', verificarTrabajadorOAdmin, async (req, res) 
         const isOwner = req.effectiveRole === 'admin';
 
         if (action === 'CLAIM') {
-            // Bloqueo atómico: solo se aparta si nadie más la ha apartado
             const ordenApartada = await Order.findOneAndUpdate(
                 {
                     orderId: idLimpio,
@@ -6317,7 +6391,7 @@ app.post('/api/worker/claim-order', verificarTrabajadorOAdmin, async (req, res) 
     }
 });
 
-// 2. Acción del Trabajador: APROBAR, REVISIÓN o RECHAZAR (Requiere que esté apartada)
+// 2. Acción del Trabajador: APROBAR, REVISIÓN o RECHAZAR (Permite destrabar EJECUTANDO_API / ERROR_API)
 app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res) => {
     try {
         const { orderId, action, manualPinCode, workerNotes } = req.body;
@@ -6330,23 +6404,20 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
         const staffName = req.staffUser.accountName || staffEmail.split('@')[0];
         const isOwner = req.effectiveRole === 'admin';
 
-        // Verificar que otro trabajador no la tenga apartada
         if (!isOwner && orden.claimedByWorker && orden.claimedByWorker !== staffEmail) {
             return res.status(403).json({
                 error: `Esta orden está apartada privadamente por ${orden.claimedByName || orden.claimedByWorker}.`
             });
         }
 
-        // Asegurar que quede registrada como apartada por quien la procesa
         if (!orden.claimedByWorker) {
             orden.claimedByWorker = staffEmail;
             orden.claimedByName = staffName;
             orden.claimedAt = new Date();
         }
 
-// ✅ SI EL TRABAJADOR VERIFICÓ LOS 6 DÍGITOS DEL PAGO MÓVIL Y LE DA A APROBAR
         if (action === 'APROBAR') {
-            // 🔒 1. Si la orden YA estaba ENTREGADA, solo actualizar Nota o PIN manual sin volver a llamar a Central One API
+            // 1. Si la orden YA estaba ENTREGADA, solo actualizar Nota o PIN manual sin volver a llamar a la API
             if (orden.status === 'ENTREGADO') {
                 if (manualPinCode && manualPinCode.trim()) {
                     orden.deliveredCode = manualPinCode.trim();
@@ -6362,23 +6433,72 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
                 });
             }
 
-            // 🔒 2. Si la orden YA está EJECUTANDO_API en este instante (doble clic o proceso en curso), bloquear segundo disparo
-            if (orden.status === 'EJECUTANDO_API' || activeOrderProcessingLocks.has(orden.orderId)) {
-                if (manualPinCode && manualPinCode.trim()) {
-                    orden.status = 'ENTREGADO';
-                    orden.progressPercent = 100;
-                    orden.deliveredCode = manualPinCode.trim();
-                    if (workerNotes) orden.workerNotes = workerNotes.trim();
-                    orden.approvedByWorker = staffEmail;
-                    orden.completedAt = new Date();
-                    await orden.save();
-                    return res.json({ success: true, message: `Orden #${orden.orderId} completada manualmente.`, order: orden });
+            // 2. Si el operador ingresó un código o confirmación manual, entregar de inmediato
+            if (manualPinCode && manualPinCode.trim()) {
+                orden.status = 'ENTREGADO';
+                orden.progressPercent = 100;
+                orden.deliveredCode = manualPinCode.trim();
+                orden.apiOrderId = orden.apiOrderId || ('MANUAL-STAFF-' + Date.now());
+                if (workerNotes) orden.workerNotes = workerNotes.trim();
+                orden.statusMessage = orden.fulfillmentType === 'API_GIFT_CARD'
+                    ? '¡Entrega completada! Cópiala aquí abajo.'
+                    : '¡Pedido entregado con éxito! Verifica tu cuenta.';
+                orden.approvedByWorker = staffEmail;
+                orden.completedAt = new Date();
+                await orden.save();
+                return res.json({ success: true, message: `Orden #${orden.orderId} completada manualmente.`, order: orden });
+            }
+
+            // 3. Si la orden ya tenía todos sus códigos en algoExecutionState.deliveredCodesList, completarla de inmediato
+            const algoSt = orden.algoExecutionState || null;
+            if (algoSt && Array.isArray(algoSt.deliveredCodesList) && algoSt.deliveredCodesList.length > 0 && Number(algoSt.totalCardsExpected) > 0 && algoSt.deliveredCodesList.length >= Number(algoSt.totalCardsExpected)) {
+                orden.status = 'ENTREGADO';
+                orden.progressPercent = 100;
+                orden.deliveredCode = algoSt.deliveredCodesList.join('  |  ');
+                if (workerNotes) orden.workerNotes = workerNotes.trim();
+                orden.statusMessage = '¡Tu pedido ha sido entregado con éxito!';
+                orden.approvedByWorker = staffEmail;
+                orden.completedAt = new Date();
+                await orden.save();
+                return res.json({ success: true, message: `Orden #${orden.orderId} marcada como entregada.`, order: orden });
+            }
+
+            // 4. Si tenía un apiOrderId previo que falló, verificar primero en Central One antes de reintentar
+            if (orden.apiOrderId && !orden.apiOrderId.startsWith('VAULT-') && !orden.apiOrderId.startsWith('INTERNAL-') && !orden.apiOrderId.startsWith('API-') && !orden.apiOrderId.startsWith('kz-ord-')) {
+                const headersCO = obtenerHeadersCentralOne();
+                if (headersCO) {
+                    try {
+                        const settingsDoc = await StoreSettings.findOne({ key: 'main_settings' }).select('arbitrageBaseCards').lean();
+                        const poolCards = settingsDoc ? (settingsDoc.arbitrageBaseCards || []) : [];
+                        const esSteamOrd = String(orden.productSlug || '').toLowerCase().includes('steam') || String(algoSt?.platformGroup || '').toLowerCase() === 'steam';
+                        const checkPrev = await verificarYExtraerEntregaCentralOne(orden.apiOrderId, headersCO, poolCards, esSteamOrd, 0, algoSt);
+
+                        if (checkPrev.state === 'COMPLETED') {
+                            const previos = (algoSt && Array.isArray(algoSt.deliveredCodesList)) ? algoSt.deliveredCodesList : [];
+                            const vistosRaw = new Set(previos.map(extraerCodigoCrudoDeTextoFormateado));
+                            const todos = [...previos];
+                            for (const cNuevo of (checkPrev.codigosPlanos || [])) {
+                                const rk = extraerCodigoCrudoDeTextoFormateado(cNuevo);
+                                if (rk && !vistosRaw.has(rk)) {
+                                    vistosRaw.add(rk);
+                                    todos.push(cNuevo);
+                                }
+                            }
+                            orden.status = 'ENTREGADO';
+                            orden.progressPercent = 100;
+                            orden.deliveredCode = todos.length > 0 ? todos.join('  |  ') : checkPrev.deliveredCode;
+                            if (workerNotes) orden.workerNotes = workerNotes.trim();
+                            orden.statusMessage = '¡Entrega completada! Cópiala aquí abajo.';
+                            orden.approvedByWorker = staffEmail;
+                            orden.completedAt = new Date();
+                            await orden.save();
+                            return res.json({ success: true, message: `Orden #${orden.orderId} recuperada de Central One y entregada.`, order: orden });
+                        } else if (checkPrev.state === 'FAILED') {
+                            // Si la orden previa en Central One falló por completo, limpiar apiOrderId para permitir nuevo disparo limpio
+                            orden.apiOrderId = '';
+                        }
+                    } catch (ePrev) {}
                 }
-                return res.json({
-                    success: true,
-                    message: `La orden #${orden.orderId} ya se está procesando automáticamente con el proveedor.`,
-                    order: orden
-                });
             }
 
             orden.status = 'EJECUTANDO_API';
@@ -6387,7 +6507,7 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
             if (workerNotes) orden.workerNotes = workerNotes.trim();
             await orden.save();
 
-            // Caso A: Si el cliente compró saldo de Tokems KZ con Pago Móvil/Binance
+            // Caso A: Si el cliente compró saldo de Tokems KZ
             if (orden.orderType === 'TOKEM_TOPUP') {
                 if (orden.deviceId.includes('@')) {
                     await User.updateOne({ email: orden.deviceId }, { $inc: { tokems: orden.tokemsAmount } });
@@ -6413,21 +6533,6 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
                 await orden.save();
 
                 return res.json({ success: true, message: 'Tokems acreditados al cliente.', order: orden });
-            }
-
-            // Si el operador escribió un PIN manual directamente al aprobar, entregarlo sin gastar saldo en la API
-            if (manualPinCode && manualPinCode.trim()) {
-                orden.status = 'ENTREGADO';
-                orden.progressPercent = 100;
-                orden.deliveredCode = manualPinCode.trim();
-                orden.apiOrderId = orden.apiOrderId || ('MANUAL-STAFF-' + Date.now());
-                orden.statusMessage = orden.fulfillmentType === 'API_GIFT_CARD'
-                    ? '¡Entrega completada! Cópiala aquí abajo.'
-                    : '¡Pedido entregado con éxito! Verifica tu cuenta.';
-                orden.approvedByWorker = staffEmail;
-                orden.completedAt = new Date();
-                await orden.save();
-                return res.json({ success: true, message: `Orden #${orden.orderId} aprobada con código manual.`, order: orden });
             }
 
             // Caso B: Recarga por ID, Gift Card o Servicio -> Dispara la API automáticamente
@@ -6468,7 +6573,6 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
             orden.completedAt = new Date();
             await orden.save();
 
-            // Enviar respaldo por correo mediante Resend si el cliente tiene email
             if (orden.userEmail && orden.userEmail.includes('@')) {
                 await resend.emails.send({
                     from: 'Kem!Zone Oficial <registro@kzsorteos.com>',
