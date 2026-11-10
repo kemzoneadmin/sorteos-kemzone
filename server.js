@@ -6660,15 +6660,15 @@ app.post('/api/tickets/cleanup', verificarTrabajadorOAdmin, async (req, res) => 
 // 👷 DASHBOARD 2: ENDPOINTS PARA TRABAJADORES / OPERADORES
 // =================================================================
 
-// 1. Cola de órdenes, tickets y lista de operadores en tiempo real (Con Auto-Destrabe de EJECUTANDO_API)
+// 1. Cola de órdenes, tickets y lista de operadores en tiempo real (Sincronizado en vivo con estado "Recibida" de Central One)
 app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
     try {
         const { statusFilter } = req.query;
         const workerEmail = (req.staffUser.email || '').trim().toLowerCase();
         const isOwner = req.effectiveRole === 'admin';
 
-        // 🔄 Auto-verificar en vivo cualquier orden que haya quedado en EJECUTANDO_API
-        const enEjecucion = await Order.find({ status: 'EJECUTANDO_API' }).limit(10);
+        // 🔄 Verificar en vivo cualquier orden que esté en EJECUTANDO_API ("Recibida" en Central One)
+        const enEjecucion = await Order.find({ status: 'EJECUTANDO_API' }).limit(15);
         if (enEjecucion.length > 0) {
             const headersCO = obtenerHeadersCentralOne();
             const settingsDoc = await StoreSettings.findOne({ key: 'main_settings' }).select('arbitrageBaseCards').lean();
@@ -6679,7 +6679,6 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
                 const algoSt = ordExec.algoExecutionState || null;
                 const codigosGuardados = (algoSt && Array.isArray(algoSt.deliveredCodesList)) ? algoSt.deliveredCodesList : [];
 
-                // Si ya tenía todos sus códigos listos, pasarla a ENTREGADO de inmediato
                 if (ordExec.deliveredCode || (algoSt && Number(algoSt.totalCardsExpected) > 0 && codigosGuardados.length >= Number(algoSt.totalCardsExpected))) {
                     ordExec.status = 'ENTREGADO';
                     ordExec.progressPercent = 100;
@@ -6692,7 +6691,7 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
                     continue;
                 }
 
-                // Si tiene un ID de orden en Central One, consultar su estado real ahora mismo
+                // Consultar el estado real en Central One
                 if (headersCO && ordExec.apiOrderId && !ordExec.apiOrderId.startsWith('VAULT-') && !ordExec.apiOrderId.startsWith('INTERNAL-') && !ordExec.apiOrderId.startsWith('API-') && !ordExec.apiOrderId.startsWith('kz-ord-')) {
                     try {
                         const esSteamOrd = String(ordExec.productSlug || '').toLowerCase().includes('steam') || String(algoSt?.platformGroup || '').toLowerCase() === 'steam';
@@ -6721,23 +6720,28 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
                             }
                             await ordExec.save();
                             continue;
-                        } else if (check.state === 'FAILED' || check.state === 'PARTIAL_REFUNDED') {
+                        } else if (check.state === 'PROCESSING') {
+                            // ⏳ Sigue "Recibida" en Central One con saldo retenido: mantenerla en EJECUTANDO_API y asegurar que el vigilante siga activo
                             if (!activeCentralOnePollers.has(ordExec.orderId)) {
                                 programarSeguimientoOrdenCentralOne(ordExec.orderId, ordExec.apiOrderId);
                             }
+                            continue;
+                        } else if (check.state === 'FAILED' || check.state === 'PARTIAL_REFUNDED') {
+                            if (algoSt && algoSt.isAlgorithmOrder) {
+                                if (!activeCentralOnePollers.has(ordExec.orderId)) {
+                                    programarSeguimientoOrdenCentralOne(ordExec.orderId, ordExec.apiOrderId);
+                                }
+                            } else {
+                                // Si era una recarga directa 1 a 1 y Central One la rechazó/reembolsó definitivamente, ahora sí pasa a ERROR_API para permitir reintento
+                                ordExec.status = 'ERROR_API';
+                                ordExec.statusMessage = 'Pago verificado. El proveedor reportó una demora en el servidor del juego; un operador reintentará tu entrega.';
+                                ordExec.workerNotes = `⚠️ Central One reembolsó/canceló el intento (${check.failureCode || 'fallo'}): ${check.errorMsg || 'Puedes reintentar el envío.'}`;
+                                ordExec.apiOrderId = '';
+                                await ordExec.save();
+                            }
+                            continue;
                         }
                     } catch (eCheck) {}
-                }
-
-                // Si lleva más de 2 minutos en EJECUTANDO_API sin vigilante activo, pasarla a ERROR_API para habilitar el botón de reintento/entrega manual
-                const msDesdeUpdate = Date.now() - new Date(ordExec.updatedAt || ordExec.fecha || Date.now()).getTime();
-                if (msDesdeUpdate > 120000 && !activeCentralOnePollers.has(ordExec.orderId)) {
-                    if (codigosGuardados.length > 0 && !ordExec.deliveredCode) {
-                        ordExec.deliveredCode = codigosGuardados.join('  |  ');
-                    }
-                    ordExec.status = 'ERROR_API';
-                    ordExec.statusMessage = 'Pago verificado. Un operador completará la liberación de tu entrega en breve.';
-                    await ordExec.save();
                 }
             }
         }
@@ -6747,7 +6751,6 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
             query.status = statusFilter;
         }
 
-        // 🔒 PRIVACIDAD ESTRICTA: Cada trabajador solo recibe la Cola por Apartar pública + SUS propias órdenes
         if (!isOwner) {
             query.$or = [
                 {
