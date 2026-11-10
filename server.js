@@ -2102,13 +2102,13 @@ function extraerStringCodigoDeElementoCO(cEntry) {
     return '';
 }
 
-// 🏦 Guarda de forma atómica en el Stock Propio (internalCodeStock) de tu Bóveda cualquier código que llegue tarde de Central One
+// 🏦 Guarda de forma atómica en el Stock Propio (internalCodeStock) de la tarjeta correspondiente en tu Bóveda (o en el paquete) cualquier código que Central One libere después de una entrega manual o reembolso
 async function guardarCodigosRecuperadosEnStockInterno(ordenDB, listaObjetosCodigos = [], codigosPlanos = [], coOrderReference = '') {
     try {
         const settings = await StoreSettings.findOne({ key: 'main_settings' });
-        if (!settings || !Array.isArray(settings.arbitrageBaseCards)) return 0;
+        if (!settings) return 0;
+        if (!Array.isArray(settings.arbitrageBaseCards)) settings.arbitrageBaseCards = [];
 
-        // Reunir todos los códigos que ya estén guardados en la Bóveda para no duplicar jamás el mismo código
         const codigosExistentesEnBoveda = new Set();
         settings.arbitrageBaseCards.forEach(c => {
             (c.internalCodeStock || []).forEach(cod => {
@@ -2116,61 +2116,118 @@ async function guardarCodigosRecuperadosEnStockInterno(ordenDB, listaObjetosCodi
             });
         });
 
-        let guardadosCount = 0;
+        let guardadosEnBovedaCount = 0;
+        let guardadosEnPaqueteCount = 0;
         const detallesGuardados = [];
+        const codigosSinTarjetaBoveda = [];
 
-        if (Array.isArray(listaObjetosCodigos) && listaObjetosCodigos.length > 0) {
-            for (const itemCode of listaObjetosCodigos) {
-                // Emparejar por UUID, SKU, Nombre, Valor Facial (ej. 100000 / 75000) o Costo Unitario
-                const metaMatch = emparejarItemCentralOneConMetaKZ(
-                    {
-                        catalog_item_id: itemCode.catalogItemId || itemCode.centralOneProductId || '',
-                        sku: itemCode.sku || '',
-                        product_name: itemCode.name || '',
-                        unit_price: itemCode.unitCostUSD || 0
-                    },
-                    -1,
-                    [],
-                    settings.arbitrageBaseCards
-                );
+        // Detectar plataforma de la orden por si fue un paquete directo (ej. PlayStation $10 USD)
+        const textoOrdenLow = `${ordenDB?.productSlug || ''} ${ordenDB?.productName || ''} ${ordenDB?.algoExecutionState?.platformGroup || ''}`.toLowerCase();
+        const platOrden = textoOrdenLow.includes('playstation') || textoOrdenLow.includes('psn') ? 'playstation'
+            : (textoOrdenLow.includes('nintendo') || textoOrdenLow.includes('eshop') ? 'nintendo'
+            : (textoOrdenLow.includes('xbox') ? 'xbox'
+            : (textoOrdenLow.includes('league') || textoOrdenLow.includes('lol') || textoOrdenLow.includes('riot') ? 'lol'
+            : (textoOrdenLow.includes('steam') ? 'steam' : ''))));
 
-                const cPool = settings.arbitrageBaseCards.find(c =>
-                    (itemCode.cardId && c.cardId === itemCode.cardId) ||
-                    (metaMatch && metaMatch.cardId && c.cardId === metaMatch.cardId) ||
-                    (itemCode.catalogItemId && String(c.centralOneProductId || '').trim() === String(itemCode.catalogItemId).trim()) ||
-                    (itemCode.sku && String(c.centralOneSku || '').trim().toUpperCase() === String(itemCode.sku).trim().toUpperCase())
-                );
+        const itemsProcesar = Array.isArray(listaObjetosCodigos) && listaObjetosCodigos.length > 0
+            ? listaObjetosCodigos
+            : (Array.isArray(codigosPlanos) && codigosPlanos.length > 0
+                ? [{ cardId: '', catalogItemId: '', sku: ordenDB?.apiProductSku || '', name: ordenDB?.packageName || '', unitClientUSD: Number(ordenDB?.baseAmountUSD || 0), rawCodes: codigosPlanos }]
+                : []);
 
-                const listaCruda = Array.isArray(itemCode.rawCodes) && itemCode.rawCodes.length > 0
-                    ? itemCode.rawCodes
-                    : (Array.isArray(itemCode.codes) ? itemCode.codes : []);
+        for (const itemCode of itemsProcesar) {
+            const metaMatch = emparejarItemCentralOneConMetaKZ(
+                {
+                    catalog_item_id: itemCode.catalogItemId || itemCode.centralOneProductId || '',
+                    sku: itemCode.sku || '',
+                    product_name: itemCode.name || '',
+                    unit_price: itemCode.unitCostUSD || 0
+                },
+                -1,
+                ordenDB?.algoExecutionState?.orderedItemsMeta || [],
+                settings.arbitrageBaseCards
+            );
 
-                if (cPool && listaCruda.length > 0) {
+            // 1. Buscar tarjeta exacta en la Bóveda por cardId, UUID de Central One o SKU
+            let cPool = settings.arbitrageBaseCards.find(c =>
+                (itemCode.cardId && c.cardId === itemCode.cardId) ||
+                (metaMatch && metaMatch.cardId && c.cardId === metaMatch.cardId) ||
+                (itemCode.catalogItemId && String(c.centralOneProductId || '').trim() === String(itemCode.catalogItemId).trim()) ||
+                (itemCode.sku && String(c.centralOneSku || '').trim().toUpperCase() === String(itemCode.sku).trim().toUpperCase())
+            );
+
+            // 2. Si la orden se creó como producto directo pero tienes esa misma tarjeta en la Bóveda (misma plataforma y mismo valor en $ USD), vincularla a esa tarjeta de la Bóveda
+            if (!cPool && platOrden) {
+                const montoBuscado = Number(itemCode.unitClientUSD) || extraerNumeroFacialDeTextoServer(`${itemCode.name || ''} ${ordenDB?.packageName || ''}`);
+                if (montoBuscado > 0) {
+                    cPool = settings.arbitrageBaseCards.find(c =>
+                        String(c.platformGroup || '').toLowerCase() === platOrden &&
+                        (Math.abs(Number(c.effectiveClientUSD || 0) - montoBuscado) <= 0.35 || Math.abs(Number(c.faceValueOrigin || 0) - montoBuscado) <= 0.35)
+                    );
+                }
+            }
+
+            const listaCruda = Array.isArray(itemCode.rawCodes) && itemCode.rawCodes.length > 0
+                ? itemCode.rawCodes
+                : (Array.isArray(itemCode.codes) ? itemCode.codes : []);
+
+            for (const rawC of listaCruda) {
+                const limpio = rawC.includes('➔') ? rawC.split('➔').slice(1).join('➔').trim() : String(rawC || '').trim();
+                const clave = extraerCodigoCrudoDeTextoFormateado(limpio);
+                if (!limpio || !clave) continue;
+
+                if (cPool) {
                     if (!Array.isArray(cPool.internalCodeStock)) cPool.internalCodeStock = [];
-                    for (const rawC of listaCruda) {
-                        const limpio = rawC.includes('➔') ? rawC.split('➔').slice(1).join('➔').trim() : String(rawC || '').trim();
-                        const clave = extraerCodigoCrudoDeTextoFormateado(limpio);
-                        if (limpio && clave && !codigosExistentesEnBoveda.has(clave)) {
-                            cPool.internalCodeStock.push(limpio);
-                            codigosExistentesEnBoveda.add(clave);
-                            guardadosCount++;
-                            detallesGuardados.push(`${cPool.name}: ${limpio}`);
+                    if (!codigosExistentesEnBoveda.has(clave)) {
+                        cPool.internalCodeStock.push(limpio);
+                        codigosExistentesEnBoveda.add(clave);
+                        guardadosEnBovedaCount++;
+                        detallesGuardados.push(`${cPool.name}: ${limpio}`);
+                    }
+                } else {
+                    codigosSinTarjetaBoveda.push(limpio);
+                }
+            }
+        }
+
+        // 3. Si algún código era de un paquete individual que no está en la Bóveda del Algoritmo, guardarlo en la Bóveda de Pines (backupPinVault) de ese paquete
+        if (codigosSinTarjetaBoveda.length > 0 && ordenDB && ordenDB.productSlug) {
+            const prodDB = await CatalogProduct.findOne({ slug: ordenDB.productSlug });
+            if (prodDB) {
+                const usarAlt = Boolean(prodDB.useAltPricing && Array.isArray(prodDB.altPackages) && prodDB.altPackages.length > 0);
+                const listaPaq = usarAlt ? prodDB.altPackages : (prodDB.packages || []);
+                const pkg = listaPaq.find(p =>
+                    String(p.packageId || '').trim() === String(ordenDB.packageId || '').trim() ||
+                    String(p.name || '').trim().toLowerCase() === String(ordenDB.packageName || '').trim().toLowerCase()
+                );
+                if (pkg) {
+                    if (!Array.isArray(pkg.backupPinVault)) pkg.backupPinVault = [];
+                    for (const codSuelto of codigosSinTarjetaBoveda) {
+                        if (!pkg.backupPinVault.includes(codSuelto)) {
+                            pkg.backupPinVault.push(codSuelto);
+                            guardadosEnPaqueteCount++;
+                            detallesGuardados.push(`${prodDB.name} (${pkg.name}): ${codSuelto}`);
                         }
+                    }
+                    if (guardadosEnPaqueteCount > 0) {
+                        prodDB.markModified('packages');
+                        prodDB.markModified('altPackages');
+                        await prodDB.save();
                     }
                 }
             }
         }
 
-        if (guardadosCount > 0) {
+        const totalRecuperados = guardadosEnBovedaCount + guardadosEnPaqueteCount;
+        if (totalRecuperados > 0) {
             settings.markModified('arbitrageBaseCards');
             await registrarAlertaCentralOne(settings, {
                 type: 'BACK_IN_STOCK',
                 severity: 'OK',
-                title: `🏦 +${guardadosCount} código(s) recuperados automáticamente en tu Stock Propio (${coOrderReference || (ordenDB ? '#' + ordenDB.orderId : 'Central One')})`,
-                detail: `Central One liberó códigos retrasados y se guardaron en tu Bóveda listos para la próxima venta: ${detallesGuardados.join(' • ')}`
+                title: `🏦 +${totalRecuperados} código(s) guardados automáticamente en tu Stock Propio (${coOrderReference || (ordenDB ? '#' + ordenDB.orderId : 'Central One')})`,
+                detail: `Entregaste la orden manualmente (o fue reembolsada) y Central One terminó de liberar el código pendiente. Quedó guardado en tu stock listo para la próxima venta: ${detallesGuardados.join(' • ')}`
             });
 
-            // Guardado atómico directo en MongoDB para asegurar 100% persistencia
             await StoreSettings.collection.updateOne(
                 { key: 'main_settings' },
                 {
@@ -2180,8 +2237,12 @@ async function guardarCodigosRecuperadosEnStockInterno(ordenDB, listaObjetosCodi
                     }
                 }
             );
+
+            setImmediate(() => {
+                recalcularPreciosYAlgoritmoTiendaKZ().catch(() => {});
+            });
         }
-        return guardadosCount;
+        return totalRecuperados;
     } catch (e) {
         console.error('Aviso guardando en stock interno:', e.message);
         return 0;
@@ -6936,20 +6997,53 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
                 });
             }
 
-            // 2. Si el operador ingresó un código o confirmación manual, entregar de inmediato
+// 2. Si el operador ingresó un código o confirmación manual, entregar de inmediato al cliente y dejar vigilando el código pendiente de Central One para guardarlo en tu Stock Propio
             if (manualPinCode && manualPinCode.trim()) {
+                const habiaOrdenEnCentralOne = Boolean(
+                    orden.apiOrderId &&
+                    !orden.apiOrderId.startsWith('MANUAL-') &&
+                    !orden.apiOrderId.startsWith('VAULT-') &&
+                    !orden.apiOrderId.startsWith('INTERNAL-') &&
+                    !orden.apiOrderId.startsWith('API-')
+                );
+
                 orden.status = 'ENTREGADO';
                 orden.progressPercent = 100;
                 orden.deliveredCode = manualPinCode.trim();
-                orden.apiOrderId = orden.apiOrderId || ('MANUAL-STAFF-' + Date.now());
+                if (!orden.apiOrderId) {
+                    orden.apiOrderId = 'MANUAL-STAFF-' + Date.now();
+                }
                 if (workerNotes) orden.workerNotes = workerNotes.trim();
-                orden.statusMessage = orden.fulfillmentType === 'API_GIFT_CARD'
+                orden.statusMessage = orden.fulfillmentType === 'API_GIFT_CARD' || orden.isGiftCardPin
                     ? '¡Entrega completada! Cópiala aquí abajo.'
                     : '¡Pedido entregado con éxito! Verifica tu cuenta.';
                 orden.approvedByWorker = staffEmail;
                 orden.completedAt = new Date();
+
+                if (habiaOrdenEnCentralOne) {
+                    const stAlgo = orden.algoExecutionState || {};
+                    stAlgo.manuallyCompletedWhilePendingCO = true;
+                    stAlgo.coLateCodesRecovered = false;
+                    orden.algoExecutionState = stAlgo;
+                    orden.markModified('algoExecutionState');
+                }
+
                 await orden.save();
-                return res.json({ success: true, message: `Orden #${orden.orderId} completada manualmente.`, order: orden });
+
+                // Si Central One tenía este pedido en "Recibida", dejar el vigilante activo para que apenas Central One suelte el código se guarde en tu Stock Propio
+                if (habiaOrdenEnCentralOne) {
+                    const coIdVigilar = orden.apiOrderId.startsWith('kz-ord-') ? null : orden.apiOrderId;
+                    const idempVigilar = orden.apiOrderId.startsWith('kz-ord-') ? orden.apiOrderId : (orden.algoExecutionState?.pendingReplacementIdempKey || null);
+                    programarSeguimientoOrdenCentralOne(orden.orderId, coIdVigilar, idempVigilar, orden.algoExecutionState?.pendingReplacementBody || null);
+                }
+
+                return res.json({
+                    success: true,
+                    message: habiaOrdenEnCentralOne
+                        ? `Orden #${orden.orderId} entregada manualmente. Cuando Central One libere el código pendiente, se guardará automáticamente en tu Stock Propio.`
+                        : `Orden #${orden.orderId} completada manualmente.`,
+                    order: orden
+                });
             }
 
             // 3. Si la orden ya tenía todos sus códigos en algoExecutionState.deliveredCodesList, completarla de inmediato
