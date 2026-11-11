@@ -5702,7 +5702,130 @@ app.post('/api/orders/verify-player', async (req, res) => {
     }
 });
 
-// 2. Crear Orden en la Pestaña de Pago -> Pasa a la Pestaña de Entrega en Vivo (Optimizado en Paralelo ~20ms)
+// ⚡ CACHÉ ULTRARRÁPIDO EN RAM PARA CHECKOUT ("ENVIAR PAGO" EN ~50ms SIN LEER 10MB DE DISCO)
+let _ramFastSettings = null;
+let _ramFastSettingsTs = 0;
+let _ramFastPaymentMethods = null;
+let _ramFastPaymentMethodsTs = 0;
+let _ramFastProductsMap = new Map();
+let _ramFastProductsTs = 0;
+
+async function obtenerSettingsCheckoutRAM(forzar = false) {
+    const ahora = Date.now();
+    if (!forzar && _ramFastSettings && (ahora - _ramFastSettingsTs < 20000)) {
+        return _ramFastSettings;
+    }
+    const doc = await StoreSettings.collection.findOne(
+        { key: 'main_settings' },
+        {
+            projection: {
+                exchangeRateVES: 1,
+                bcvRateVES: 1,
+                tokemValueUSD: 1,
+                storeOpen: 1,
+                autoTriggerApiOnTokems: 1,
+                'flashOffers.slug': 1,
+                'flashOffers.pkgId': 1,
+                'flashOffers.linkedPackageId': 1,
+                'flashOffers.title': 1,
+                'flashOffers.usd': 1,
+                'flashOffers.oldUsd': 1,
+                'flashOffers.costUSD': 1,
+                'flashOffers.tokemsPrice': 1,
+                'flashOffers.apiProductSku': 1,
+                'flashOffers.centralOneProductId': 1,
+                'flashOffers.isGiftCardPin': 1,
+                'flashOffers.backupPinVault': 1,
+                'flashOffers.active': 1,
+                'flashOffers.expiresAt': 1,
+                arbitrageBaseCards: 1
+            }
+        }
+    );
+    if (doc) {
+        _ramFastSettings = doc;
+        _ramFastSettingsTs = ahora;
+    }
+    return _ramFastSettings;
+}
+
+async function obtenerMetodoPagoCheckoutRAM(paymentMethodKey) {
+    const ahora = Date.now();
+    if (!_ramFastPaymentMethods || (ahora - _ramFastPaymentMethodsTs > 30000)) {
+        const lista = await PaymentMethod.collection.find(
+            { active: true },
+            { projection: { methodKey: 1, name: 1, currency: 1, requiresReference: 1, refDigitsLength: 1, active: 1 } }
+        ).toArray();
+        _ramFastPaymentMethods = lista || [];
+        _ramFastPaymentMethodsTs = ahora;
+    }
+    const keyClean = String(paymentMethodKey || '').trim();
+    return _ramFastPaymentMethods.find(m => m.methodKey === keyClean) ||
+           (keyClean.startsWith('pago_movil') ? _ramFastPaymentMethods.find(m => m.methodKey === 'pago_movil') : null) ||
+           null;
+}
+
+async function obtenerProductoCheckoutRAM(slugBuscado) {
+    const slugClean = String(slugBuscado || '').trim().toLowerCase();
+    if (!slugClean) return null;
+    const ahora = Date.now();
+    if (_ramFastProductsMap.has(slugClean) && (ahora - _ramFastProductsTs < 20000)) {
+        return _ramFastProductsMap.get(slugClean);
+    }
+    const prods = await CatalogProduct.collection.find(
+        {},
+        {
+            projection: {
+                cardImageUrl: 0,
+                flyerImageUrl: 0,
+                infoImageUrl: 0,
+                'packages.imageUrl': 0,
+                'altPackages.imageUrl': 0,
+                'packages.targetSchemaCache': 0,
+                'altPackages.targetSchemaCache': 0
+            }
+        }
+    ).toArray();
+    const nuevoMapa = new Map();
+    (prods || []).forEach(p => {
+        if (p && p.slug) nuevoMapa.set(String(p.slug).trim().toLowerCase(), p);
+    });
+    _ramFastProductsMap = nuevoMapa;
+    _ramFastProductsTs = ahora;
+    return _ramFastProductsMap.get(slugClean) || null;
+}
+
+// Invalidar el caché en RAM automáticamente apenas el Dueño guarde cambios en Ajustes, Productos o Métodos de Pago
+app.use(['/api/admin/settings', '/api/admin/central-one/sync', '/api/admin/product/save', '/api/admin/product/delete', '/api/admin/payment-method/save', '/api/admin/payment-method/delete'], (req, res, next) => {
+    res.on('finish', () => {
+        _ramFastSettingsTs = 0;
+        _ramFastProductsTs = 0;
+        _ramFastPaymentMethodsTs = 0;
+    });
+    next();
+});
+
+// 🔒 Candado Server-Side para el botón "🎁 Código Manual (Sin API)"
+app.use('/api/worker/process-order', (req, res, next) => {
+    if (req.body && req.body.action === 'APROBAR' && req.body.forceManualNoApi === true) {
+        const codigoManual = String(req.body.manualPinCode || '').trim();
+        if (!codigoManual) {
+            return res.status(400).json({
+                error: 'Estás en Modo Entrega Manual (Sin API). Debes pegar o escribir el código antes de confirmar.'
+            });
+        }
+    }
+    next();
+});
+
+// Precargar el caché en RAM al arrancar el servidor
+setTimeout(() => {
+    obtenerSettingsCheckoutRAM(true).catch(() => {});
+    obtenerMetodoPagoCheckoutRAM('pago_movil').catch(() => {});
+    obtenerProductoCheckoutRAM('free-fire-id').catch(() => {});
+}, 2000);
+
+// 2. Crear Orden en la Pestaña de Pago -> Pasa a la Pestaña de Entrega en Vivo (Instantáneo desde RAM ~50ms)
 app.post('/api/orders/create', orderLimiter, verificarTokenOpcional, async (req, res) => {
     try {
         const {
@@ -5730,17 +5853,10 @@ app.post('/api/orders/create', orderLimiter, verificarTokenOpcional, async (req,
         const esOrdenProductoNormal = (orderType !== 'TOKEM_TOPUP' && slugBuscado && slugBuscado !== 'calculadora-steam' && slugBuscado !== 'tokems-kz');
         const hace48Horas = new Date(Date.now() - 48 * 60 * 60 * 1000);
 
-        // ⚡ CONSULTA PARALELA ULTRARRÁPIDA (Sin descargar imágenes Base64 ni cachés pesados)
+        // ⚡ CONSULTA EN PARALELO DESDE RAM + VERIFICACIÓN INDEXADA DE REFERENCIA (~40ms)
         const [settingsRaw, metodoPagoDB, ordenConMismaRef, productoDBPre] = await Promise.all([
-            StoreSettings.findOne({ key: 'main_settings' })
-                .select('exchangeRateVES bcvRateVES tokemValueUSD storeOpen autoTriggerApiOnTokems flashOffers arbitrageBaseCards')
-                .lean(),
-            PaymentMethod.findOne({
-                $or: [
-                    { methodKey: paymentMethodKey, active: true },
-                    ...(paymentMethodKey && String(paymentMethodKey).startsWith('pago_movil') ? [{ methodKey: 'pago_movil' }] : [])
-                ]
-            }).select('methodKey name currency requiresReference refDigitsLength active').lean(),
+            obtenerSettingsCheckoutRAM(false),
+            obtenerMetodoPagoCheckoutRAM(paymentMethodKey),
             (paymentMethodKey !== 'tokems_kz' && refLimpia.length >= 4)
                 ? Order.findOne({
                     paymentReference: refLimpia,
@@ -5749,8 +5865,10 @@ app.post('/api/orders/create', orderLimiter, verificarTokenOpcional, async (req,
                 }).select('orderId productName').lean()
                 : Promise.resolve(null),
             esOrdenProductoNormal
-                ? CatalogProduct.findOne({ slug: slugBuscado })
-                    .select('-cardImageUrl -flyerImageUrl -infoImageUrl -packages.imageUrl -altPackages.imageUrl -packages.targetSchemaCache -altPackages.targetSchemaCache')
+                ? (paymentMethodKey === 'tokems_kz'
+                    ? CatalogProduct.findOne({ slug: slugBuscado })
+                        .select('-cardImageUrl -flyerImageUrl -infoImageUrl -packages.imageUrl -altPackages.imageUrl -packages.targetSchemaCache -altPackages.targetSchemaCache')
+                    : obtenerProductoCheckoutRAM(slugBuscado))
                 : Promise.resolve(null)
         ]);
 
