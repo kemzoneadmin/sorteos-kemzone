@@ -3048,7 +3048,7 @@ function formatearCodigoConEtiquetaPlataforma(codeStr, amountUSD, platformGroup 
     return `Código ${montoComa}$ ➔ ${limpio}`;
 }
 
-// 🛡️ Candado de Servidor: Bloquea compras de paquetes que hayan quedado sin stock en Central One (y no tengan PINs propios)
+// 🛡️ Candado Ultrarrápido de Servidor (5ms): Bloquea compras de paquetes sin stock sin descargar imágenes Base64
 app.use(['/api/orders/create', '/api/binance-pay/create-checkout'], express.json(), async (req, res, next) => {
     try {
         const { orderType, productSlug, packageId, packageName } = req.body || {};
@@ -3056,7 +3056,9 @@ app.use(['/api/orders/create', '/api/binance-pay/create-checkout'], express.json
         if (!slugClean || orderType === 'TOKEM_TOPUP' || slugClean === 'tokems-kz' || slugClean === 'calculadora-steam') {
             return next();
         }
-        const prodDB = await CatalogProduct.findOne({ slug: slugClean }).lean();
+        const prodDB = await CatalogProduct.findOne({ slug: slugClean })
+            .select('slug active useAltPricing packages.packageId packages.name packages.inStock packages.providerInStock packages.backupPinVault altPackages.packageId altPackages.name altPackages.inStock altPackages.providerInStock altPackages.backupPinVault')
+            .lean();
         if (!prodDB) return next();
 
         const listaPaq = (prodDB.useAltPricing && Array.isArray(prodDB.altPackages) && prodDB.altPackages.length > 0)
@@ -3084,66 +3086,7 @@ app.use(['/api/orders/create', '/api/binance-pay/create-checkout'], express.json
     }
 });
 
-// Sincronizar estado de stock de paquetes al iniciar el servidor
-setTimeout(() => {
-    recalcularPreciosYAlgoritmoTiendaKZ().catch(() => {});
-}, 3500);
-
-// 🏷️ Formatea cualquier código (Steam, PlayStation, Nintendo, Xbox, Roblox) colocando arriba qué cantidad en $ da ese código
-function formatearCodigoConEtiquetaPlataforma(codeStr, amountUSD, platformGroup = 'steam', esSteam = true) {
-    const limpio = String(codeStr || '').trim();
-    if (!limpio) return '';
-    if (limpio.includes('➔') || limpio.toLowerCase().includes('steam wallet')) return limpio;
-    const num = Number(amountUSD) || 0;
-    if (num <= 0) return limpio;
-    const montoComa = num.toFixed(2).replace('.', ',');
-    const plat = String(platformGroup || '').toLowerCase();
-
-    if (esSteam || plat === 'steam') return `Steam Wallet ${montoComa}$ ➔ ${limpio}`;
-    if (plat === 'playstation' || plat === 'psn') return `PlayStation ${montoComa}$ ➔ ${limpio}`;
-    if (plat === 'nintendo' || plat === 'eshop') return `Nintendo eShop ${montoComa}$ ➔ ${limpio}`;
-    if (plat === 'xbox') return `Xbox ${montoComa}$ ➔ ${limpio}`;
-    if (plat === 'roblox') return `Roblox ${montoComa}$ ➔ ${limpio}`;
-    return `Código ${montoComa}$ ➔ ${limpio}`;
-}
-
-// 🛡️ Candado de Servidor: Bloquea compras de paquetes que hayan quedado sin stock en Central One (y no tengan PINs propios)
-app.use(['/api/orders/create', '/api/binance-pay/create-checkout'], express.json(), async (req, res, next) => {
-    try {
-        const { orderType, productSlug, packageId, packageName } = req.body || {};
-        const slugClean = String(productSlug || '').trim().toLowerCase();
-        if (!slugClean || orderType === 'TOKEM_TOPUP' || slugClean === 'tokems-kz' || slugClean === 'calculadora-steam') {
-            return next();
-        }
-        const prodDB = await CatalogProduct.findOne({ slug: slugClean }).lean();
-        if (!prodDB) return next();
-
-        const listaPaq = (prodDB.useAltPricing && Array.isArray(prodDB.altPackages) && prodDB.altPackages.length > 0)
-            ? prodDB.altPackages
-            : (prodDB.packages || []);
-        const idBuscado = String(packageId || '').trim();
-        const nomBuscado = String(packageName || '').trim().toLowerCase();
-
-        const pkg = listaPaq.find(p =>
-            String(p.packageId || p.id || '').trim() === idBuscado ||
-            (nomBuscado && String(p.name || '').trim().toLowerCase() === nomBuscado)
-        );
-
-        if (pkg) {
-            const tienePinesRespaldo = Array.isArray(pkg.backupPinVault) && pkg.backupPinVault.length > 0;
-            if (pkg.inStock === false || (pkg.providerInStock === false && !tienePinesRespaldo)) {
-                return res.status(400).json({
-                    error: `Por el momento el paquete "${pkg.name}" se encuentra agotado temporalmente. Por favor selecciona otro paquete disponible.`
-                });
-            }
-        }
-        next();
-    } catch (e) {
-        next();
-    }
-});
-
-// Sincronizar estado de stock de paquetes al iniciar el servidor
+// Sincronizar estado de stock de paquetes al iniciar el servidor (1 sola vez)
 setTimeout(() => {
     recalcularPreciosYAlgoritmoTiendaKZ().catch(() => {});
 }, 3500);
@@ -5762,7 +5705,7 @@ app.post('/api/orders/verify-player', async (req, res) => {
     }
 });
 
-// 2. Crear Orden en la Pestaña de Pago -> Pasa a la Pestaña de Entrega en Vivo
+// 2. Crear Orden en la Pestaña de Pago -> Pasa a la Pestaña de Entrega en Vivo (Optimizado en Paralelo ~20ms)
 app.post('/api/orders/create', orderLimiter, verificarTokenOpcional, async (req, res) => {
     try {
         const {
@@ -5784,26 +5727,47 @@ app.post('/api/orders/create', orderLimiter, verificarTokenOpcional, async (req,
             paymentReference
         } = req.body;
 
-        const settings = await StoreSettings.findOne({ key: 'main_settings' }) || { exchangeRateVES: 55.00, storeOpen: true, autoTriggerApiOnTokems: true };
-        if (!settings.storeOpen) {
+        const identificadorLimpio = (userEmail || deviceId || 'invitado').trim().toLowerCase();
+        const refLimpia = (paymentReference || '').trim().toUpperCase();
+        const slugBuscado = String(productSlug || '').trim().toLowerCase();
+        const esOrdenProductoNormal = (orderType !== 'TOKEM_TOPUP' && slugBuscado && slugBuscado !== 'calculadora-steam' && slugBuscado !== 'tokems-kz');
+        const hace48Horas = new Date(Date.now() - 48 * 60 * 60 * 1000);
+
+        // ⚡ CONSULTA PARALELA ULTRARRÁPIDA (Sin descargar imágenes Base64 ni cachés pesados)
+        const [settingsRaw, metodoPagoDB, ordenConMismaRef, productoDBPre] = await Promise.all([
+            StoreSettings.findOne({ key: 'main_settings' })
+                .select('exchangeRateVES bcvRateVES tokemValueUSD storeOpen autoTriggerApiOnTokems flashOffers arbitrageBaseCards')
+                .lean(),
+            PaymentMethod.findOne({
+                $or: [
+                    { methodKey: paymentMethodKey, active: true },
+                    ...(paymentMethodKey && String(paymentMethodKey).startsWith('pago_movil') ? [{ methodKey: 'pago_movil' }] : [])
+                ]
+            }).select('methodKey name currency requiresReference refDigitsLength active').lean(),
+            (paymentMethodKey !== 'tokems_kz' && refLimpia.length >= 4)
+                ? Order.findOne({
+                    paymentReference: refLimpia,
+                    fecha: { $gte: hace48Horas },
+                    status: { $ne: 'RECHAZADO' }
+                }).select('orderId productName').lean()
+                : Promise.resolve(null),
+            esOrdenProductoNormal
+                ? CatalogProduct.findOne({ slug: slugBuscado })
+                    .select('-cardImageUrl -flyerImageUrl -infoImageUrl -packages.imageUrl -altPackages.imageUrl -packages.targetSchemaCache -altPackages.targetSchemaCache')
+                : Promise.resolve(null)
+        ]);
+
+        const settings = settingsRaw || { exchangeRateVES: 1012.00, bcvRateVES: 889.25, tokemValueUSD: 1.00, storeOpen: true, autoTriggerApiOnTokems: true };
+        if (settings.storeOpen === false) {
             return res.status(403).json({ error: 'La tienda está en mantenimiento temporal. Intenta en unos minutos.' });
         }
 
-        let metodoPago = await PaymentMethod.findOne({ methodKey: paymentMethodKey, active: true });
-        if (!metodoPago && paymentMethodKey && paymentMethodKey.startsWith('pago_movil')) {
-            metodoPago = await PaymentMethod.findOne({ methodKey: 'pago_movil' });
-        }
-        if (!metodoPago) {
-            metodoPago = {
-                methodKey: paymentMethodKey || 'pago_movil',
-                name: paymentMethodNameCustom || 'Pago Verificable',
-                requiresReference: paymentMethodKey !== 'tokems_kz',
-                refDigitsLength: 6
-            };
-        }
-
-        const identificadorLimpio = (userEmail || deviceId || 'invitado').trim().toLowerCase();
-        const refLimpia = (paymentReference || '').trim().toUpperCase();
+        const metodoPago = metodoPagoDB || {
+            methodKey: paymentMethodKey || 'pago_movil',
+            name: paymentMethodNameCustom || 'Pago Verificable',
+            requiresReference: paymentMethodKey !== 'tokems_kz',
+            refDigitsLength: 6
+        };
 
         if (metodoPago.requiresReference && refLimpia.length < 4) {
             return res.status(400).json({ error: 'Debes ingresar los últimos dígitos de la referencia o ID de transacción.' });
@@ -5811,18 +5775,9 @@ app.post('/api/orders/create', orderLimiter, verificarTokenOpcional, async (req,
 
         let esRefDuplicada = false;
         let textoAlertaDuplicada = '';
-        if (metodoPago.requiresReference && refLimpia) {
-            const hace48Horas = new Date(Date.now() - 48 * 60 * 60 * 1000);
-            const ordenConMismaRef = await Order.findOne({
-                paymentReference: refLimpia,
-                fecha: { $gte: hace48Horas },
-                status: { $ne: 'RECHAZADO' }
-            }).lean();
-
-            if (ordenConMismaRef) {
-                esRefDuplicada = true;
-                textoAlertaDuplicada = `⚠️ ALERTA: La referencia "${refLimpia}" ya fue usada en la orden #${ordenConMismaRef.orderId} (${ordenConMismaRef.productName}). Verifica tu banco con cuidado.`;
-            }
+        if (metodoPago.requiresReference && ordenConMismaRef) {
+            esRefDuplicada = true;
+            textoAlertaDuplicada = `⚠️ ALERTA: La referencia "${refLimpia}" ya fue usada en la orden #${ordenConMismaRef.orderId} (${ordenConMismaRef.productName}). Verifica tu banco con cuidado.`;
         }
 
         let nombreProducto = '';
@@ -5837,9 +5792,8 @@ app.post('/api/orders/create', orderLimiter, verificarTokenOpcional, async (req,
         let apiProv = '';
         let apiSku = '';
         let esPinGiftCard = false;
-        let productoDB = null;
-
-let estadoAlgoritmoInicial = null;
+        let productoDB = productoDBPre;
+        let estadoAlgoritmoInicial = null;
 
         if (orderType === 'TOKEM_TOPUP') {
             const cantTokems = Math.max(1, Number(customTokemAmount) || 1);
@@ -5848,7 +5802,7 @@ let estadoAlgoritmoInicial = null;
             fulfillment = 'TOKEM_WALLET_CREDIT';
             baseUSD = Number((cantTokems * (settings.tokemValueUSD || 1)).toFixed(2));
             costoEnTokems = cantTokems;
-} else if (String(productSlug || '').trim().toLowerCase() === 'calculadora-steam') {
+        } else if (slugBuscado === 'calculadora-steam') {
             const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
             const round4 = (n) => Math.round((Number(n) + Number.EPSILON) * 10000) / 10000;
             const ceil2  = (n) => Math.ceil(round4(n) * 100 - 1e-6) / 100;
@@ -5866,7 +5820,6 @@ let estadoAlgoritmoInicial = null;
                 })
                 .filter(g => g.usdR > 0);
 
-            // Soporte para "Repetir Compra" desde Mi Cuenta cuando no viene customSteamCalcData en vivo
             if (validGames.length === 0 && req.body.packageName) {
                 const pkgTxt = String(req.body.packageName || '');
                 const parteJuegos = pkgTxt.split('➔')[0] || pkgTxt;
@@ -5898,14 +5851,16 @@ let estadoAlgoritmoInicial = null;
             }
 
             if (validGames.length === 0) {
-return res.status(400).json({ error: 'Debes ingresar al menos un juego con precio válido en la Calculadora de Steam.' });
+                return res.status(400).json({ error: 'Debes ingresar al menos un juego con precio válido en la Calculadora de Steam.' });
             }
 
             const totalPriceUsd = round2(validGames.reduce((a, it) => a + it.usdR, 0));
+            const catalogCacheUsar = _ramCentralOneCatalogCache.length > 0 ? _ramCentralOneCatalogCache : null;
+
             const planTarjetas = calcularCombinacionListaJuegosSeparadosSteam(
                 validGames,
                 settings.arbitrageBaseCards || [],
-                settings.centralOneCatalogCache || null
+                catalogCacheUsar
             );
 
             if (!planTarjetas || !planTarjetas.hasSolution) {
@@ -5922,7 +5877,7 @@ return res.status(400).json({ error: 'Debes ingresar al menos un juego con preci
                         it.usdR,
                         'steam',
                         settings.arbitrageBaseCards || [],
-                        settings.centralOneCatalogCache || null
+                        catalogCacheUsar
                     );
                 const costoIndiv = (planIndiv && planIndiv.hasSolution) ? Number(planIndiv.totalCostUSD) : it.usdR;
                 const difIndiv = Math.max(0, round4(costoIndiv - it.usdR));
@@ -5975,8 +5930,6 @@ return res.status(400).json({ error: 'Debes ingresar al menos un juego con preci
                 save: async () => {}
             };
         } else {
-            const slugBuscado = String(productSlug || '').trim().toLowerCase();
-            productoDB = await CatalogProduct.findOne({ slug: slugBuscado });
             if (!productoDB) return res.status(404).json({ error: 'Producto no encontrado.' });
 
             if (productoDB.active === false) {
@@ -5997,22 +5950,16 @@ return res.status(400).json({ error: 'Debes ingresar al menos un juego con preci
                 (nombrePkgBuscado && String(p.name || '').trim().toLowerCase() === nombrePkgBuscado)
             );
 
-const ofertaMatch = (settings.flashOffers || []).find(of =>
+            const ofertaMatch = (settings.flashOffers || []).find(of =>
                 String(of.slug || '').trim().toLowerCase() === slugBuscado &&
                 (String(of.pkgId || '').trim() === idPkgBuscado ||
+                 String(of.linkedPackageId || '').trim() === idPkgBuscado ||
                  (nombrePkgBuscado && String(of.title || '').trim().toLowerCase() === nombrePkgBuscado))
             );
 
             if (ofertaMatch) {
                 const vencioPorTiempo = Boolean(ofertaMatch.expiresAt && new Date(ofertaMatch.expiresAt).getTime() <= Date.now());
                 const estaActivaOferta = ofertaMatch.active !== false && !vencioPorTiempo;
-
-                // Si venció por tiempo, la apaga permanentemente en MongoDB en segundo plano
-                if (vencioPorTiempo && ofertaMatch.active !== false && typeof settings.save === 'function') {
-                    ofertaMatch.active = false;
-                    settings.markModified('flashOffers');
-                    settings.save().catch(() => {});
-                }
 
                 if (!estaActivaOferta) {
                     if (!pkg) {
@@ -6021,17 +5968,27 @@ const ofertaMatch = (settings.flashOffers || []).find(of =>
                         });
                     }
                 } else {
+                    if (!pkg && ofertaMatch.linkedPackageId) {
+                        pkg = listaPaquetesActiva.find(p => String(p.packageId || p.id || '').trim() === String(ofertaMatch.linkedPackageId).trim());
+                    }
+                    const bovedaOferta = Array.isArray(ofertaMatch.backupPinVault) && ofertaMatch.backupPinVault.length > 0
+                        ? ofertaMatch.backupPinVault
+                        : (pkg && Array.isArray(pkg.backupPinVault) ? pkg.backupPinVault : []);
+
                     pkg = {
-                        packageId: ofertaMatch.pkgId || idPkgBuscado,
-                        name: ofertaMatch.title,
+                        ...(pkg ? (pkg.toObject ? pkg.toObject() : pkg) : {}),
+                        packageId: (pkg && pkg.packageId) || ofertaMatch.linkedPackageId || ofertaMatch.pkgId || idPkgBuscado,
+                        name: ofertaMatch.title || (pkg ? pkg.name : 'Paquete en Oferta'),
                         priceUSD: Number(ofertaMatch.usd),
                         costUSD: Number(ofertaMatch.costUSD || (pkg ? pkg.costUSD : 0) || 0),
                         tokemsPrice: Number(ofertaMatch.tokemsPrice || ofertaMatch.usd),
-                        apiProviderName: (pkg && pkg.apiProviderName) || 'DEFAULT_API',
+                        apiProviderName: (pkg && pkg.apiProviderName) || 'CENTRAL_ONE',
                         apiProductSku: ofertaMatch.apiProductSku || (pkg ? pkg.apiProductSku : '') || ofertaMatch.pkgId,
                         centralOneProductId: ofertaMatch.centralOneProductId || (pkg ? pkg.centralOneProductId : '') || '',
+                        useSmartAlgorithm: Boolean((pkg && pkg.useSmartAlgorithm) || productoDB.isSmartCodeProduct),
+                        targetClientUSD: Number((pkg && pkg.targetClientUSD) || 0),
                         isGiftCardPin: ofertaMatch.isGiftCardPin !== undefined ? Boolean(ofertaMatch.isGiftCardPin) : Boolean(pkg && pkg.isGiftCardPin),
-                        backupPinVault: Array.isArray(ofertaMatch.backupPinVault) ? ofertaMatch.backupPinVault : [],
+                        backupPinVault: bovedaOferta,
                         inStock: true
                     };
                 }
@@ -6112,7 +6069,7 @@ const ofertaMatch = (settings.flashOffers || []).find(of =>
             }
             pagadoConTokems = true;
 
-            await new Transaction({
+            new Transaction({
                 deviceId: identificadorLimpio,
                 tipo: 'Recarga_Tienda',
                 tokens: -costoEnTokems,
@@ -6122,7 +6079,7 @@ const ofertaMatch = (settings.flashOffers || []).find(of =>
             }).save().catch(() => {});
         }
 
-const orderId = 'KZ-' + crypto.randomInt(100000, 999999).toString();
+        const orderId = 'KZ-' + crypto.randomInt(100000, 999999).toString();
 
         let uidDestinoFinal = (playerUid || '').trim();
         if (!uidDestinoFinal) {
@@ -6144,7 +6101,6 @@ const orderId = 'KZ-' + crypto.randomInt(100000, 999999).toString();
         let mensajeInicialOrden = 'Tu orden está en proceso. Un operador está verificando tu referencia de pago...';
 
         if (esFueraDeHorarioVzla) {
-            // 11:00 AM en Venezuela equivale a las 15:00:00 UTC
             let proxima11amUtcMs = Date.UTC(
                 fechaVzla.getUTCFullYear(),
                 fechaVzla.getUTCMonth(),
@@ -6205,7 +6161,7 @@ const orderId = 'KZ-' + crypto.randomInt(100000, 999999).toString();
             ...(estadoAlgoritmoInicial ? { algoExecutionState: estadoAlgoritmoInicial } : {})
         });
 
-if (pagadoConTokems && settings.autoTriggerApiOnTokems && fulfillment !== 'MANUAL_INTERNAL') {
+        if (pagadoConTokems && settings.autoTriggerApiOnTokems !== false && fulfillment !== 'MANUAL_INTERNAL') {
             const apiRes = await ejecutarEntregaPorAPI(nuevaOrden, productoDB);
             if (apiRes.success) {
                 if (apiRes.isProcessingAsync) {
@@ -6721,90 +6677,94 @@ app.post('/api/tickets/cleanup', verificarTrabajadorOAdmin, async (req, res) => 
 // 👷 DASHBOARD 2: ENDPOINTS PARA TRABAJADORES / OPERADORES
 // =================================================================
 
-// 1. Cola de órdenes, tickets y lista de operadores en tiempo real (Sincronizado en vivo con estado "Recibida" de Central One)
+// 1. Cola de órdenes, tickets y lista de operadores en tiempo real (Respuesta instantánea ~20ms + Sincronización Central One en 2do plano)
+let _lastWorkerQueueCoSyncMs = 0;
+
 app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     try {
         const { statusFilter } = req.query;
         const workerEmail = (req.staffUser.email || '').trim().toLowerCase();
         const isOwner = req.effectiveRole === 'admin';
 
-        // 🔄 Verificar en vivo cualquier orden que esté en EJECUTANDO_API ("Recibida" en Central One)
-        const enEjecucion = await Order.find({ status: 'EJECUTANDO_API' }).limit(15);
-        if (enEjecucion.length > 0) {
-            const headersCO = obtenerHeadersCentralOne();
-            const settingsDoc = await StoreSettings.findOne({ key: 'main_settings' }).select('arbitrageBaseCards').lean();
-            const poolCards = settingsDoc ? (settingsDoc.arbitrageBaseCards || []) : [];
+        // 🔄 Verificar en segundo plano (sin frenar la respuesta) cualquier orden que esté en EJECUTANDO_API ("Recibida" en Central One)
+        if (Date.now() - _lastWorkerQueueCoSyncMs > 10000) {
+            _lastWorkerQueueCoSyncMs = Date.now();
+            setImmediate(async () => {
+                try {
+                    const enEjecucion = await Order.find({ status: 'EJECUTANDO_API' }).limit(10);
+                    if (enEjecucion.length === 0) return;
 
-            for (const ordExec of enEjecucion) {
-                if (activeOrderProcessingLocks.has(ordExec.orderId)) continue;
-                const algoSt = ordExec.algoExecutionState || null;
-                const codigosGuardados = (algoSt && Array.isArray(algoSt.deliveredCodesList)) ? algoSt.deliveredCodesList : [];
+                    const headersCO = obtenerHeadersCentralOne();
+                    const settingsDoc = await StoreSettings.findOne({ key: 'main_settings' }).select('arbitrageBaseCards').lean();
+                    const poolCards = settingsDoc ? (settingsDoc.arbitrageBaseCards || []) : [];
 
-                if (ordExec.deliveredCode || (algoSt && Number(algoSt.totalCardsExpected) > 0 && codigosGuardados.length >= Number(algoSt.totalCardsExpected))) {
-                    ordExec.status = 'ENTREGADO';
-                    ordExec.progressPercent = 100;
-                    if (!ordExec.deliveredCode && codigosGuardados.length > 0) {
-                        ordExec.deliveredCode = codigosGuardados.join('  |  ');
-                    }
-                    ordExec.statusMessage = '¡Tu pedido ha sido entregado automáticamente con éxito!';
-                    ordExec.completedAt = ordExec.completedAt || new Date();
-                    await ordExec.save();
-                    continue;
-                }
+                    for (const ordExec of enEjecucion) {
+                        if (activeOrderProcessingLocks.has(ordExec.orderId)) continue;
+                        const algoSt = ordExec.algoExecutionState || null;
+                        const codigosGuardados = (algoSt && Array.isArray(algoSt.deliveredCodesList)) ? algoSt.deliveredCodesList : [];
 
-                // Consultar el estado real en Central One
-                if (headersCO && ordExec.apiOrderId && !ordExec.apiOrderId.startsWith('VAULT-') && !ordExec.apiOrderId.startsWith('INTERNAL-') && !ordExec.apiOrderId.startsWith('API-') && !ordExec.apiOrderId.startsWith('kz-ord-')) {
-                    try {
-                        const esSteamOrd = String(ordExec.productSlug || '').toLowerCase().includes('steam') || String(algoSt?.platformGroup || '').toLowerCase() === 'steam';
-                        const check = await verificarYExtraerEntregaCentralOne(ordExec.apiOrderId, headersCO, poolCards, esSteamOrd, 0, algoSt);
-
-                        if (check.state === 'COMPLETED') {
-                            const vistosRaw = new Set(codigosGuardados.map(extraerCodigoCrudoDeTextoFormateado));
-                            const todos = [...codigosGuardados];
-                            for (const cNuevo of (check.codigosPlanos || [])) {
-                                const rk = extraerCodigoCrudoDeTextoFormateado(cNuevo);
-                                if (rk && !vistosRaw.has(rk)) {
-                                    vistosRaw.add(rk);
-                                    todos.push(cNuevo);
-                                }
-                            }
+                        if (ordExec.deliveredCode || (algoSt && Number(algoSt.totalCardsExpected) > 0 && codigosGuardados.length >= Number(algoSt.totalCardsExpected))) {
                             ordExec.status = 'ENTREGADO';
                             ordExec.progressPercent = 100;
-                            ordExec.deliveredCode = todos.length > 0 ? todos.join('  |  ') : check.deliveredCode;
-                            ordExec.statusMessage = '¡Tu pedido ha sido entregado automáticamente con éxito!';
-                            ordExec.completedAt = new Date();
-                            if (algoSt) {
-                                algoSt.deliveredCodesList = todos;
-                                algoSt.deliveredCardsCount = todos.length;
-                                ordExec.algoExecutionState = algoSt;
-                                ordExec.markModified('algoExecutionState');
+                            if (!ordExec.deliveredCode && codigosGuardados.length > 0) {
+                                ordExec.deliveredCode = codigosGuardados.join('  |  ');
                             }
+                            ordExec.statusMessage = '¡Tu pedido ha sido entregado automáticamente con éxito!';
+                            ordExec.completedAt = ordExec.completedAt || new Date();
                             await ordExec.save();
                             continue;
-                        } else if (check.state === 'PROCESSING') {
-                            // ⏳ Sigue "Recibida" en Central One con saldo retenido: mantenerla en EJECUTANDO_API y asegurar que el vigilante siga activo
-                            if (!activeCentralOnePollers.has(ordExec.orderId)) {
-                                programarSeguimientoOrdenCentralOne(ordExec.orderId, ordExec.apiOrderId);
-                            }
-                            continue;
-                        } else if (check.state === 'FAILED' || check.state === 'PARTIAL_REFUNDED') {
-                            if (algoSt && algoSt.isAlgorithmOrder) {
-                                if (!activeCentralOnePollers.has(ordExec.orderId)) {
-                                    programarSeguimientoOrdenCentralOne(ordExec.orderId, ordExec.apiOrderId);
-                                }
-                            } else {
-                                // Si era una recarga directa 1 a 1 y Central One la rechazó/reembolsó definitivamente, ahora sí pasa a ERROR_API para permitir reintento
-                                ordExec.status = 'ERROR_API';
-                                ordExec.statusMessage = 'Pago verificado. El proveedor reportó una demora en el servidor del juego; un operador reintentará tu entrega.';
-                                ordExec.workerNotes = `⚠️ Central One reembolsó/canceló el intento (${check.failureCode || 'fallo'}): ${check.errorMsg || 'Puedes reintentar el envío.'}`;
-                                ordExec.apiOrderId = '';
-                                await ordExec.save();
-                            }
-                            continue;
                         }
-                    } catch (eCheck) {}
-                }
-            }
+
+                        if (headersCO && ordExec.apiOrderId && !ordExec.apiOrderId.startsWith('VAULT-') && !ordExec.apiOrderId.startsWith('INTERNAL-') && !ordExec.apiOrderId.startsWith('API-') && !ordExec.apiOrderId.startsWith('kz-ord-')) {
+                            try {
+                                const esSteamOrd = String(ordExec.productSlug || '').toLowerCase().includes('steam') || String(algoSt?.platformGroup || '').toLowerCase() === 'steam';
+                                const check = await verificarYExtraerEntregaCentralOne(ordExec.apiOrderId, headersCO, poolCards, esSteamOrd, 0, algoSt);
+
+                                if (check.state === 'COMPLETED') {
+                                    const vistosRaw = new Set(codigosGuardados.map(extraerCodigoCrudoDeTextoFormateado));
+                                    const todos = [...codigosGuardados];
+                                    for (const cNuevo of (check.codigosPlanos || [])) {
+                                        const rk = extraerCodigoCrudoDeTextoFormateado(cNuevo);
+                                        if (rk && !vistosRaw.has(rk)) {
+                                            vistosRaw.add(rk);
+                                            todos.push(cNuevo);
+                                        }
+                                    }
+                                    ordExec.status = 'ENTREGADO';
+                                    ordExec.progressPercent = 100;
+                                    ordExec.deliveredCode = todos.length > 0 ? todos.join('  |  ') : check.deliveredCode;
+                                    ordExec.statusMessage = '¡Tu pedido ha sido entregado automáticamente con éxito!';
+                                    ordExec.completedAt = new Date();
+                                    if (algoSt) {
+                                        algoSt.deliveredCodesList = todos;
+                                        algoSt.deliveredCardsCount = todos.length;
+                                        ordExec.algoExecutionState = algoSt;
+                                        ordExec.markModified('algoExecutionState');
+                                    }
+                                    await ordExec.save();
+                                } else if (check.state === 'PROCESSING') {
+                                    if (!activeCentralOnePollers.has(ordExec.orderId)) {
+                                        programarSeguimientoOrdenCentralOne(ordExec.orderId, ordExec.apiOrderId);
+                                    }
+                                } else if (check.state === 'FAILED' || check.state === 'PARTIAL_REFUNDED') {
+                                    if (algoSt && algoSt.isAlgorithmOrder) {
+                                        if (!activeCentralOnePollers.has(ordExec.orderId)) {
+                                            programarSeguimientoOrdenCentralOne(ordExec.orderId, ordExec.apiOrderId);
+                                        }
+                                    } else {
+                                        ordExec.status = 'ERROR_API';
+                                        ordExec.statusMessage = 'Pago verificado. El proveedor reportó una demora en el servidor del juego; un operador reintentará tu entrega.';
+                                        ordExec.workerNotes = `⚠️ Central One reembolsó/canceló el intento (${check.failureCode || 'fallo'}): ${check.errorMsg || 'Puedes reintentar el envío.'}`;
+                                        ordExec.apiOrderId = '';
+                                        await ordExec.save();
+                                    }
+                                }
+                            } catch (eCheck) {}
+                        }
+                    }
+                } catch (eBg) {}
+            });
         }
 
         const query = {};
@@ -6825,7 +6785,7 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
         }
 
         const [orders, ticketsAbiertos, pendientesSinApartarCount, workersList] = await Promise.all([
-            Order.find(query).sort({ fecha: -1 }).limit(250).select('-costUSD').lean(),
+            Order.find(query).sort({ fecha: -1 }).limit(250).select('-costUSD -apiRawResponse').lean(),
             SupportTicket.find(
                 isOwner
                     ? {}
@@ -6835,7 +6795,7 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
                             { assignedWorker: workerEmail }
                         ]
                     }
-            ).sort({ updatedAt: -1 }).limit(120).lean(),
+            ).sort({ updatedAt: -1 }).limit(100).lean(),
             Order.countDocuments({
                 status: 'EN_PROCESO',
                 $or: [{ claimedByWorker: '' }, { claimedByWorker: null }, { claimedByWorker: { $exists: false } }]
@@ -7273,6 +7233,40 @@ app.post('/api/worker/delete-order', verificarSoloAdmin, async (req, res) => {
 
 app.get('/api/admin/overview', verificarSoloAdmin, async (req, res) => {
     try {
+        // ⚡ MODO SÓLO CATÁLOGO CENTRAL ONE (5ms desde RAM: evita volver a descargar órdenes e imágenes Base64)
+        if (req.query.catalogOnly === '1') {
+            const stExtra = await StoreSettings.findOne({ key: 'main_settings' })
+                .select('centralOneCatalogCache centralOneAlerts centralOneSync flyersCanvaConfig')
+                .lean();
+            const fuenteCatCO = Array.isArray(_ramCentralOneCatalogCache) && _ramCentralOneCatalogCache.length > 0
+                ? _ramCentralOneCatalogCache
+                : (stExtra?.centralOneCatalogCache || []);
+
+            return res.json({
+                success: true,
+                catalogOnly: true,
+                settings: {
+                    centralOneCatalogCache: fuenteCatCO.map(c => ({
+                        product_id: c.product_id,
+                        sku: c.sku,
+                        name: c.name,
+                        reseller_price: c.reseller_price,
+                        in_stock: c.in_stock,
+                        status: c.status,
+                        available_stock: c.available_stock,
+                        product_family_name: c.product_family_name,
+                        requires_target: c.requires_target,
+                        target_fields: c.target_fields,
+                        region: c.region || c.country || '',
+                        target_schema: c.target_schema || null
+                    })),
+                    centralOneAlerts: stExtra?.centralOneAlerts || [],
+                    centralOneSync: stExtra?.centralOneSync || null,
+                    flyersCanvaConfig: stExtra?.flyersCanvaConfig || null
+                }
+            });
+        }
+
         const isFastMode = req.query.fast === '1' || req.query.lite === '1';
 
         // Sincronizado con zona horaria de Venezuela (UTC-4) para que no reinicie a las 8:00 PM
@@ -7333,7 +7327,6 @@ app.get('/api/admin/overview', verificarSoloAdmin, async (req, res) => {
         if (isFastMode) {
             delete settings.centralOneCatalogCache;
             delete settings.flyersCanvaConfig;
-            // Aligerar posibles Base64 pesados dentro de settings en modo rápido
             if (settings.heroConfig && settings.heroConfig.mascotUrl && settings.heroConfig.mascotUrl.startsWith('data:')) {
                 delete settings.heroConfig.mascotUrl;
             }
