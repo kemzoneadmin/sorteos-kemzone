@@ -7339,13 +7339,12 @@ app.get('/api/admin/overview', verificarSoloAdmin, async (req, res) => {
         const hoyInicio = new Date(Date.UTC(ahoraVzla.getUTCFullYear(), ahoraVzla.getUTCMonth(), ahoraVzla.getUTCDate(), 4, 0, 0, 0));
         const mesInicio = new Date(Date.UTC(ahoraVzla.getUTCFullYear(), ahoraVzla.getUTCMonth(), 1, 4, 0, 0, 0));
 
-        const projectionSettings = isFastMode
+const projectionSettings = isFastMode
             ? '-centralOneCatalogCache -centralOneCoverageCache -processedWebhookIds -flyersCanvaConfig'
             : '-centralOneCoverageCache -processedWebhookIds';
 
-        const projectionProducts = isFastMode
-            ? '-cardImageUrl -flyerImageUrl -infoImageUrl -packages.imageUrl -altPackages.imageUrl -packages.targetSchemaCache -altPackages.targetSchemaCache'
-            : '-packages.targetSchemaCache -altPackages.targetSchemaCache';
+        // Conserva siempre las imágenes reales de productos y paquetes desde MongoDB para que jamás se pierdan ni mezclen al editar
+        const projectionProducts = '-packages.targetSchemaCache -altPackages.targetSchemaCache';
 
         const [
             settingsRaw,
