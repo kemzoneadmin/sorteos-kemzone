@@ -7490,7 +7490,7 @@ const projectionSettings = isFastMode
     }
 });
 
-// 2. Modificar Tasa Bs/USD, Portada, Pool de Tarjetas Base del Algoritmo y Configuración General
+// 2. Modificar Tasa Bs/USD, Portada, Pool de Tarjetas Base del Algoritmo y Configuración General (Guardado Atómico 5ms)
 app.post('/api/admin/settings', verificarSoloAdmin, async (req, res) => {
     try {
         const {
@@ -7511,12 +7511,46 @@ app.post('/api/admin/settings', verificarSoloAdmin, async (req, res) => {
             arbitrageBaseCards
         } = req.body;
 
-        const requiereRecalculoAlgoritmo = Array.isArray(arbitrageBaseCards);
+        const camposSet = {
+            updatedBy: req.adminUser.email,
+            updatedAt: new Date()
+        };
 
-        // Si se envió la Bóveda de Tarjetas Base, normalizar cada tarjeta (respetando cuando internalCodeStock queda vacío []) y guardarla directo en MongoDB en 5ms
-        let poolNormalizado = null;
-        if (requiereRecalculoAlgoritmo) {
-            poolNormalizado = arbitrageBaseCards.map((c, idx) => ({
+        if (exchangeRateVES !== undefined) camposSet.exchangeRateVES = Number(exchangeRateVES);
+        if (bcvRateVES !== undefined) camposSet.bcvRateVES = Number(bcvRateVES);
+        if (tokemValueUSD !== undefined) camposSet.tokemValueUSD = Number(tokemValueUSD);
+        if (typeof storeOpen === 'boolean') camposSet.storeOpen = storeOpen;
+        if (typeof autoTriggerApiOnTokems === 'boolean') camposSet.autoTriggerApiOnTokems = autoTriggerApiOnTokems;
+        if (announcementText !== undefined) camposSet.announcementText = String(announcementText);
+        if (typeof hideAnnouncement === 'boolean') camposSet.hideAnnouncement = hideAnnouncement;
+        if (heroConfig && typeof heroConfig === 'object') camposSet.heroConfig = heroConfig;
+        if (flashSectionConfig && typeof flashSectionConfig === 'object') camposSet.flashSectionConfig = flashSectionConfig;
+
+        if (Array.isArray(flashOffers)) {
+            camposSet.flashOffers = flashOffers.map(of => ({
+                ...of,
+                slug: String(of.slug || '').trim(),
+                linkedPackageId: String(of.linkedPackageId || '').trim(),
+                pkgId: String(of.pkgId || of.linkedPackageId || '').trim(),
+                oldUsd: Number(of.oldUsd || 0),
+                usd: Number(of.usd || 0),
+                costUSD: Number(of.costUSD || 0),
+                profitUSD: Number(of.profitUSD || 0),
+                tokemsPrice: Number(of.tokemsPrice ?? of.usd ?? 0),
+                expiresAt: of.expiresAt ? new Date(of.expiresAt) : null,
+                active: of.active !== false,
+                isGiftCardPin: Boolean(of.isGiftCardPin),
+                backupPinVault: Array.isArray(of.backupPinVault) ? of.backupPinVault : []
+            }));
+        }
+
+        if (catalogSectionConfig && typeof catalogSectionConfig === 'object') camposSet.catalogSectionConfig = catalogSectionConfig;
+        if (navigationConfig && typeof navigationConfig === 'object') camposSet.navigationConfig = navigationConfig;
+        if (flyersCanvaConfig && typeof flyersCanvaConfig === 'object') camposSet.flyersCanvaConfig = flyersCanvaConfig;
+        if (steamCalculatorConfig && typeof steamCalculatorConfig === 'object') camposSet.steamCalculatorConfig = steamCalculatorConfig;
+
+        if (Array.isArray(arbitrageBaseCards)) {
+            camposSet.arbitrageBaseCards = arbitrageBaseCards.map((c, idx) => ({
                 cardId: String(c.cardId || ('arb_' + idx)),
                 platformGroup: String(c.platformGroup || 'steam').toLowerCase(),
                 name: String(c.name || `Tarjeta Base #${idx + 1}`).trim(),
@@ -7536,88 +7570,28 @@ app.post('/api/admin/settings', verificarSoloAdmin, async (req, res) => {
                 active: c.active !== false,
                 lastPriceUpdateAt: c.lastPriceUpdateAt ? new Date(c.lastPriceUpdateAt) : new Date()
             }));
-
-            // Guardado atómico directo en la colección para que jamás falle por VersionError ni re-suba el caché gigante de Central One
-            await StoreSettings.collection.updateOne(
-                { key: 'main_settings' },
-                {
-                    $set: {
-                        arbitrageBaseCards: poolNormalizado,
-                        updatedBy: req.adminUser.email,
-                        updatedAt: new Date()
-                    }
-                }
-            );
         }
 
-        let settings = await StoreSettings.findOne({ key: 'main_settings' })
-            .select('-centralOneCatalogCache -centralOneCoverageCache -processedWebhookIds');
-        if (!settings) settings = new StoreSettings({ key: 'main_settings' });
+        // Guardado atómico directo en MongoDB (Evita errores de versión o exclusión de Mongoose)
+        await StoreSettings.collection.updateOne(
+            { key: 'main_settings' },
+            { $set: camposSet },
+            { upsert: true }
+        );
 
-        let huboOtrosCambios = false;
-        if (exchangeRateVES !== undefined) { settings.exchangeRateVES = Number(exchangeRateVES); huboOtrosCambios = true; }
-        if (bcvRateVES !== undefined) { settings.bcvRateVES = Number(bcvRateVES); huboOtrosCambios = true; }
-        if (tokemValueUSD !== undefined) { settings.tokemValueUSD = Number(tokemValueUSD); huboOtrosCambios = true; }
-        if (typeof storeOpen === 'boolean') { settings.storeOpen = storeOpen; huboOtrosCambios = true; }
-        if (typeof autoTriggerApiOnTokems === 'boolean') { settings.autoTriggerApiOnTokems = autoTriggerApiOnTokems; huboOtrosCambios = true; }
-        if (announcementText !== undefined) { settings.announcementText = announcementText; huboOtrosCambios = true; }
-        if (typeof hideAnnouncement === 'boolean') { settings.hideAnnouncement = hideAnnouncement; huboOtrosCambios = true; }
-        if (heroConfig && typeof heroConfig === 'object') { settings.heroConfig = heroConfig; huboOtrosCambios = true; }
-        if (flashSectionConfig && typeof flashSectionConfig === 'object') {
-            settings.flashSectionConfig = flashSectionConfig;
-            settings.markModified('flashSectionConfig');
-            huboOtrosCambios = true;
-        }
-        if (Array.isArray(flashOffers)) {
-            settings.flashOffers = flashOffers;
-            settings.markModified('flashOffers');
-            huboOtrosCambios = true;
-        }
-        if (catalogSectionConfig && typeof catalogSectionConfig === 'object') {
-            settings.catalogSectionConfig = catalogSectionConfig;
-            settings.markModified('catalogSectionConfig');
-            huboOtrosCambios = true;
-        }
-        if (navigationConfig && typeof navigationConfig === 'object') {
-            settings.navigationConfig = navigationConfig;
-            settings.markModified('navigationConfig');
-            huboOtrosCambios = true;
-        }
-        if (flyersCanvaConfig && typeof flyersCanvaConfig === 'object') {
-            settings.flyersCanvaConfig = flyersCanvaConfig;
-            settings.markModified('flyersCanvaConfig');
-            huboOtrosCambios = true;
-        }
-        if (steamCalculatorConfig && typeof steamCalculatorConfig === 'object') {
-            settings.steamCalculatorConfig = steamCalculatorConfig;
-            settings.markModified('steamCalculatorConfig');
-            huboOtrosCambios = true;
-        }
-
-        if (huboOtrosCambios) {
-            settings.updatedBy = req.adminUser.email;
-            await settings.save();
-        }
-
-        if (poolNormalizado) {
-            settings.arbitrageBaseCards = poolNormalizado;
-            // Ejecutar recálculo de combinaciones en segundo plano sin bloquear el botón del navegador
+        if (Array.isArray(arbitrageBaseCards)) {
             setImmediate(() => {
                 recalcularPreciosYAlgoritmoTiendaKZ().catch(() => {});
             });
         }
 
-        const settingsLigero = settings.toObject ? settings.toObject() : { ...settings };
-        delete settingsLigero.centralOneCatalogCache;
-        delete settingsLigero.centralOneCoverageCache;
-        delete settingsLigero.processedWebhookIds;
-        if (poolNormalizado) {
-            settingsLigero.arbitrageBaseCards = poolNormalizado;
-        }
+        const settingsActualizado = await StoreSettings.findOne({ key: 'main_settings' })
+            .select('-centralOneCatalogCache -centralOneCoverageCache -processedWebhookIds')
+            .lean();
 
         return res.json({
             success: true,
-            settings: settingsLigero
+            settings: settingsActualizado
         });
     } catch (error) {
         console.error('Error en /api/admin/settings:', error);
