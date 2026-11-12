@@ -7414,13 +7414,33 @@ app.post('/api/worker/delete-order', verificarSoloAdmin, async (req, res) => {
 // 👑 DASHBOARD 1: ENDPOINTS EXCLUSIVOS PARA TI (ADMIN / DESARROLLADOR)
 // =================================================================
 
+// ⚡ Evita que los listados masivos de tickets descarguen capturas Base64 pesadas (solo se descargan al abrir un ticket individual con findOne)
+SupportTicket.schema.pre('find', function() {
+    const fields = this._fields;
+    if (!fields || Object.keys(fields).length === 0) {
+        this.select('-messages.attachmentUrl');
+    }
+});
+
 app.get('/api/admin/overview', verificarSoloAdmin, async (req, res) => {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     try {
-        // ⚡ MODO SÓLO CATÁLOGO CENTRAL ONE (5ms desde RAM: evita volver a descargar órdenes e imágenes Base64)
+        // ⚡ MODO SÓLO CATÁLOGO CENTRAL ONE: Si ya está en RAM, no descarga los ~8MB desde MongoDB Atlas (responde en 2ms)
         if (req.query.catalogOnly === '1') {
+            const tieneEnRAM = Array.isArray(_ramCentralOneCatalogCache) && _ramCentralOneCatalogCache.length > 0;
+            const projectionExtra = tieneEnRAM
+                ? 'centralOneAlerts centralOneSync flyersCanvaConfig'
+                : 'centralOneCatalogCache centralOneAlerts centralOneSync flyersCanvaConfig';
+
             const stExtra = await StoreSettings.findOne({ key: 'main_settings' })
-                .select('centralOneCatalogCache centralOneAlerts centralOneSync flyersCanvaConfig')
+                .select(projectionExtra)
                 .lean();
+
+            if (!tieneEnRAM && Array.isArray(stExtra?.centralOneCatalogCache) && stExtra.centralOneCatalogCache.length > 0) {
+                _ramCentralOneCatalogCache = stExtra.centralOneCatalogCache;
+                obtenerIndicesCatalogoEnRAM(_ramCentralOneCatalogCache);
+            }
+
             const fuenteCatCO = Array.isArray(_ramCentralOneCatalogCache) && _ramCentralOneCatalogCache.length > 0
                 ? _ramCentralOneCatalogCache
                 : (stExtra?.centralOneCatalogCache || []);
@@ -7452,16 +7472,15 @@ app.get('/api/admin/overview', verificarSoloAdmin, async (req, res) => {
 
         const isFastMode = req.query.fast === '1' || req.query.lite === '1';
 
-        // Sincronizado con zona horaria de Venezuela (UTC-4) para que no reinicie a las 8:00 PM
+        // Sincronizado con zona horaria de Venezuela (UTC-4)
         const ahoraVzla = new Date(Date.now() - (4 * 60 * 60 * 1000));
         const hoyInicio = new Date(Date.UTC(ahoraVzla.getUTCFullYear(), ahoraVzla.getUTCMonth(), ahoraVzla.getUTCDate(), 4, 0, 0, 0));
         const mesInicio = new Date(Date.UTC(ahoraVzla.getUTCFullYear(), ahoraVzla.getUTCMonth(), 1, 4, 0, 0, 0));
 
-const projectionSettings = isFastMode
+        const projectionSettings = isFastMode
             ? '-centralOneCatalogCache -centralOneCoverageCache -processedWebhookIds -flyersCanvaConfig'
             : '-centralOneCoverageCache -processedWebhookIds';
 
-        // Conserva siempre las imágenes reales de productos y paquetes desde MongoDB para que jamás se pierdan ni mezclen al editar
         const projectionProducts = '-packages.targetSchemaCache -altPackages.targetSchemaCache';
 
         const [
@@ -7488,17 +7507,17 @@ const projectionSettings = isFastMode
             PaymentMethod.find().sort({ sortOrder: 1 }).lean(),
             Order.find()
                 .sort({ fecha: -1 })
-                .limit(1500)
+                .limit(isFastMode ? 600 : 1500)
                 .select('-internalAccountLogin.accountPass -apiRawResponse -algoExecutionState.pendingReplacementBody')
                 .lean(),
             Order.countDocuments({ status: 'EN_PROCESO' }),
             SupportTicket.countDocuments({ status: { $in: ['ABIERTO', 'EN_REVISION'] } }),
-            SupportTicket.find().sort({ createdAt: -1 }).limit(200).select('ticketId orderId userEmail category status assignedWorker assignedWorkerName createdAt').lean(),
+            SupportTicket.find().sort({ createdAt: -1 }).limit(150).select('ticketId orderId userEmail category status assignedWorker assignedWorkerName createdAt').lean(),
             User.find({ role: { $in: ['worker', 'admin'] } }).select('email accountName role tokems').lean(),
             User.find().sort({ createdAt: -1 }).select('accountName email role isVerified tokems savedProfiles createdAt').lean(),
             Balance.find({ tokens: { $gt: 0 } }).select('deviceId tokens').lean(),
             Pin.find().select('code tokens used createdBy createdAt').lean(),
-            Transaction.find().sort({ fecha: -1 }).limit(500).select('deviceId tipo tokens plan precio fecha').lean()
+            Transaction.find().sort({ fecha: -1 }).limit(isFastMode ? 250 : 500).select('deviceId tipo tokens plan precio fecha').lean()
         ]);
 
         const settings = settingsRaw ? { ...settingsRaw } : {};
@@ -7509,12 +7528,6 @@ const projectionSettings = isFastMode
         if (isFastMode) {
             delete settings.centralOneCatalogCache;
             delete settings.flyersCanvaConfig;
-            if (settings.heroConfig && settings.heroConfig.mascotUrl && settings.heroConfig.mascotUrl.startsWith('data:')) {
-                delete settings.heroConfig.mascotUrl;
-            }
-            if (settings.binanceAutoConfig && settings.binanceAutoConfig.qrImageUrl && settings.binanceAutoConfig.qrImageUrl.startsWith('data:')) {
-                delete settings.binanceAutoConfig.qrImageUrl;
-            }
         } else if (Array.isArray(fuenteCatCO) && fuenteCatCO.length > 0) {
             settings.centralOneCatalogCache = fuenteCatCO.map(c => ({
                 product_id: c.product_id,
