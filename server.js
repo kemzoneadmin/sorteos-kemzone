@@ -5409,29 +5409,55 @@ const _origFindOrders = Order.find;
 // 🏪 ENDPOINTS PÚBLICOS DE LA TIENDA KEM!ZONE (CATÁLOGO Y COMPRAS)
 // =================================================================
 
+// ⚡ CACHÉ EN RAM PARA BOOTSTRAP PÚBLICO Y VERIFICACIÓN INSTANTÁNEA DE JUGADORES
+let _ramBootstrapPayload = null;
+let _ramBootstrapTs = 0;
+const _ramVerifiedPlayersCache = new Map();
+
+app.use(['/api/admin/settings', '/api/admin/central-one/sync', '/api/admin/product/save', '/api/admin/product/delete', '/api/admin/product/reorder', '/api/admin/payment-method/save', '/api/admin/payment-method/delete', '/api/admin/binance-pay/config'], (req, res, next) => {
+    res.on('finish', () => {
+        _ramBootstrapPayload = null;
+        _ramBootstrapTs = 0;
+    });
+    next();
+});
+
 app.get('/api/store/bootstrap', async (req, res) => {
     res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     res.set('Pragma', 'no-cache');
     res.set('Expires', '0');
     res.set('Surrogate-Control', 'no-store');
     try {
+        const ahora = Date.now();
+        if (_ramBootstrapPayload && (ahora - _ramBootstrapTs < 15000)) {
+            return res.json({
+                ..._ramBootstrapPayload,
+                serverTimestamp: ahora
+            });
+        }
+
         const [settings, products, paymentMethods] = await Promise.all([
             StoreSettings.findOne({ key: 'main_settings' })
                 .select('-centralOneCatalogCache -centralOneCoverageCache -centralOneAlerts -processedWebhookIds -flyersCanvaConfig')
                 .lean(),
             CatalogProduct.find()
                 .sort({ sortOrder: 1, createdAt: 1 })
-                .select('-packages.costUSD -packages.backupPinVault -altPackages.costUSD -altPackages.backupPinVault')
+                .select('-packages.costUSD -packages.backupPinVault -packages.targetSchemaCache -altPackages.costUSD -altPackages.backupPinVault -altPackages.targetSchemaCache')
                 .lean(),
             PaymentMethod.find({ active: true }).sort({ sortOrder: 1 }).lean()
         ]);
 
-        return res.json({
+        _ramBootstrapPayload = {
             success: true,
-            serverTimestamp: Date.now(),
             settings: settings || { exchangeRateVES: 55.00, tokemValueUSD: 1.00, storeOpen: true },
             products: products || [],
             paymentMethods: paymentMethods || []
+        };
+        _ramBootstrapTs = ahora;
+
+        return res.json({
+            ..._ramBootstrapPayload,
+            serverTimestamp: ahora
         });
     } catch (error) {
         return res.status(500).json({ error: 'Error cargando catálogo de la tienda.' });
@@ -5443,7 +5469,6 @@ function normalizarValorServidorJuego(rawRegionOrServer, targetSchemaField = nul
     const val = String(rawRegionOrServer || '').trim();
     if (!val) return { primary: '', fallback: '' };
 
-    // Si el dueño escribió formato "Etiqueta Visible|valor_api" (ej: "Europa|Europe")
     if (val.includes('|')) {
         const partes = val.split('|').map(s => s.trim()).filter(Boolean);
         return { primary: partes[1] || partes[0], fallback: partes[0] };
@@ -5451,7 +5476,6 @@ function normalizarValorServidorJuego(rawRegionOrServer, targetSchemaField = nul
 
     const vLow = val.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
 
-    // Diccionario oficial para Genshin Impact, Honkai Star Rail, Zenless Zone Zero y juegos globales
     let stdName = val;
     let hoyoCode = val;
 
@@ -5467,7 +5491,7 @@ function normalizarValorServidorJuego(rawRegionOrServer, targetSchemaField = nul
     } else if (vLow.includes('tw') || vLow.includes('hk') || vLow.includes('mo') || vLow === 'os_cht' || vLow.includes('sar')) {
         stdName = 'TW, HK, MO';
         hoyoCode = 'os_cht';
-    } else if (vLow === 'latam' || vLow === ' latinoamerica' || vLow === 'sudamerica' || vLow === 'south america' || vLow === 'sa') {
+    } else if (vLow === 'latam' || vLow === 'latinoamerica' || vLow === 'sudamerica' || vLow === 'south america' || vLow === 'sa') {
         stdName = 'South America';
         hoyoCode = 'SA';
     } else if (vLow === 'brasil' || vLow === 'brazil' || vLow === 'br') {
@@ -5475,7 +5499,6 @@ function normalizarValorServidorJuego(rawRegionOrServer, targetSchemaField = nul
         hoyoCode = 'BR';
     }
 
-    // Si el SKU de Central One trae target_schema con opciones explícitas (options / enum / values), empatar con la opción exacta del proveedor
     let schemaOptions = [];
     if (targetSchemaField && typeof targetSchemaField === 'object') {
         if (Array.isArray(targetSchemaField.options)) schemaOptions = targetSchemaField.options;
@@ -5513,7 +5536,6 @@ function normalizarValorServidorJuego(rawRegionOrServer, targetSchemaField = nul
     };
 }
 
-// Construye el target_payload exacto que exige Central One (con soporte de fallback automático para servidores)
 function construirTargetPayloadCentralOne(coCatItem, rawUid, rawServer, rawRegion, slugJuego = '') {
     const targetFields = (coCatItem && Array.isArray(coCatItem.target_fields) && coCatItem.target_fields.length > 0)
         ? coCatItem.target_fields
@@ -5533,7 +5555,6 @@ function construirTargetPayloadCentralOne(coCatItem, rawUid, rawServer, rawRegio
     const uidLimpio = String(rawUid || '').trim();
     let srvORegionElegido = String(rawServer || rawRegion || '').trim();
 
-    // Si es Genshin / Honkai / ZZZ y no llegó servidor pero el UID tiene 9-10 dígitos, deducir servidor por el 1er dígito
     const esJuegoHoyo = /genshin|honkai|star-rail|zenless|zzz/i.test(`${slugJuego} ${coCatItem?.name || ''} ${coCatItem?.sku || ''}`);
     if (!srvORegionElegido && esJuegoHoyo && /^[6789]\d{8,9}$/.test(uidLimpio)) {
         const primerDigito = uidLimpio.charAt(0);
@@ -5552,7 +5573,6 @@ function construirTargetPayloadCentralOne(coCatItem, rawUid, rawServer, rawRegio
         const fieldSchema = encontrarSchemaDeCampo(fieldKey);
 
         if (fkLower.includes('server') || fkLower.includes('zone') || fkLower.includes('region') || fkLower.includes('world')) {
-            // Si el juego tiene tanto servidor como región, priorizar el que corresponda
             const valorCrudo = (fkLower.includes('zone') && rawServer)
                 ? String(rawServer).trim()
                 : (srvORegionElegido || String(rawRegion || rawServer || '').trim());
@@ -5578,22 +5598,36 @@ function construirTargetPayloadCentralOne(coCatItem, rawUid, rawServer, rawRegio
     };
 }
 
-// 1.5 Verificar ID de Jugador en el Paso 1 conectado en vivo a POST /api/v1/player/validate de Central One
+// 1.5 Verificar ID de Jugador en 0ms desde RAM + Caché de Jugadores Verificados (Sin descargar 8MB de MongoDB)
 app.post('/api/orders/verify-player', async (req, res) => {
     try {
         const { productSlug, packageId, playerUid, playerServer, playerRegion } = req.body;
-        if (!playerUid || String(playerUid).trim().length < 3) {
+        const uidClean = String(playerUid || '').trim();
+        if (!uidClean || uidClean.length < 3) {
             return res.status(400).json({ error: 'Ingresa un ID de jugador válido.' });
         }
 
+        const slugClean = String(productSlug || '').trim().toLowerCase();
+        const cacheKeyPlayer = `${slugClean}|${uidClean}|${String(playerServer || '').trim()}|${String(playerRegion || '').trim()}`;
+        const cachedPlayer = _ramVerifiedPlayersCache.get(cacheKeyPlayer);
+        if (cachedPlayer && (Date.now() - cachedPlayer.ts < 15 * 60 * 1000)) {
+            return res.status(cachedPlayer.httpStatus).json(cachedPlayer.payload);
+        }
+
         const headers = obtenerHeadersCentralOne();
-        if (headers && productSlug) {
-            const slugClean = String(productSlug).trim().toLowerCase();
-            const prodDB = await CatalogProduct.findOne({ slug: slugClean }).lean();
-            const settings = await StoreSettings.findOne({ key: 'main_settings' }).select('centralOneCatalogCache').lean();
-            const catalogCache = (Array.isArray(_ramCentralOneCatalogCache) && _ramCentralOneCatalogCache.length > 0)
-                ? _ramCentralOneCatalogCache
-                : (settings?.centralOneCatalogCache || []);
+        if (headers && slugClean) {
+            const prodDB = await obtenerProductoCheckoutRAM(slugClean);
+
+            if (!Array.isArray(_ramCentralOneCatalogCache) || _ramCentralOneCatalogCache.length === 0) {
+                const docCat = await StoreSettings.collection.findOne(
+                    { key: 'main_settings' },
+                    { projection: { centralOneCatalogCache: 1 } }
+                );
+                if (docCat && Array.isArray(docCat.centralOneCatalogCache)) {
+                    _ramCentralOneCatalogCache = docCat.centralOneCatalogCache;
+                }
+            }
+            const { tieneCacheAPI, mapaCO_Id, mapaCO_Sku } = obtenerIndicesCatalogoEnRAM(_ramCentralOneCatalogCache);
 
             if (prodDB) {
                 const listaPaq = (prodDB.useAltPricing && Array.isArray(prodDB.altPackages) && prodDB.altPackages.length > 0)
@@ -5606,13 +5640,13 @@ app.post('/api/orders/verify-player', async (req, res) => {
                 let coProductId = pkgElegido ? (pkgElegido.centralOneProductId || '') : '';
                 let coCatItem = null;
 
-                if (Array.isArray(catalogCache) && catalogCache.length > 0) {
+                if (tieneCacheAPI) {
                     if (coProductId) {
-                        coCatItem = catalogCache.find(x => x.product_id === coProductId);
+                        coCatItem = mapaCO_Id[coProductId] || null;
                     }
                     if (!coCatItem && pkgElegido && pkgElegido.apiProductSku) {
                         const skuClean = String(pkgElegido.apiProductSku).trim().toUpperCase();
-                        coCatItem = catalogCache.find(x => String(x.sku || '').trim().toUpperCase() === skuClean);
+                        coCatItem = mapaCO_Sku[skuClean] || null;
                         if (coCatItem) coProductId = coCatItem.product_id;
                     }
                 }
@@ -5620,7 +5654,7 @@ app.post('/api/orders/verify-player', async (req, res) => {
                 if (coProductId && (!coCatItem || coCatItem.requires_target !== false)) {
                     const { primaryPayload, fallbackPayload } = construirTargetPayloadCentralOne(
                         coCatItem,
-                        playerUid,
+                        uidClean,
                         playerServer,
                         playerRegion,
                         slugClean
@@ -5630,14 +5664,13 @@ app.post('/api/orders/verify-player', async (req, res) => {
                         const respCO = await axios.post(`${CENTRAL_ONE_BASE_URL}/player/validate`, {
                             product_id: coProductId,
                             target_payload: tPayload
-                        }, { headers, timeout: 9000 });
+                        }, { headers, timeout: 6500 });
                         return respCO.data || {};
                     };
 
                     try {
                         let dataCO = await intentarValidacionCO(primaryPayload);
 
-                        // Si el primer formato de región (ej. "Europe") dio inválido y existe código técnico alternativo (ej. "os_euro"), probar el alternativo automáticamente
                         if (dataCO.status === 'invalid' && fallbackPayload) {
                             try {
                                 const dataFallback = await intentarValidacionCO(fallbackPayload);
@@ -5649,7 +5682,7 @@ app.post('/api/orders/verify-player', async (req, res) => {
 
                         if (dataCO.status === 'valid') {
                             const nick = dataCO.player?.name || '';
-                            return res.json({
+                            const okPayload = {
                                 success: true,
                                 status: 'valid',
                                 verified: true,
@@ -5657,31 +5690,36 @@ app.post('/api/orders/verify-player', async (req, res) => {
                                 message: nick
                                     ? `✅ Cuenta verificada: ${nick}`
                                     : `✅ Cuenta verificada y activa en el servidor del juego.`
-                            });
+                            };
+                            _ramVerifiedPlayersCache.set(cacheKeyPlayer, { ts: Date.now(), httpStatus: 200, payload: okPayload });
+                            return res.json(okPayload);
                         }
 
                         if (dataCO.status === 'invalid') {
-                            return res.status(400).json({
+                            const invPayload = {
                                 success: false,
                                 status: 'invalid',
                                 verified: false,
                                 error: '❌ El ID de jugador o la Región seleccionada NO coinciden con ninguna cuenta activa en este servidor. Revísalos e intenta de nuevo.'
-                            });
+                            };
+                            _ramVerifiedPlayersCache.set(cacheKeyPlayer, { ts: Date.now(), httpStatus: 400, payload: invPayload });
+                            return res.status(400).json(invPayload);
                         }
                     } catch (errVal) {
-                        // Si el primer intento dio error 400/422 por formato de servidor y tenemos fallbackPayload, reintentar con el código alternativo
                         if (fallbackPayload) {
                             try {
                                 const dataFb2 = await intentarValidacionCO(fallbackPayload);
                                 if (dataFb2 && dataFb2.status === 'valid') {
                                     const nick = dataFb2.player?.name || '';
-                                    return res.json({
+                                    const okFbPayload = {
                                         success: true,
                                         status: 'valid',
                                         verified: true,
                                         nickname: nick,
                                         message: nick ? `✅ Cuenta verificada: ${nick}` : `✅ Cuenta verificada en el servidor.`
-                                    });
+                                    };
+                                    _ramVerifiedPlayersCache.set(cacheKeyPlayer, { ts: Date.now(), httpStatus: 200, payload: okFbPayload });
+                                    return res.json(okFbPayload);
                                 }
                             } catch (eFb2) {}
                         }
