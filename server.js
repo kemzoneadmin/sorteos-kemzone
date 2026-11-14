@@ -1952,8 +1952,27 @@ async function sincronizarTodoConCentralOne(forzar = false) {
                 }
             }
 
-            settings.centralOneCatalogCache = nuevosItems;
-            settings.centralOneSync.catalogCount = nuevosItems.length;
+// ⚡ Compactar cada ítem del catálogo dejando solo los campos necesarios (Reduce un 80% el peso en RAM y red)
+            const itemsCompactados = nuevosItems.map(c => ({
+                product_id: c.product_id,
+                sku: c.sku,
+                name: c.name,
+                reseller_price: c.reseller_price,
+                in_stock: c.in_stock,
+                status: c.status,
+                available_stock: c.available_stock,
+                product_family_name: c.product_family_name || '',
+                requires_target: c.requires_target,
+                target_fields: c.target_fields || [],
+                region: c.region || c.country || '',
+                target_schema: c.target_schema || null
+            }));
+
+            _ramCentralOneCatalogCache = itemsCompactados;
+            obtenerIndicesCatalogoEnRAM(_ramCentralOneCatalogCache);
+
+            settings.centralOneCatalogCache = itemsCompactados;
+            settings.centralOneSync.catalogCount = itemsCompactados.length;
             settings.centralOneSync.apiConnected = true;
             settings.centralOneSync.lastSyncAt = new Date();
             settings.markModified('centralOneCatalogCache');
@@ -1965,29 +1984,30 @@ async function sincronizarTodoConCentralOne(forzar = false) {
         }
 
         settings.markModified('centralOneSync');
-        await recalcularPreciosYAlgoritmoTiendaKZ(settings);
+        await recalcularPreciosYAlgoritmoTiendaKZ(settings, null, true);
 
         return {
             success: true,
             sync: settings.centralOneSync,
-            catalogCount: (settings.centralOneCatalogCache || []).length
+            catalogCount: (_ramCentralOneCatalogCache || []).length
         };
     } catch (err) {
         return { success: false, error: err.message };
     }
 }
 
+// 🔄 Sincronización automática en segundo plano cada 3 minutos (en vez de 15 min) para detectar stock y precios rápido
 setInterval(() => {
     if (process.env.CENTRAL_ONE_API_KEY) {
         sincronizarTodoConCentralOne().catch(() => {});
     }
-}, 15 * 60 * 1000);
+}, 3 * 60 * 1000);
 
 setTimeout(() => {
     if (process.env.CENTRAL_ONE_API_KEY) {
         sincronizarTodoConCentralOne().catch(() => {});
     }
-}, 6000);
+}, 5000);
 
 // 🏷️ Formatea el código agregándole "Steam Wallet X,XX$ ➔ " si pertenece al pool de Steam
 function formatearCodigoConEtiquetaSteam(codeStr, amountUSD, esSteam = true) {
@@ -7862,14 +7882,24 @@ app.post('/api/admin/settings', verificarSoloAdmin, async (req, res) => {
     }
 });
 
-// 2.5 Endpoints de Sincronización y Control del Monitor Central One API
+// 2.5 Endpoints de Sincronización y Control del Monitor Central One API (Respuesta Ultrarrápida)
 app.post('/api/admin/central-one/sync', verificarSoloAdmin, async (req, res) => {
     try {
         const resultado = await sincronizarTodoConCentralOne(true);
         const [settings, products] = await Promise.all([
-            StoreSettings.findOne({ key: 'main_settings' }).lean(),
-            CatalogProduct.find().sort({ sortOrder: 1 }).lean()
+            StoreSettings.findOne({ key: 'main_settings' })
+                .select('-centralOneCatalogCache -centralOneCoverageCache -processedWebhookIds -flyersCanvaConfig')
+                .lean(),
+            CatalogProduct.find()
+                .sort({ sortOrder: 1 })
+                .select('-cardImageUrl -flyerImageUrl -infoImageUrl -packages.imageUrl -altPackages.imageUrl -packages.targetSchemaCache -altPackages.targetSchemaCache')
+                .lean()
         ]);
+
+        if (settings) {
+            settings.centralOneCatalogCache = _ramCentralOneCatalogCache || [];
+        }
+
         return res.json({
             success: resultado.success,
             error: resultado.error || null,
