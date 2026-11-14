@@ -3040,7 +3040,7 @@ function formatearCodigoConEtiquetaPlataforma(codeStr, amountUSD, platformGroup 
     return `Código ${montoComa}$ ➔ ${limpio}`;
 }
 
-// 🛡️ Candado Ultrarrápido de Servidor (5ms): Bloquea compras de paquetes sin stock sin descargar imágenes Base64
+// 🛡️ Candado Ultrarrápido en RAM (0ms): Bloquea compras de paquetes sin stock sin hacer doble consulta a MongoDB
 app.use(['/api/orders/create', '/api/binance-pay/create-checkout'], express.json(), async (req, res, next) => {
     try {
         const { orderType, productSlug, packageId, packageName } = req.body || {};
@@ -3048,9 +3048,11 @@ app.use(['/api/orders/create', '/api/binance-pay/create-checkout'], express.json
         if (!slugClean || orderType === 'TOKEM_TOPUP' || slugClean === 'tokems-kz' || slugClean === 'calculadora-steam') {
             return next();
         }
-        const prodDB = await CatalogProduct.findOne({ slug: slugClean })
-            .select('slug active useAltPricing packages.packageId packages.name packages.inStock packages.providerInStock packages.backupPinVault altPackages.packageId altPackages.name altPackages.inStock altPackages.providerInStock altPackages.backupPinVault')
-            .lean();
+        const prodDB = typeof obtenerProductoCheckoutRAM === 'function'
+            ? await obtenerProductoCheckoutRAM(slugClean)
+            : await CatalogProduct.findOne({ slug: slugClean })
+                .select('slug active useAltPricing packages.packageId packages.name packages.inStock packages.providerInStock packages.backupPinVault altPackages.packageId altPackages.name altPackages.inStock altPackages.providerInStock altPackages.backupPinVault')
+                .lean();
         if (!prodDB) return next();
 
         const listaPaq = (prodDB.useAltPricing && Array.isArray(prodDB.altPackages) && prodDB.altPackages.length > 0)
@@ -3275,12 +3277,12 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
 
     const headersBase = obtenerHeadersCentralOne();
 
-    // ⚡ Sondeo en caliente: consulta hasta 4 veces rápidas (0.5s, 1.5s, 2.5s, 3.6s) para atrapar los códigos apenas Central One los genere
+// ⚡ Sondeo en caliente ultrarrápido (máx 1s): si Central One entrega al instante lo devuelve; si tarda más, delega al vigilante sin frenar al operador
     const consultarConEsperaCalienteCO = async (coOrderId, initialStatus, esSteamFlag, fallbackUsdVal, algoStObj) => {
         if (String(initialStatus || '').toLowerCase() === 'completed') {
             return await verificarYExtraerEntregaCentralOne(coOrderId, headersBase, poolCards, esSteamFlag, fallbackUsdVal, algoStObj);
         }
-        const pausasMs = [500, 950, 1050, 1100];
+        const pausasMs = [350, 650];
         let ultimoCheck = null;
         for (let p = 0; p < pausasMs.length; p++) {
             await new Promise(r => setTimeout(r, pausasMs[p]));
@@ -6988,7 +6990,10 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
             });
         }
 
-        const query = {};
+        // No enviar checkouts de Binance que siguen esperando pago en la ventana del QR
+        const query = {
+            $nor: [{ status: 'INICIANDO', isWaitingBinanceAuto: true }]
+        };
         if (statusFilter && statusFilter !== 'TODAS') {
             query.status = statusFilter;
         }
@@ -6996,7 +7001,7 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
         if (!isOwner) {
             query.$or = [
                 {
-                    status: { $in: ['EN_PROCESO', 'ERROR_API'] },
+                    status: { $in: ['EN_PROCESO', 'ERROR_API', 'EJECUTANDO_API'] },
                     $or: [{ claimedByWorker: '' }, { claimedByWorker: null }, { claimedByWorker: { $exists: false } }]
                 },
                 { claimedByWorker: workerEmail },
@@ -7005,8 +7010,14 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
             ];
         }
 
-        const [orders, ticketsAbiertos, pendientesSinApartarCount, workersList] = await Promise.all([
-            Order.find(query).sort({ fecha: -1 }).limit(250).select('-costUSD -apiRawResponse').lean(),
+        // Caché en RAM de 30s para la lista de trabajadores (evita consultar User.find en cada latido de la cola)
+        if (!global._ramWorkersListCache || (Date.now() - (global._ramWorkersListTs || 0) > 30000)) {
+            global._ramWorkersListCache = await User.find({ role: { $in: ['worker', 'admin'] } }).select('email accountName role tokems').lean();
+            global._ramWorkersListTs = Date.now();
+        }
+
+        const [orders, ticketsAbiertos, pendientesSinApartarCount] = await Promise.all([
+            Order.find(query).sort({ fecha: -1 }).limit(180).select('-costUSD -apiRawResponse -algoExecutionState.pendingReplacementBody').lean(),
             SupportTicket.find(
                 isOwner
                     ? {}
@@ -7016,12 +7027,12 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
                             { assignedWorker: workerEmail }
                         ]
                     }
-            ).sort({ updatedAt: -1 }).limit(100).lean(),
+            ).sort({ updatedAt: -1 }).limit(80).lean(),
             Order.countDocuments({
                 status: 'EN_PROCESO',
+                isWaitingBinanceAuto: { $ne: true },
                 $or: [{ claimedByWorker: '' }, { claimedByWorker: null }, { claimedByWorker: { $exists: false } }]
-            }),
-            isOwner ? User.find({ role: { $in: ['worker', 'admin'] } }).select('email accountName role tokems').lean() : Promise.resolve([])
+            })
         ]);
 
         return res.json({
@@ -7032,7 +7043,7 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
             pendientesCount: pendientesSinApartarCount,
             orders,
             tickets: ticketsAbiertos,
-            workersList
+            workersList: isOwner ? (global._ramWorkersListCache || []) : []
         });
     } catch (error) {
         return res.status(500).json({ error: 'Error cargando cola de trabajo.' });
