@@ -1635,10 +1635,14 @@ async function recalcularPreciosYAlgoritmoTiendaKZ(settingsDoc = null, targetSlu
             const esSmartProd = Boolean(prod.isSmartCodeProduct);
             const platGroup = prod.smartPlatformGroup || 'steam';
 
-            const procesarArregloPaquetes = (listaPaquetes) => {
+const procesarArregloPaquetes = (listaPaquetes) => {
                 if (!Array.isArray(listaPaquetes)) return;
                 for (const pkg of listaPaquetes) {
-                    const usaAlgo = esSmartProd || Boolean(pkg.useSmartAlgorithm);
+                    // Respeta el interruptor individual del paquete: si useSmartAlgorithm es false, funciona como Paquete Único directo aunque el producto sea de Algoritmo
+                    const usaAlgo = (pkg.useSmartAlgorithm === false)
+                        ? false
+                        : Boolean(esSmartProd || pkg.useSmartAlgorithm);
+
                     const tieneStockBovedaPaquete = Array.isArray(pkg.backupPinVault) && pkg.backupPinVault.length > 0;
 
                     if (usaAlgo) {
@@ -1682,30 +1686,45 @@ async function recalcularPreciosYAlgoritmoTiendaKZ(settingsDoc = null, targetSlu
                                 }
                             }
                         }
-                    } else if (catalogoCO.length > 0 && (pkg.centralOneProductId || pkg.apiProductSku)) {
-                        const skuUpper = String(pkg.apiProductSku || '').trim().toUpperCase();
-                        const itemCO = (pkg.centralOneProductId && mapaCO_PorId[pkg.centralOneProductId]) ||
-                                       (skuUpper && mapaCO_PorSku[skuUpper]);
-                        if (itemCO) {
-                            const nuevoCosto = itemCO.reseller_price !== null ? Number(itemCO.reseller_price) : pkg.costUSD;
-                            const nuevoStock = Boolean((itemCO.in_stock && itemCO.status === 'active') || tieneStockBovedaPaquete);
-                            if (nuevoCosto > 0 && Math.abs((pkg.costUSD || 0) - nuevoCosto) > 0.0001) {
-                                pkg.costUSD = nuevoCosto;
-                                prodModificado = true;
-                            }
-                            if (pkg.providerInStock !== nuevoStock) {
-                                pkg.providerInStock = nuevoStock;
-                                prodModificado = true;
-                            }
-                            if (Array.isArray(itemCO.target_schema)) {
-                                pkg.targetSchemaCache = itemCO.target_schema;
-                            }
-                        } else if (pkg.centralOneProductId || (skuUpper && skuUpper.includes('-'))) {
-                            // Si estaba vinculado a Central One y el proveedor lo retiró del catálogo, pausar automáticamente
-                            const stockRespaldo = tieneStockBovedaPaquete ? true : false;
-                            if (pkg.providerInStock !== stockRespaldo) {
-                                pkg.providerInStock = stockRespaldo;
-                                prodModificado = true;
+                    } else {
+                        if (pkg.resolvedCombo) {
+                            pkg.resolvedCombo = null;
+                            prodModificado = true;
+                        }
+                        if (catalogoCO.length > 0 && (pkg.centralOneProductId || pkg.apiProductSku)) {
+                            const skuUpper = String(pkg.apiProductSku || '').trim().toUpperCase();
+                            const itemCO = (pkg.centralOneProductId && mapaCO_PorId[pkg.centralOneProductId]) ||
+                                           (skuUpper && mapaCO_PorSku[skuUpper]);
+
+                            // También contar si esa tarjeta tiene códigos guardados en el Stock Propio de la Bóveda
+                            const cardEnBoveda = (settingsDoc.arbitrageBaseCards || []).find(c =>
+                                (pkg.centralOneProductId && c.centralOneProductId === pkg.centralOneProductId) ||
+                                (skuUpper && String(c.centralOneSku || '').trim().toUpperCase() === skuUpper)
+                            );
+                            const tieneStockPropioBoveda = cardEnBoveda && Array.isArray(cardEnBoveda.internalCodeStock) && cardEnBoveda.internalCodeStock.length > 0;
+                            const tieneRespaldoLocal = Boolean(tieneStockBovedaPaquete || tieneStockPropioBoveda);
+
+                            if (itemCO) {
+                                const nuevoCosto = itemCO.reseller_price !== null ? Number(itemCO.reseller_price) : pkg.costUSD;
+                                const nuevoStock = Boolean((itemCO.in_stock && itemCO.status === 'active') || tieneRespaldoLocal);
+                                if (nuevoCosto > 0 && Math.abs((pkg.costUSD || 0) - nuevoCosto) > 0.0001) {
+                                    pkg.costUSD = nuevoCosto;
+                                    prodModificado = true;
+                                }
+                                if (pkg.providerInStock !== nuevoStock) {
+                                    pkg.providerInStock = nuevoStock;
+                                    prodModificado = true;
+                                }
+                                if (Array.isArray(itemCO.target_schema)) {
+                                    pkg.targetSchemaCache = itemCO.target_schema;
+                                }
+                            } else if (pkg.centralOneProductId || (skuUpper && skuUpper.includes('-'))) {
+                                // Si el proveedor retiró o pausó la tarjeta del catálogo, pausar el paquete automáticamente
+                                const stockRespaldo = tieneRespaldoLocal ? true : false;
+                                if (pkg.providerInStock !== stockRespaldo) {
+                                    pkg.providerInStock = stockRespaldo;
+                                    prodModificado = true;
+                                }
                             }
                         }
                     }
@@ -3336,7 +3355,9 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
         }
     }
 
-    const usaAlgoritmo = Boolean((productoDB && productoDB.isSmartCodeProduct) || (pkg && pkg.useSmartAlgorithm));
+const usaAlgoritmo = (pkg && pkg.useSmartAlgorithm === false)
+        ? false
+        : Boolean((productoDB && productoDB.isSmartCodeProduct) || (pkg && pkg.useSmartAlgorithm));
 
     // 🧠 CASO A: PRODUCTO CON ALGORITMO INTELIGENTE DE CÓDIGOS (STEAM, PLAYSTATION, NINTENDO, ETC.)
     if (usaAlgoritmo && pkg && Number(pkg.targetClientUSD) > 0) {
@@ -7147,13 +7168,31 @@ app.post('/api/worker/claim-order', verificarTrabajadorOAdmin, async (req, res) 
     }
 });
 
-// 2. Acción del Trabajador: APROBAR, REVISIÓN o RECHAZAR (Permite destrabar EJECUTANDO_API / ERROR_API)
+// 🔒 Candado en RAM para impedir que 2 clics seguidos de "Aprobar" disparen dos veces el pedido en Central One
+const activeWorkerApprovalLocks = new Set();
+
+// 2. Acción del Trabajador: APROBAR, REVISIÓN o RECHAZAR (Con Candado Anti-Doble Disparo)
 app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res) => {
+    const idLock = String(req.body?.orderId || '').trim().toUpperCase();
+    if (!idLock || !req.body?.action) return res.status(400).json({ error: 'Faltan parámetros.' });
+
+    if (req.body.action === 'APROBAR' && activeWorkerApprovalLocks.has(idLock)) {
+        const ordEnCurso = await Order.findOne({ orderId: idLock });
+        return res.json({
+            success: true,
+            alreadyProcessing: true,
+            message: `🔒 La orden #${idLock} ya se está enviando al proveedor en este instante. No hace falta volver a darle.`,
+            order: ordEnCurso
+        });
+    }
+
+    if (req.body.action === 'APROBAR') {
+        activeWorkerApprovalLocks.add(idLock);
+    }
+
     try {
         const { orderId, action, manualPinCode, workerNotes } = req.body;
-        if (!orderId || !action) return res.status(400).json({ error: 'Faltan parámetros.' });
-
-        const orden = await Order.findOne({ orderId: orderId.trim().toUpperCase() });
+        const orden = await Order.findOne({ orderId: idLock });
         if (!orden) return res.status(404).json({ error: 'Orden no encontrada.' });
 
         const staffEmail = (req.staffUser.email || '').trim().toLowerCase();
@@ -7189,7 +7228,7 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
                 });
             }
 
-// 2. Si el operador ingresó un código o confirmación manual, entregar de inmediato al cliente y dejar vigilando el código pendiente de Central One para guardarlo en tu Stock Propio
+            // 2. Si el operador ingresó un código manual escrito a mano, entregar de inmediato al cliente y dejar vigilando el código pendiente de Central One para guardarlo en Stock Propio
             if (manualPinCode && manualPinCode.trim()) {
                 const habiaOrdenEnCentralOne = Boolean(
                     orden.apiOrderId &&
@@ -7222,7 +7261,6 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
 
                 await orden.save();
 
-                // Si Central One tenía este pedido en "Recibida", dejar el vigilante activo para que apenas Central One suelte el código se guarde en tu Stock Propio
                 if (habiaOrdenEnCentralOne) {
                     const coIdVigilar = orden.apiOrderId.startsWith('kz-ord-') ? null : orden.apiOrderId;
                     const idempVigilar = orden.apiOrderId.startsWith('kz-ord-') ? orden.apiOrderId : (orden.algoExecutionState?.pendingReplacementIdempKey || null);
@@ -7238,7 +7276,50 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
                 });
             }
 
-            // 3. Si la orden ya tenía todos sus códigos en algoExecutionState.deliveredCodesList, completarla de inmediato
+            // 3. 🔒 CANDADO ANTI-DOBLE PEDIDO: Si la orden YA está en EJECUTANDO_API y tiene apiOrderId en Central One, NO permitir que otro clic vuelva a pedir otra tarjeta
+            if (orden.status === 'EJECUTANDO_API' && orden.apiOrderId && !orden.apiOrderId.startsWith('VAULT-') && !orden.apiOrderId.startsWith('INTERNAL-') && !orden.apiOrderId.startsWith('API-')) {
+                const headersCO = obtenerHeadersCentralOne();
+                if (headersCO && !orden.apiOrderId.startsWith('kz-ord-')) {
+                    try {
+                        const settingsDoc = await StoreSettings.findOne({ key: 'main_settings' }).select('arbitrageBaseCards').lean();
+                        const poolCards = settingsDoc ? (settingsDoc.arbitrageBaseCards || []) : [];
+                        const algoSt = orden.algoExecutionState || null;
+                        const esSteamOrd = String(orden.productSlug || '').toLowerCase().includes('steam') || String(algoSt?.platformGroup || '').toLowerCase() === 'steam';
+                        const checkPrev = await verificarYExtraerEntregaCentralOne(orden.apiOrderId, headersCO, poolCards, esSteamOrd, 0, algoSt);
+
+                        if (checkPrev.state === 'COMPLETED') {
+                            const previos = (algoSt && Array.isArray(algoSt.deliveredCodesList)) ? algoSt.deliveredCodesList : [];
+                            const vistosRaw = new Set(previos.map(extraerCodigoCrudoDeTextoFormateado));
+                            const todos = [...previos];
+                            for (const cNuevo of (checkPrev.codigosPlanos || [])) {
+                                const rk = extraerCodigoCrudoDeTextoFormateado(cNuevo);
+                                if (rk && !vistosRaw.has(rk)) {
+                                    vistosRaw.add(rk);
+                                    todos.push(cNuevo);
+                                }
+                            }
+                            orden.status = 'ENTREGADO';
+                            orden.progressPercent = 100;
+                            orden.deliveredCode = todos.length > 0 ? todos.join('  |  ') : checkPrev.deliveredCode;
+                            orden.statusMessage = '¡Entrega completada! Cópiala aquí abajo.';
+                            orden.approvedByWorker = orden.approvedByWorker || staffEmail;
+                            orden.completedAt = new Date();
+                            await orden.save();
+                            return res.json({ success: true, message: `¡Orden #${orden.orderId} ya liberada por Central One y entregada!`, order: orden });
+                        }
+                    } catch (eCheckEnCurso) {}
+                }
+
+                programarSeguimientoOrdenCentralOne(orden.orderId, orden.apiOrderId.startsWith('kz-ord-') ? null : orden.apiOrderId, orden.apiOrderId.startsWith('kz-ord-') ? orden.apiOrderId : null, null, true);
+                return res.json({
+                    success: true,
+                    alreadyProcessing: true,
+                    message: `🔒 El pedido #${orden.orderId} ya fue enviado a Central One y se está procesando. No se enviará dos veces.`,
+                    order: orden
+                });
+            }
+
+            // 4. Si la orden ya tenía todos sus códigos en algoExecutionState.deliveredCodesList, completarla de inmediato
             const algoSt = orden.algoExecutionState || null;
             if (algoSt && Array.isArray(algoSt.deliveredCodesList) && algoSt.deliveredCodesList.length > 0 && Number(algoSt.totalCardsExpected) > 0 && algoSt.deliveredCodesList.length >= Number(algoSt.totalCardsExpected)) {
                 orden.status = 'ENTREGADO';
@@ -7252,7 +7333,7 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
                 return res.json({ success: true, message: `Orden #${orden.orderId} marcada como entregada.`, order: orden });
             }
 
-            // 4. Si tenía un apiOrderId previo que falló, verificar primero en Central One antes de reintentar
+            // 5. Si estaba en ERROR_API con un apiOrderId previo, verificar primero en Central One antes de reintentar
             if (orden.apiOrderId && !orden.apiOrderId.startsWith('VAULT-') && !orden.apiOrderId.startsWith('INTERNAL-') && !orden.apiOrderId.startsWith('API-') && !orden.apiOrderId.startsWith('kz-ord-')) {
                 const headersCO = obtenerHeadersCentralOne();
                 if (headersCO) {
@@ -7283,7 +7364,6 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
                             await orden.save();
                             return res.json({ success: true, message: `Orden #${orden.orderId} recuperada de Central One y entregada.`, order: orden });
                         } else if (checkPrev.state === 'FAILED') {
-                            // Si la orden previa en Central One falló por completo, limpiar apiOrderId para permitir nuevo disparo limpio
                             orden.apiOrderId = '';
                         }
                     } catch (ePrev) {}
@@ -7293,6 +7373,7 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
             orden.status = 'EJECUTANDO_API';
             orden.statusMessage = 'Pago verificado. Ejecutando entrega automática...';
             orden.progressPercent = 80;
+            orden.approvedByWorker = staffEmail;
             if (workerNotes) orden.workerNotes = workerNotes.trim();
             await orden.save();
 
@@ -7434,6 +7515,8 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
     } catch (error) {
         console.error('Error en /api/worker/process-order:', error);
         return res.status(500).json({ error: 'Error procesando la orden.' });
+    } finally {
+        activeWorkerApprovalLocks.delete(idLock);
     }
 });
 
