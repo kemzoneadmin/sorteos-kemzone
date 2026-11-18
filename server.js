@@ -7548,7 +7548,6 @@ app.post('/api/worker/delete-order', verificarSoloAdmin, async (req, res) => {
 
         const idLimpio = String(orderId).trim().toUpperCase();
 
-        // 1. Detener cualquier poller o candado en memoria RAM para esta orden
         if (activeCentralOnePollers.has(idLimpio)) {
             clearTimeout(activeCentralOnePollers.get(idLimpio));
             activeCentralOnePollers.delete(idLimpio);
@@ -7557,10 +7556,8 @@ app.post('/api/worker/delete-order', verificarSoloAdmin, async (req, res) => {
         activeWorkerApprovalLocks.delete(idLimpio);
         _lastLiveStatusCoCheckMap.delete(idLimpio);
 
-        // 2. Eliminar la orden de MongoDB
         const ordenBorrada = await Order.findOneAndDelete({ orderId: idLimpio });
 
-        // 3. Eliminar cualquier transacción o ticket automático vinculado a esta orden para que no quede rastro en estadísticas
         await Transaction.deleteMany({
             detalles: { $regex: new RegExp(`#${idLimpio}\\b`, 'i') }
         }).catch(() => {});
@@ -7577,6 +7574,232 @@ app.post('/api/worker/delete-order', verificarSoloAdmin, async (req, res) => {
     } catch (error) {
         console.error('Error eliminando orden:', error);
         return res.status(500).json({ error: 'Error al eliminar la orden.' });
+    }
+});
+
+// 🕵️‍♂️ MOTOR FORENSE MULTINIVEL PARA OPERADORES Y DUEÑO (PAGO MÓVIL, BINANCE, ÓRDENES KZ Y AUDITOR DE CÓDIGOS CENTRAL ONE)
+app.post('/api/worker/forensic-verify', verificarTrabajadorOAdmin, async (req, res) => {
+    try {
+        const { mode, query } = req.body;
+        const rawQ = String(query || '').trim();
+        if (!rawQ || rawQ.length < 2) {
+            return res.status(400).json({ error: 'Ingresa al menos 2 caracteres para realizar la búsqueda forense.' });
+        }
+
+        const escaparRegex = (str) => String(str || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const projectionOrden = req.effectiveRole === 'admin'
+            ? '-internalAccountLogin.accountPass -apiRawResponse -algoExecutionState.pendingReplacementBody'
+            : '-internalAccountLogin.accountPass -costUSD -apiRawResponse -algoExecutionState.pendingReplacementBody';
+
+        // 1. VERIFICADOR DE REFERENCIAS DE PAGO MÓVIL (BS) Y BANCOS
+        if (mode === 'PAGO_MOVIL') {
+            const qClean = rawQ.replace(/[^a-zA-Z0-9-]/g, '').trim();
+            const regexRef = new RegExp(escaparRegex(qClean), 'i');
+
+            const [orders, tickets] = await Promise.all([
+                Order.find({
+                    paymentReference: { $regex: regexRef },
+                    paymentMethodKey: { $nin: ['tokems_kz'] }
+                }).sort({ fecha: -1 }).limit(25).select(projectionOrden).lean(),
+                SupportTicket.find({
+                    $or: [
+                        { paymentReference: { $regex: regexRef } },
+                        { 'messages.text': { $regex: regexRef } }
+                    ]
+                }).sort({ updatedAt: -1 }).limit(10).select('ticketId orderId userEmail userName status category paymentReference createdAt').lean()
+            ]);
+
+            return res.json({
+                success: true,
+                mode,
+                query: qClean,
+                orders,
+                tickets
+            });
+        }
+
+        // 2. VERIFICADOR DE TRANSACCIONES BINANCE PAY (TxID P_..., Order ID, Checkout ch_KZ..., Monto .001)
+        if (mode === 'BINANCE') {
+            const qClean = rawQ.trim();
+            const regexBn = new RegExp(escaparRegex(qClean), 'i');
+            const numMonto = parseFloat(qClean.replace(',', '.'));
+            const filtroOr = [
+                { binanceTransactionId: { $regex: regexBn } },
+                { binanceCheckoutId: { $regex: regexBn } },
+                { binancePayerName: { $regex: regexBn } },
+                { paymentReference: { $regex: regexBn } }
+            ];
+
+            if (!isNaN(numMonto) && numMonto > 0) {
+                filtroOr.push({
+                    binanceExactAmountUSDT: { $gte: Number((numMonto - 0.0005).toFixed(4)), $lte: Number((numMonto + 0.0005).toFixed(4)) }
+                });
+            }
+
+            const [orders, settingsDoc] = await Promise.all([
+                Order.find({
+                    $and: [
+                        { $or: [{ paymentMethodKey: { $regex: /binance/i } }, { binanceCheckoutId: { $ne: '' } }, { binanceTransactionId: { $ne: '' } }] },
+                        { $or: filtroOr }
+                    ]
+                }).sort({ fecha: -1 }).limit(25).select(projectionOrden).lean(),
+                StoreSettings.findOne({ key: 'main_settings' }).select('binanceAutoConfig').lean()
+            ]);
+
+            const usedTxIds = Array.isArray(settingsDoc?.binanceAutoConfig?.usedTxIds)
+                ? settingsDoc.binanceAutoConfig.usedTxIds
+                : [];
+            const isBurnedInGateway = usedTxIds.some(id => String(id).toLowerCase().includes(qClean.toLowerCase())) ||
+                                      memoriaTxIdsQuemados.has(qClean);
+
+            return res.json({
+                success: true,
+                mode,
+                query: qClean,
+                orders,
+                isBurnedInGateway
+            });
+        }
+
+        // 3. LOCALIZADOR MAESTRO DE ÓRDENES (#KZ-...), ID CENTRAL ONE O CLIENTE (UID / WHATSAPP / CORREO)
+        if (mode === 'KZ_ORDER') {
+            const limpioSinHash = rawQ.replace(/^#/, '').trim();
+            const soloDigitos = limpioSinHash.replace(/^KZ-/i, '').trim();
+            const regexGeneral = new RegExp(escaparRegex(limpioSinHash), 'i');
+            const regexKzId = new RegExp(escaparRegex(soloDigitos), 'i');
+
+            const orders = await Order.find({
+                $or: [
+                    { orderId: { $regex: regexKzId } },
+                    { apiOrderId: { $regex: regexGeneral } },
+                    { playerUid: { $regex: regexGeneral } },
+                    { userEmail: { $regex: regexGeneral } },
+                    { userWhatsapp: { $regex: regexGeneral } },
+                    { playerNickname: { $regex: regexGeneral } }
+                ]
+            }).sort({ fecha: -1 }).limit(25).select(projectionOrden).lean();
+
+            const orderIdsHallados = orders.map(o => o.orderId).filter(Boolean);
+            const tickets = await SupportTicket.find({
+                $or: [
+                    { orderId: { $in: orderIdsHallados } },
+                    { orderId: { $regex: regexKzId } },
+                    { ticketId: { $regex: regexGeneral } },
+                    { playerUid: { $regex: regexGeneral } }
+                ]
+            }).sort({ updatedAt: -1 }).limit(15).select('ticketId orderId userEmail userName status category assignedWorkerName createdAt').lean();
+
+            return res.json({
+                success: true,
+                mode,
+                query: limpioSinHash,
+                orders,
+                tickets
+            });
+        }
+
+        // 4. AUDITOR FORENSE DE CÓDIGOS PIN / CENTRAL ONE (ÓRDENES ENTREGADAS + STOCK PROPIO BÓVEDA + PAQUETES + PINES TOKEM)
+        if (mode === 'CODE_PIN') {
+            const limpioCodigo = rawQ.includes('➔')
+                ? rawQ.split('➔').slice(1).join('➔').trim()
+                : rawQ.trim();
+
+            if (limpioCodigo.length < 3) {
+                return res.status(400).json({ error: 'El código a verificar debe tener al menos 3 caracteres.' });
+            }
+
+            const regexCode = new RegExp(escaparRegex(limpioCodigo), 'i');
+            const codeUpper = limpioCodigo.toUpperCase();
+
+            const [ordersWithCode, settingsDoc, productsList, tokemPinDoc, tokemTxList] = await Promise.all([
+                Order.find({
+                    $or: [
+                        { deliveredCode: { $regex: regexCode } },
+                        { 'algoExecutionState.deliveredCodesList': { $regex: regexCode } }
+                    ]
+                }).sort({ fecha: -1 }).limit(25).select(projectionOrden).lean(),
+                StoreSettings.findOne({ key: 'main_settings' }).select('arbitrageBaseCards flashOffers').lean(),
+                CatalogProduct.find().select('slug name packages altPackages').lean(),
+                Pin.findOne({ code: codeUpper }).lean(),
+                Transaction.find({
+                    $or: [
+                        { codigoPin: { $regex: regexCode } },
+                        { detalles: { $regex: regexCode } }
+                    ]
+                }).sort({ fecha: -1 }).limit(10).lean()
+            ]);
+
+            // A. Escanear Stock Propio de la Bóveda del Algoritmo (arbitrageBaseCards.internalCodeStock)
+            const inOwnVaultCards = [];
+            (settingsDoc?.arbitrageBaseCards || []).forEach(c => {
+                const stockArr = Array.isArray(c.internalCodeStock) ? c.internalCodeStock : [];
+                stockArr.forEach((codStr, posIdx) => {
+                    const limpioStock = codStr.includes('➔') ? codStr.split('➔').slice(1).join('➔').trim() : String(codStr || '').trim();
+                    if (limpioStock.toUpperCase().includes(codeUpper)) {
+                        inOwnVaultCards.push({
+                            cardId: c.cardId,
+                            cardName: c.name,
+                            platformGroup: (c.platformGroup || 'steam').toUpperCase(),
+                            effectiveClientUSD: c.effectiveClientUSD,
+                            positionInQueue: posIdx + 1,
+                            totalInCard: stockArr.length,
+                            exactCode: limpioStock
+                        });
+                    }
+                });
+            });
+
+            // B. Escanear Bóvedas de Paquetes del Catálogo y Ofertas Relámpago (backupPinVault)
+            const inProductVaults = [];
+            (productsList || []).forEach(p => {
+                const revisarListaPaq = (arr, modoLbl) => {
+                    (arr || []).forEach(pk => {
+                        const boveda = Array.isArray(pk.backupPinVault) ? pk.backupPinVault : [];
+                        boveda.forEach((pinStr, idxPin) => {
+                            if (String(pinStr || '').toUpperCase().includes(codeUpper)) {
+                                inProductVaults.push({
+                                    productName: p.name,
+                                    packageName: `${pk.name}${modoLbl}`,
+                                    positionInVault: idxPin + 1,
+                                    exactCode: pinStr
+                                });
+                            }
+                        });
+                    });
+                };
+                revisarListaPaq(p.packages, '');
+                revisarListaPaq(p.altPackages, ' (Alt)');
+            });
+
+            (settingsDoc?.flashOffers || []).forEach(of => {
+                (of.backupPinVault || []).forEach((pinStr, idxPin) => {
+                    if (String(pinStr || '').toUpperCase().includes(codeUpper)) {
+                        inProductVaults.push({
+                            productName: `Oferta Relámpago (${of.game || of.slug})`,
+                            packageName: of.title,
+                            positionInVault: idxPin + 1,
+                            exactCode: pinStr
+                        });
+                    }
+                });
+            });
+
+            return res.json({
+                success: true,
+                mode,
+                query: limpioCodigo,
+                ordersWithCode,
+                inOwnVaultCards,
+                inProductVaults,
+                tokemPinDoc,
+                tokemTxList
+            });
+        }
+
+        return res.status(400).json({ error: 'Modo de verificación no válido.' });
+    } catch (error) {
+        console.error('Error en /api/worker/forensic-verify:', error);
+        return res.status(500).json({ error: 'Error ejecutando la auditoría forense.' });
     }
 });
 
