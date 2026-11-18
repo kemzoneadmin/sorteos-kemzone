@@ -3831,7 +3831,6 @@ app.use('/api/admin/overview', (req, res, next) => {
     next();
 });
 
-// ⏳ ENDPOINT DE DECISIÓN DEL CLIENTE TRAS 30 MINUTOS DE ESPERA ('WAIT' vs 'REFUND') CON CONTADOR PROGRESIVO
 app.post('/api/orders/delay-choice', cors(), express.json(), async (req, res) => {
     try {
         const { orderId, choice, deviceId, userEmail, userName, userWhatsapp } = req.body;
@@ -3845,18 +3844,17 @@ app.post('/api/orders/delay-choice', cors(), express.json(), async (req, res) =>
             return res.json({ success: true, order: orden, message: 'Tu pedido ya fue entregado.' });
         }
 
-        // OPCIÓN 1: EL CLIENTE ELIGE SEGUIR ESPERANDO (REINICIA OTROS 30 MINUTOS Y AUMENTA EL CICLO SIN RE-PEDIR A LA API)
+        // OPCIÓN 1: EL CLIENTE ELIGE SEGUIR ESPERANDO (REINICIA 1 HORA MÁS Y AUMENTA EL CICLO SIN RE-PEDIR A LA API)
         if (choice === 'WAIT') {
             const nuevoCiclo = (Number(orden.waitCyclesCount) || 0) + 1;
             orden.waitCyclesCount = nuevoCiclo;
             orden.timerStartedAt = new Date();
             orden.clientChoseToWait = true;
             orden.statusMessage = nuevoCiclo >= 2
-                ? `⏳ Seguimiento prioritario extendido (Ciclo #${nuevoCiclo + 1}): Nuestro sistema continúa esperando la liberación de tu entrega sin cargos adicionales...`
-                : '⏳ Seguimiento prioritario activado: Nuestro sistema continúa gestionando la entrega automática de tu compra...';
+                ? `⏳ Seguimiento prioritario extendido (Ciclo #${nuevoCiclo + 1} de 1 hora): Nuestro sistema continúa esperando la liberación de tu entrega sin cargos adicionales...`
+                : '⏳ Seguimiento prioritario activado (+1 hora): Nuestro sistema continúa gestionando la entrega automática de tu compra...';
             await orden.save();
 
-            // Si la orden ya fue enviada a Central One y el vigilante no estaba activo en RAM, reactivar solo la lectura pasiva
             if (orden.apiOrderId && !orden.apiOrderId.startsWith('VAULT-') && !orden.apiOrderId.startsWith('INTERNAL-') && !orden.apiOrderId.startsWith('API-')) {
                 if (!activeCentralOnePollers.has(orden.orderId)) {
                     const idCo = orden.apiOrderId.startsWith('kz-ord-') ? null : orden.apiOrderId;
@@ -3868,7 +3866,7 @@ app.post('/api/orders/delay-choice', cors(), express.json(), async (req, res) =>
             return res.json({ success: true, order: orden });
         }
 
-        // OPCIÓN 2: EL CLIENTE ELIGE SOLICITAR REEMBOLSO Y ABRIR TICKET AUTOMÁTICO EN CHAT
+        // OPCIÓN 2: EL CLIENTE ELIGE SOLICITAR REEMBOLSO Y ABRIR TICKET AUTOMÁTICO EN CHAT TRAS 1 HORA (O MÁS) DE ESPERA
         if (choice === 'REFUND') {
             orden.cancelledByDelayRefund = true;
             orden.status = 'RECHAZADO';
@@ -3898,15 +3896,16 @@ app.post('/api/orders/delay-choice', cors(), express.json(), async (req, res) =>
             const wsFinal = (userWhatsapp || orden.userWhatsapp || '').trim();
 
             const ciclosEsperados = (Number(orden.waitCyclesCount) || 0) + 1;
-            const minTotalesEsperados = ciclosEsperados * 30;
+            const minTotalesEsperados = ciclosEsperados * 60;
+            const textoHoras = ciclosEsperados === 1 ? '1 hora (60 min)' : `${ciclosEsperados} horas (${minTotalesEsperados} min)`;
             const montoTexto = `${orden.paymentReference || 'Tokems'} ($${Number(orden.totalAmountUSD || 0).toFixed(2)} USD / Bs. ${Number(orden.totalAmountVES || 0).toFixed(2)})`;
-            const mensajeAuto = `⏱️ SOLICITUD DE REEMBOLSO / AGENTE (+${minTotalesEsperados} MIN DE ESPERA):\n` +
+            const mensajeAuto = `⏱️ SOLICITUD DE REEMBOLSO / AGENTE (+${textoHoras.toUpperCase()} DE ESPERA):\n` +
                 `• Pedido cancelado: #${orden.orderId}\n` +
                 `• Producto: ${orden.productName} (${orden.packageName})\n` +
                 `• Método de pago: ${orden.paymentMethodName}\n` +
                 `• Referencia y Monto: ${montoTexto}\n` +
                 `• Destino / ID: ${orden.playerUid}\n` +
-                `El pedido superó el tiempo de espera (${ciclosEsperados} ciclo(s) de 30 min) y solicito mi reembolso o atención de un agente.`;
+                `El pedido superó el tiempo de espera (${ciclosEsperados} ciclo(s) de 1 hora) y solicito mi reembolso o atención de un agente.`;
 
             const nuevoTicket = await new SupportTicket({
                 ticketId,
@@ -3915,8 +3914,8 @@ app.post('/api/orders/delay-choice', cors(), express.json(), async (req, res) =>
                 userEmail: orden.userEmail || (identificador.includes('@') ? identificador : ''),
                 userName: nombreCliente,
                 userWhatsapp: wsFinal,
-                subject: `Reembolso por retraso (+${minTotalesEsperados} min) - Orden #${orden.orderId}`,
-                category: `Reembolso por espera (+${minTotalesEsperados} min) • #${orden.orderId}`,
+                subject: `Reembolso por retraso (+${textoHoras}) - Orden #${orden.orderId}`,
+                category: `Reembolso por espera (+${textoHoras}) • #${orden.orderId}`,
                 gameName: `${orden.productName} (${orden.packageName})`,
                 paymentMethod: orden.paymentMethodName || orden.paymentMethodKey,
                 paymentReference: montoTexto,
@@ -3931,7 +3930,7 @@ app.post('/api/orders/delay-choice', cors(), express.json(), async (req, res) =>
             }).save();
 
             orden.refundTicketId = ticketId;
-            orden.workerNotes = `Pedido cancelado por el cliente tras ${minTotalesEsperados} min de espera. Solicitud de reembolso abierta en Ticket #${ticketId}.`;
+            orden.workerNotes = `Pedido cancelado por el cliente tras ${textoHoras} de espera. Solicitud de reembolso abierta en Ticket #${ticketId}.`;
             orden.statusMessage = `Pedido cancelado a solicitud del cliente. Se abrió el chat de reembolso en el Ticket #${ticketId}.`;
             orden.completedAt = new Date();
             await orden.save();
@@ -3949,6 +3948,8 @@ app.post('/api/orders/delay-choice', cors(), express.json(), async (req, res) =>
         return res.status(500).json({ error: 'Error procesando solicitud de retraso.' });
     }
 });
+
+// =================================================================
 
 // =================================================================
 // 🛒 WEBHOOK DE SHOPIFY (INTACTO PARA COMPRA DE TOKEMS CON TARJETA)
