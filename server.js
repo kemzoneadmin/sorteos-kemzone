@@ -3831,6 +3831,21 @@ app.use('/api/admin/overview', (req, res, next) => {
     next();
 });
 
+// ⏱️ Inyectar siempre la hora oficial del servidor (serverNowMs) en las órdenes en vivo para que ningún teléfono con hora adelantada altere el contador de 1 hora
+app.use(['/api/orders/live-status', '/api/orders/create', '/api/binance-pay/check-status'], (req, res, next) => {
+    const _origJson = res.json.bind(res);
+    res.json = function(body) {
+        if (body && body.order && typeof body.order === 'object') {
+            if (typeof body.order.toObject === 'function') {
+                body.order = body.order.toObject();
+            }
+            body.order.serverNowMs = Date.now();
+        }
+        return _origJson(body);
+    };
+    next();
+});
+
 app.post('/api/orders/delay-choice', cors(), express.json(), async (req, res) => {
     try {
         const { orderId, choice, deviceId, userEmail, userName, userWhatsapp } = req.body;
@@ -3844,11 +3859,41 @@ app.post('/api/orders/delay-choice', cors(), express.json(), async (req, res) =>
             return res.json({ success: true, order: orden, message: 'Tu pedido ya fue entregado.' });
         }
 
+        // 🔒 CANDADO DE 1 HORA EN EL SERVIDOR: Verificar cuánto tiempo real ha transcurrido en el reloj del servidor
+        const DURACION_CICLO_1_HORA_MS = 60 * 60 * 1000; // 60 minutos reales
+        const ahoraServidorMs = Date.now();
+        const offsetVzlaMs = 4 * 60 * 60 * 1000;
+        const ahoraVzla = new Date(ahoraServidorMs - offsetVzlaMs);
+        const aperturaHoy11amUtcMs = Date.UTC(
+            ahoraVzla.getUTCFullYear(),
+            ahoraVzla.getUTCMonth(),
+            ahoraVzla.getUTCDate(),
+            15, 0, 0, 0
+        );
+
+        let inicioCicloMs = new Date(orden.timerStartedAt || orden.fecha || ahoraServidorMs).getTime();
+        if ((Number(orden.waitCyclesCount) || 0) === 0 && inicioCicloMs < aperturaHoy11amUtcMs && ahoraServidorMs >= aperturaHoy11amUtcMs) {
+            inicioCicloMs = aperturaHoy11amUtcMs;
+        }
+
+        const transcurridoRealServidorMs = Math.max(0, ahoraServidorMs - inicioCicloMs);
+
+        // Si un cliente con caché antiguo (de 30 min) o reloj de teléfono adelantado envía la petición antes de cumplirse la hora real (mínimo 58 min en servidor), sincronizar su reloj sin reiniciar ni cancelar
+        if (transcurridoRealServidorMs < (58 * 60 * 1000)) {
+            const ordObj = orden.toObject ? orden.toObject() : { ...orden };
+            ordObj.serverNowMs = ahoraServidorMs;
+            return res.json({
+                success: true,
+                prematureSync: true,
+                order: ordObj
+            });
+        }
+
         // OPCIÓN 1: EL CLIENTE ELIGE SEGUIR ESPERANDO (REINICIA 1 HORA MÁS Y AUMENTA EL CICLO SIN RE-PEDIR A LA API)
         if (choice === 'WAIT') {
             const nuevoCiclo = (Number(orden.waitCyclesCount) || 0) + 1;
             orden.waitCyclesCount = nuevoCiclo;
-            orden.timerStartedAt = new Date();
+            orden.timerStartedAt = new Date(ahoraServidorMs);
             orden.clientChoseToWait = true;
             orden.statusMessage = nuevoCiclo >= 2
                 ? `⏳ Seguimiento prioritario extendido (Ciclo #${nuevoCiclo + 1} de 1 hora): Nuestro sistema continúa esperando la liberación de tu entrega sin cargos adicionales...`
@@ -3863,7 +3908,9 @@ app.post('/api/orders/delay-choice', cors(), express.json(), async (req, res) =>
                 }
             }
 
-            return res.json({ success: true, order: orden });
+            const ordOut = orden.toObject ? orden.toObject() : { ...orden };
+            ordOut.serverNowMs = Date.now();
+            return res.json({ success: true, order: ordOut });
         }
 
         // OPCIÓN 2: EL CLIENTE ELIGE SOLICITAR REEMBOLSO Y ABRIR TICKET AUTOMÁTICO EN CHAT TRAS 1 HORA (O MÁS) DE ESPERA
@@ -3935,9 +3982,11 @@ app.post('/api/orders/delay-choice', cors(), express.json(), async (req, res) =>
             orden.completedAt = new Date();
             await orden.save();
 
+            const ordOut = orden.toObject ? orden.toObject() : { ...orden };
+            ordOut.serverNowMs = Date.now();
             return res.json({
                 success: true,
-                order: orden,
+                order: ordOut,
                 ticket: nuevoTicket
             });
         }
@@ -3948,8 +3997,6 @@ app.post('/api/orders/delay-choice', cors(), express.json(), async (req, res) =>
         return res.status(500).json({ error: 'Error procesando solicitud de retraso.' });
     }
 });
-
-// =================================================================
 
 // =================================================================
 // 🛒 WEBHOOK DE SHOPIFY (INTACTO PARA COMPRA DE TOKEMS CON TARJETA)
