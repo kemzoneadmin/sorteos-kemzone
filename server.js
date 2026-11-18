@@ -7540,22 +7540,39 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
     }
 });
 
-// 🗑️ ELIMINAR ORDEN DEFINITIVAMENTE (Exclusivo para el Dueño)
+// 🗑️ ELIMINAR ORDEN DEFINITIVAMENTE (Exclusivo para el Dueño — Limpia BD, Transacciones y Pollers en RAM)
 app.post('/api/worker/delete-order', verificarSoloAdmin, async (req, res) => {
     try {
         const { orderId } = req.body;
         if (!orderId) return res.status(400).json({ error: 'Falta el ID de la orden.' });
 
         const idLimpio = String(orderId).trim().toUpperCase();
+
+        // 1. Detener cualquier poller o candado en memoria RAM para esta orden
+        if (activeCentralOnePollers.has(idLimpio)) {
+            clearTimeout(activeCentralOnePollers.get(idLimpio));
+            activeCentralOnePollers.delete(idLimpio);
+        }
+        activeOrderProcessingLocks.delete(idLimpio);
+        activeWorkerApprovalLocks.delete(idLimpio);
+        _lastLiveStatusCoCheckMap.delete(idLimpio);
+
+        // 2. Eliminar la orden de MongoDB
         const ordenBorrada = await Order.findOneAndDelete({ orderId: idLimpio });
 
-        if (!ordenBorrada) {
-            return res.status(404).json({ error: 'La orden no existe o ya fue eliminada.' });
+        // 3. Eliminar cualquier transacción o ticket automático vinculado a esta orden para que no quede rastro en estadísticas
+        await Transaction.deleteMany({
+            detalles: { $regex: new RegExp(`#${idLimpio}\\b`, 'i') }
+        }).catch(() => {});
+
+        if (ordenBorrada && ordenBorrada.refundTicketId) {
+            await SupportTicket.deleteOne({ ticketId: ordenBorrada.refundTicketId }).catch(() => {});
         }
 
         return res.json({
             success: true,
-            message: `Orden #${idLimpio} eliminada con éxito de la base de datos.`
+            orderId: idLimpio,
+            message: `Orden #${idLimpio} eliminada por completo de la base de datos y de las estadísticas.`
         });
     } catch (error) {
         console.error('Error eliminando orden:', error);
