@@ -1189,8 +1189,8 @@ function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, ba
             effUsd = Number(((Number(c.faceValueOrigin) || 0) * (Number(c.conversionRateToUSD) || 0)).toFixed(4));
         }
         let costoReal = Number(c.costUSD || 0);
-        let enStockReal = c.inStock !== false;
-        let stockDisp = (c.availableStock !== null && c.availableStock !== undefined) ? Number(c.availableStock) : null;
+        let enStockAPI = c.inStock !== false;
+        let stockDispAPI = (c.availableStock !== null && c.availableStock !== undefined) ? Number(c.availableStock) : null;
         const stockInternoCount = Array.isArray(c.internalCodeStock) ? c.internalCodeStock.length : 0;
 
         let coIdResuelto = String(c.centralOneProductId || '').trim();
@@ -1200,41 +1200,46 @@ function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, ba
             const itemCO = (coIdResuelto && mapaCO_Id[coIdResuelto]) ||
                            (coSkuResuelto && mapaCO_Sku[coSkuResuelto.toUpperCase()]);
             if (!itemCO) {
-                enStockReal = false;
+                enStockAPI = false;
             } else {
                 if (!coIdResuelto && itemCO.product_id) coIdResuelto = String(itemCO.product_id);
                 if (!coSkuResuelto && itemCO.sku) coSkuResuelto = String(itemCO.sku);
-                enStockReal = Boolean(itemCO.in_stock && itemCO.status === 'active');
-                if ((!costoReal || costoReal <= 0) && itemCO.reseller_price !== null && Number(itemCO.reseller_price) > 0) {
+                enStockAPI = Boolean(itemCO.in_stock && itemCO.status === 'active');
+                if (itemCO.reseller_price !== null && Number(itemCO.reseller_price) > 0) {
                     costoReal = Number(itemCO.reseller_price);
                 }
                 if (itemCO.available_stock !== undefined && itemCO.available_stock !== null) {
-                    stockDisp = Number(itemCO.available_stock);
+                    stockDispAPI = Number(itemCO.available_stock);
                 }
+                if (stockDispAPI !== null && stockDispAPI <= 0) enStockAPI = false;
             }
         }
 
-if (!enStockReal && stockInternoCount <= 0) continue;
-        // Si en Central One NO hay stock pero tienes códigos propios en línea, limitar estrictamente a tus códigos propios
-        const stockTotalEfectivo = !enStockReal
+        if (costoReal <= 0 && stockInternoCount > 0 && effUsd > 0) {
+            costoReal = effUsd;
+        }
+
+        if (!enStockAPI && stockInternoCount <= 0) continue;
+        const stockTotalEfectivo = !enStockAPI
             ? stockInternoCount
-            : (stockDisp !== null ? (stockDisp + stockInternoCount) : null);
+            : (stockDispAPI !== null ? (stockDispAPI + stockInternoCount) : null);
         if (stockTotalEfectivo !== null && stockTotalEfectivo <= 0) continue;
         if (effUsd <= 0 || costoReal <= 0) continue;
 
         candidatas.push({
             ...c,
             cardId: c.cardId,
-            name: c.name || coSkuResuelto || 'Tarjeta Steam',
+            name: c.name || coSkuResuelto || 'Tarjeta Base',
             centralOneProductId: coIdResuelto,
             centralOneSku: coSkuResuelto,
             faceValueOrigin: c.faceValueOrigin,
-            originCurrency: c.originCurrency || 'VND',
+            originCurrency: c.originCurrency || 'USD',
             effectiveClientUSD: effUsd,
             costUSD: costoReal,
             costPerDollar: costoReal / effUsd,
             availableStock: stockTotalEfectivo,
-            internalStockCount: stockInternoCount
+            internalStockCount: stockInternoCount,
+            enStockAPI
         });
     }
 
@@ -1245,29 +1250,38 @@ if (!enStockReal && stockInternoCount <= 0) continue;
         };
     }
 
+    // 🔒 Techo máximo estricto: JAMÁS permite asignar una tarjeta de $10 o $100 a un paquete de $2, $4 o $5
+    const calcularTechoMaximoPermitidoUSD = (targetUSD) => {
+        if (targetUSD <= 2.50) return Number((targetUSD + 1.15).toFixed(2));
+        if (targetUSD <= 6.00) return Number((targetUSD + 1.35).toFixed(2));
+        if (targetUSD <= 15.00) return Number((targetUSD + 2.10).toFixed(2));
+        if (targetUSD <= 35.00) return Number((targetUSD + 3.50).toFixed(2));
+        return Number((targetUSD * 1.12).toFixed(2));
+    };
+
     const resolverTramoConAlgoritmoExacto = (targetTramoUSD, listaDisp, limiteCartas) => {
-        let cands = [...listaDisp];
+        const techoMaximoUSD = calcularTechoMaximoPermitidoUSD(targetTramoUSD);
+        let cands = listaDisp.filter(c => c.effectiveClientUSD <= techoMaximoUSD + 0.01);
+        if (cands.length === 0) return null;
+
         if (targetTramoUSD >= 10) {
             const umbralMin = (targetTramoUSD / limiteCartas) * 0.45;
-            const grandes = cands.filter(c => c.effectiveClientUSD >= umbralMin);
-            if (grandes.length > 0) cands = grandes;
+            const grandesOConStockPropio = cands.filter(c => c.effectiveClientUSD >= umbralMin || c.internalStockCount > 0);
+            if (grandesOConStockPropio.length > 0) cands = grandesOConStockPropio;
         }
 
         cands.sort((a, b) => {
+            const aTienePropio = a.internalStockCount > 0 ? 1 : 0;
+            const bTienePropio = b.internalStockCount > 0 ? 1 : 0;
+            if (aTienePropio !== bTienePropio) return bTienePropio - aTienePropio;
             if (Math.abs(a.costPerDollar - b.costPerDollar) > 0.015) return a.costPerDollar - b.costPerDollar;
             return b.effectiveClientUSD - a.effectiveClientUSD;
         });
 
         const n = cands.length;
-        const menorCartaUSD = Math.min(...cands.map(c => c.effectiveClientUSD));
         const mayorCartaUSD = Math.max(...cands.map(c => c.effectiveClientUSD));
-
         const pisoMinimoUSD = Number((targetTramoUSD - 0.001).toFixed(4));
-        const techoMaximoUSD = targetTramoUSD <= 3.50
-            ? Math.max(targetTramoUSD * 1.85, menorCartaUSD * 2.05)
-            : (targetTramoUSD <= 15 ? (targetTramoUSD * 1.35) : (targetTramoUSD + Math.max(8.0, targetTramoUSD * 0.25, mayorCartaUSD * 1.05)));
 
-        const mejorRatioCosto = Math.min(...cands.map(c => c.costPerDollar));
         const maxCartaGlobalPorIndice = new Array(n);
         let maxRunning = 0;
         for (let i = n - 1; i >= 0; i--) {
@@ -1277,19 +1291,25 @@ if (!enStockReal && stockInternoCount <= 0) continue;
 
         const penalizacionPorCartaMicro = Math.round(Math.max(0.15, targetTramoUSD * 0.012) * 10000);
         const soluciones = [];
-        let mejorCostoHalladoMicro = Infinity;
         let nodosExplorados = 0;
 
         function explorar(startIndex, cartasUsadas, conteoPorIndice, sumaClienteUSD, sumaCostoMicro) {
             nodosExplorados++;
-            if (nodosExplorados > 1400) return;
+            if (nodosExplorados > 1800) return;
 
             const sumaRedondeada = Number(sumaClienteUSD.toFixed(2));
             if (cartasUsadas > 0 && sumaRedondeada >= pisoMinimoUSD && sumaRedondeada <= techoMaximoUSD) {
                 const diffMeta = Number(Math.max(0, sumaRedondeada - targetTramoUSD).toFixed(2));
                 const itemsCombo = [];
+                let cartasCubiertasConStockPropio = 0;
+                let usdCubiertoConStockPropio = 0;
+
                 Object.entries(conteoPorIndice).forEach(([idxStr, qty]) => {
                     const card = cands[Number(idxStr)];
+                    const cubiertasPropio = Math.min(qty, Number(card.internalStockCount || 0));
+                    cartasCubiertasConStockPropio += cubiertasPropio;
+                    usdCubiertoConStockPropio += Number((cubiertasPropio * card.effectiveClientUSD).toFixed(2));
+
                     itemsCombo.push({
                         cardId: card.cardId,
                         centralOneProductId: card.centralOneProductId || '',
@@ -1298,14 +1318,14 @@ if (!enStockReal && stockInternoCount <= 0) continue;
                         quantity: qty,
                         unitCostUSD: Number(card.costUSD),
                         unitClientUSD: Number(card.effectiveClientUSD),
+                        ownStockUsed: cubiertasPropio,
                         originText: `${card.faceValueOrigin} ${card.originCurrency}`
                     });
                 });
 
+                const cartasAPedirEnAPI = Math.max(0, cartasUsadas - cartasCubiertasConStockPropio);
+                const cubierto100PorStockPropio = (cartasAPedirEnAPI === 0 && cartasCubiertasConStockPropio > 0);
                 const scoreBeneficioMicro = sumaCostoMicro + ((cartasUsadas - 1) * penalizacionPorCartaMicro);
-                if (scoreBeneficioMicro < mejorCostoHalladoMicro) {
-                    mejorCostoHalladoMicro = scoreBeneficioMicro;
-                }
 
                 soluciones.push({
                     hasSolution: true,
@@ -1316,6 +1336,10 @@ if (!enStockReal && stockInternoCount <= 0) continue;
                     scoreBeneficioMicro,
                     bonusClientUSD: diffMeta,
                     overshootUSD: diffMeta,
+                    ownStockCardsUsed: cartasCubiertasConStockPropio,
+                    ownStockUSD: usdCubiertoConStockPropio,
+                    apiCardsNeeded: cartasAPedirEnAPI,
+                    isFullyCoveredByOwnStock: cubierto100PorStockPropio,
                     items: itemsCombo
                 });
                 return;
@@ -1327,11 +1351,6 @@ if (!enStockReal && stockInternoCount <= 0) continue;
             const faltaUSD = Math.max(0, pisoMinimoUSD - sumaClienteUSD);
             const minCartasFaltantes = Math.ceil(faltaUSD / Math.max(0.1, maxCartaRestanteUSD));
             if (cartasUsadas + minCartasFaltantes > limiteCartas) return;
-
-            const minTotalCartasRama = Math.max(1, cartasUsadas + minCartasFaltantes);
-            const costoMinimoFaltanteMicro = Math.round(faltaUSD * mejorRatioCosto * 10000);
-            const scoreMinimoPosibleRama = sumaCostoMicro + costoMinimoFaltanteMicro + ((minTotalCartasRama - 1) * penalizacionPorCartaMicro);
-            if (scoreMinimoPosibleRama > mejorCostoHalladoMicro + 500) return;
 
             for (let i = startIndex; i < n; i++) {
                 const card = cands[i];
@@ -1354,8 +1373,21 @@ if (!enStockReal && stockInternoCount <= 0) continue;
         explorar(0, 0, {}, 0, 0);
         if (soluciones.length === 0) return null;
 
+        // 🏆 PRIORIDAD #1: Combinaciones cubiertas 100% con tu Stock Propio (como 1x $20 Xbox en tu stock) ganan SIEMPRE sobre pedir 2x $10 a la API
         soluciones.sort((a, b) => {
-            if (Math.abs(a.scoreBeneficioMicro - b.scoreBeneficioMicro) > 100) return a.scoreBeneficioMicro - b.scoreBeneficioMicro;
+            if (a.isFullyCoveredByOwnStock !== b.isFullyCoveredByOwnStock) {
+                return a.isFullyCoveredByOwnStock ? -1 : 1;
+            }
+            if (a.isFullyCoveredByOwnStock && b.isFullyCoveredByOwnStock) {
+                if (Math.abs(a.overshootUSD - b.overshootUSD) > 0.05) return a.overshootUSD - b.overshootUSD;
+                if (a.totalCards !== b.totalCards) return a.totalCards - b.totalCards;
+            }
+            if (Math.abs(a.ownStockUSD - b.ownStockUSD) > 0.50) {
+                return b.ownStockUSD - a.ownStockUSD;
+            }
+            if (Math.abs(a.scoreBeneficioMicro - b.scoreBeneficioMicro) > 100) {
+                return a.scoreBeneficioMicro - b.scoreBeneficioMicro;
+            }
             if (a.totalCards !== b.totalCards) return a.totalCards - b.totalCards;
             return a.overshootUSD - b.overshootUSD;
         });
@@ -1363,144 +1395,29 @@ if (!enStockReal && stockInternoCount <= 0) continue;
     };
 
     const { max: maxCartasHumano } = obtenerLimiteHumanoCodigosServer(metaUSD);
-    const mayorCartaGlobal = Math.max(...candidatas.map(c => c.effectiveClientUSD));
-    const minCodigosRequeridos = Math.ceil((metaUSD - 0.001) / Math.max(0.1, mayorCartaGlobal));
+    const techoGlobalMeta = calcularTechoMaximoPermitidoUSD(metaUSD);
+    const candidatasValidasParaMeta = candidatas.filter(c => c.effectiveClientUSD <= techoGlobalMeta + 0.01);
+
+    if (candidatasValidasParaMeta.length === 0) {
+        return {
+            hasSolution: false,
+            reason: `Sin tarjetas de denominación pequeña en stock para armar $${metaUSD.toFixed(2)} USD (Paquete pausado automáticamente).`
+        };
+    }
+
+    const mayorCartaValida = Math.max(...candidatasValidasParaMeta.map(c => c.effectiveClientUSD));
+    const minCodigosRequeridos = Math.ceil((metaUSD - 0.001) / Math.max(0.1, mayorCartaValida));
 
     let solucionFinal = null;
 
-    // 1. Intento normal dentro del límite de 10 tarjetas
     if (minCodigosRequeridos <= maxCartasHumano) {
-        solucionFinal = resolverTramoConAlgoritmoExacto(metaUSD, candidatas, maxCartasHumano);
-    }
-
-    // 2. MODO ESCALA INFINITA: Si supera las 10 tarjetas (o no alcanzó con 10), arma el bloque mayorista + cierre exacto
-    if (!solucionFinal) {
-        const candsConStock = candidatas.map(c => ({ ...c }));
-        candsConStock.sort((a, b) => {
-            const scoreA = (a.costUSD + 0.18) / a.effectiveClientUSD;
-            const scoreB = (b.costUSD + 0.18) / b.effectiveClientUSD;
-            if (Math.abs(scoreA - scoreB) > 0.02) return scoreA - scoreB;
-            return b.effectiveClientUSD - a.effectiveClientUSD;
-        });
-
-        const mapaBulk = new Map();
-        let usdAcumuladoBulk = 0;
-        let costoMicroBulk = 0;
-        let cartasBulk = 0;
-
-        const ventanaColaUSD = Math.max(mayorCartaGlobal * 4, 25);
-
-        for (const card of candsConStock) {
-            const faltaParaVentana = (metaUSD - ventanaColaUSD) - usdAcumuladoBulk;
-            if (faltaParaVentana <= 0) break;
-
-            let cantTomar = Math.floor(faltaParaVentana / card.effectiveClientUSD);
-            if (card.availableStock !== null && card.availableStock !== undefined) {
-                cantTomar = Math.min(cantTomar, Math.max(0, Number(card.availableStock)));
-            }
-            if (cantTomar > 0) {
-                mapaBulk.set(card.cardId, { card, qty: cantTomar });
-                usdAcumuladoBulk = Number((usdAcumuladoBulk + cantTomar * card.effectiveClientUSD).toFixed(4));
-                costoMicroBulk += cantTomar * aMicro4(card.costUSD);
-                cartasBulk += cantTomar;
-                if (card.availableStock !== null && card.availableStock !== undefined) {
-                    card.availableStock = Math.max(0, Number(card.availableStock) - cantTomar);
-                }
-            }
-        }
-
-        const restoPorCubrirUSD = Number(Math.max(0, metaUSD - usdAcumuladoBulk).toFixed(4));
-        let solCola = null;
-
-        if (restoPorCubrirUSD > 0.001) {
-            solCola = resolverTramoConAlgoritmoExacto(restoPorCubrirUSD, candsConStock, 10);
-
-            if (!solCola) {
-                for (const card of candsConStock) {
-                    const faltaAhora = (metaUSD - 0.001) - usdAcumuladoBulk;
-                    if (faltaAhora <= 0) break;
-                    let cantExtra = Math.ceil(faltaAhora / card.effectiveClientUSD);
-                    if (card.availableStock !== null && card.availableStock !== undefined) {
-                        cantExtra = Math.min(cantExtra, Math.max(0, Number(card.availableStock)));
-                    }
-                    if (cantExtra > 0) {
-                        const prev = mapaBulk.get(card.cardId);
-                        mapaBulk.set(card.cardId, { card, qty: (prev ? prev.qty : 0) + cantExtra });
-                        usdAcumuladoBulk = Number((usdAcumuladoBulk + cantExtra * card.effectiveClientUSD).toFixed(4));
-                        costoMicroBulk += cantExtra * aMicro4(card.costUSD);
-                        cartasBulk += cantExtra;
-                        if (card.availableStock !== null && card.availableStock !== undefined) {
-                            card.availableStock = Math.max(0, Number(card.availableStock) - cantExtra);
-                        }
-                    }
-                }
-            }
-        }
-
-        if (solCola && Array.isArray(solCola.items)) {
-            solCola.items.forEach(it => {
-                const prev = mapaBulk.get(it.cardId);
-                if (prev) {
-                    prev.qty += it.quantity;
-                } else {
-                    mapaBulk.set(it.cardId, {
-                        card: {
-                            cardId: it.cardId,
-                            centralOneProductId: it.centralOneProductId,
-                            centralOneSku: it.sku,
-                            name: it.name,
-                            costUSD: it.unitCostUSD,
-                            effectiveClientUSD: it.unitClientUSD,
-                            faceValueOrigin: '',
-                            originCurrency: ''
-                        },
-                        qty: it.quantity
-                    });
-                }
-                usdAcumuladoBulk = Number((usdAcumuladoBulk + it.quantity * it.unitClientUSD).toFixed(4));
-                costoMicroBulk += cantExtraCosto(it);
-                cartasBulk += it.quantity;
-            });
-        }
-
-        function cantExtraCosto(it) {
-            return it.quantity * aMicro4(it.unitCostUSD);
-        }
-
-        if (usdAcumuladoBulk >= metaUSD - 0.001 && cartasBulk > 0) {
-            const itemsMerged = [];
-            mapaBulk.forEach(({ card, qty }) => {
-                itemsMerged.push({
-                    cardId: card.cardId,
-                    centralOneProductId: card.centralOneProductId || '',
-                    sku: card.centralOneSku || '',
-                    name: card.name,
-                    quantity: qty,
-                    unitCostUSD: Number(card.costUSD),
-                    unitClientUSD: Number(card.effectiveClientUSD),
-                    originText: `${card.faceValueOrigin || ''} ${card.originCurrency || ''}`.trim()
-                });
-            });
-            const totalClientRedondeado = Number(usdAcumuladoBulk.toFixed(2));
-            const diffMetaFinal = Number(Math.max(0, totalClientRedondeado - metaUSD).toFixed(2));
-            solucionFinal = {
-                hasSolution: true,
-                totalCards: cartasBulk,
-                totalClientUSD: totalClientRedondeado,
-                totalCostUSD: deMicro4(costoMicroBulk),
-                totalCostMicro: costoMicroBulk,
-                scoreBeneficioMicro: costoMicroBulk,
-                bonusClientUSD: diffMetaFinal,
-                overshootUSD: diffMetaFinal,
-                items: itemsMerged
-            };
-        }
+        solucionFinal = resolverTramoConAlgoritmoExacto(metaUSD, candidatasValidasParaMeta, maxCartasHumano);
     }
 
     if (!solucionFinal) {
         return {
             hasSolution: false,
-            reason: `Stock insuficiente en la Bóveda para cubrir $${metaUSD.toFixed(2)} USD en este momento.`
+            reason: `Sin stock disponible para armar $${metaUSD.toFixed(2)} USD en este momento (Paquete pausado automáticamente).`
         };
     }
 
@@ -1562,7 +1479,7 @@ async function guardarCodigosRecuperadosEnStockInterno(ordenDB, listaObjetosCodi
                 type: 'BACK_IN_STOCK',
                 severity: 'OK',
                 title: `🏦 ${guardadosCount} código(s) guardados en Stock Interno (#${ordenDB ? ordenDB.orderId : 'KZ'})`,
-                detail: `El cliente había solicitado reembolso tras 30 min de espera, por lo que los códigos entregados por el proveedor se guardaron en tu Bóveda para usarlos automáticamente en la próxima venta.`
+                detail: `El cliente había solicitado reembolso tras 1 hora de espera, por lo que los códigos entregados por el proveedor se guardaron en tu Bóveda para usarlos automáticamente en la próxima venta.`
             });
             await settings.save();
         }
@@ -1571,7 +1488,7 @@ async function guardarCodigosRecuperadosEnStockInterno(ordenDB, listaObjetosCodi
     }
 }
 
-// 🔄 RECALCULADOR GLOBAL DE PRECIOS POR GANANCIA FIJA + ALGORITMO + AUTO-PAUSA POR FALTA DE STOCK EN PROVEEDOR
+// 🔄 RECALCULADOR GLOBAL DE PRECIOS POR GANANCIA FIJA + ALGORITMO + AUTO-PAUSA Y CURACIÓN DE PRECIOS INFLADOS
 async function recalcularPreciosYAlgoritmoTiendaKZ(settingsDoc = null, targetSlugOnly = null, desdeSyncAPI = false) {
     try {
         if (!settingsDoc) settingsDoc = await StoreSettings.findOne({ key: 'main_settings' });
@@ -1635,18 +1552,26 @@ async function recalcularPreciosYAlgoritmoTiendaKZ(settingsDoc = null, targetSlu
             const esSmartProd = Boolean(prod.isSmartCodeProduct);
             const platGroup = prod.smartPlatformGroup || 'steam';
 
-const procesarArregloPaquetes = (listaPaquetes) => {
+            const procesarArregloPaquetes = (listaPaquetes) => {
                 if (!Array.isArray(listaPaquetes)) return;
                 for (const pkg of listaPaquetes) {
-                    // Respeta el interruptor individual del paquete: si useSmartAlgorithm es false, funciona como Paquete Único directo aunque el producto sea de Algoritmo
                     const usaAlgo = (pkg.useSmartAlgorithm === false)
                         ? false
                         : Boolean(esSmartProd || pkg.useSmartAlgorithm);
 
                     const tieneStockBovedaPaquete = Array.isArray(pkg.backupPinVault) && pkg.backupPinVault.length > 0;
+                    const metaUsd = extraerMetaUsdDeNombrePaqueteServer(pkg);
+
+                    // 🛡️ AUTO-CURACIÓN: Si algún paquete (como 4 USD o 5 USD de PlayStation) quedó con el costo inflado de $98.32 ($100 USD), devolverlo a su valor base normal
+                    if (metaUsd > 0 && Number(pkg.costUSD) > Math.max(metaUsd * 2.1, metaUsd + 15)) {
+                        pkg.costUSD = metaUsd;
+                        const profSano = Number(pkg.profitUSD ?? 0.50);
+                        pkg.priceUSD = Number((metaUsd + profSano).toFixed(2));
+                        pkg.tokemsPrice = pkg.priceUSD;
+                        prodModificado = true;
+                    }
 
                     if (usaAlgo) {
-                        const metaUsd = extraerMetaUsdDeNombrePaqueteServer(pkg);
                         if (metaUsd > 0 && Number(pkg.targetClientUSD) !== metaUsd) {
                             pkg.targetClientUSD = metaUsd;
                             prodModificado = true;
@@ -1675,6 +1600,7 @@ const procesarArregloPaquetes = (listaPaquetes) => {
                                     prodModificado = true;
                                 }
                             } else {
+                                // Si no hay tarjetas pequeñas para armar el paquete (ej. $2 o $5 de PlayStation), se pausa automáticamente y NO altera su precio normal
                                 const estadoStockFinal = tieneStockBovedaPaquete ? true : false;
                                 if (pkg.providerInStock !== estadoStockFinal) {
                                     pkg.providerInStock = estadoStockFinal;
@@ -1696,7 +1622,6 @@ const procesarArregloPaquetes = (listaPaquetes) => {
                             const itemCO = (pkg.centralOneProductId && mapaCO_PorId[pkg.centralOneProductId]) ||
                                            (skuUpper && mapaCO_PorSku[skuUpper]);
 
-                            // También contar si esa tarjeta tiene códigos guardados en el Stock Propio de la Bóveda
                             const cardEnBoveda = (settingsDoc.arbitrageBaseCards || []).find(c =>
                                 (pkg.centralOneProductId && c.centralOneProductId === pkg.centralOneProductId) ||
                                 (skuUpper && String(c.centralOneSku || '').trim().toUpperCase() === skuUpper)
@@ -1718,8 +1643,7 @@ const procesarArregloPaquetes = (listaPaquetes) => {
                                 if (Array.isArray(itemCO.target_schema)) {
                                     pkg.targetSchemaCache = itemCO.target_schema;
                                 }
-                            } else if (pkg.centralOneProductId || (skuUpper && skuUpper.includes('-'))) {
-                                // Si el proveedor retiró o pausó la tarjeta del catálogo, pausar el paquete automáticamente
+                            } else if (pkg.centralOneProductId || (skuUpper && skuUpIncludesDash(skuUpper))) {
                                 const stockRespaldo = tieneRespaldoLocal ? true : false;
                                 if (pkg.providerInStock !== stockRespaldo) {
                                     pkg.providerInStock = stockRespaldo;
@@ -1744,6 +1668,10 @@ const procesarArregloPaquetes = (listaPaquetes) => {
                 }
             };
 
+            function skuUpIncludesDash(s) {
+                return s.includes('-');
+            }
+
             procesarArregloPaquetes(prod.packages);
             procesarArregloPaquetes(prod.altPackages);
 
@@ -1767,9 +1695,11 @@ const procesarArregloPaquetes = (listaPaquetes) => {
 
         if (operacionesBulk.length > 0) {
             await CatalogProduct.bulkWrite(operacionesBulk);
+            _ramBootstrapPayload = null;
+            _ramBootstrapTs = 0;
+            _ramFastProductsTs = 0;
         }
 
-        // Si alguna Oferta Relámpago está vinculada a Central One y quedó sin stock, pausarla también
         let ofertasModificadas = false;
         if (catalogoCO.length > 0 && Array.isArray(settingsDoc.flashOffers)) {
             for (const of of settingsDoc.flashOffers) {
