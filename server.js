@@ -9013,6 +9013,484 @@ app.get('/api/verify/:drawId', async (req, res) => {
     }
 });
 
+// =================================================================
+// 🤖 MOTOR DE NOTIFICACIONES EN VIVO POR TELEGRAM (4 EVENTOS + AUTO-DETECTOR DE CHAT/GRUPO)
+// =================================================================
+StoreSettings.schema.add({
+    telegramConfig: { type: mongoose.Schema.Types.Mixed, default: null }
+});
+
+const _telegramPreventiveAlertSentSet = new Set();
+
+async function obtenerConfigTelegramActiva(settingsDoc = null) {
+    if (!settingsDoc) {
+        settingsDoc = await StoreSettings.findOne({ key: 'main_settings' }).select('telegramConfig').lean();
+    }
+    const cfg = (settingsDoc && settingsDoc.telegramConfig && typeof settingsDoc.telegramConfig === 'object')
+        ? settingsDoc.telegramConfig
+        : {};
+
+    const botToken = String(cfg.botToken || process.env.TELEGRAM_BOT_TOKEN || '').trim();
+    const chatIdsRaw = String(cfg.chatId || process.env.TELEGRAM_CHAT_ID || '').trim();
+    const chatIds = chatIdsRaw.split(/[,;\s]+/).map(s => s.trim()).filter(Boolean);
+
+    return {
+        enabled: cfg.enabled !== false,
+        botToken,
+        chatId: chatIdsRaw,
+        chatIds,
+        notifyNewOrders: cfg.notifyNewOrders !== false,
+        notifyAutoSales: cfg.notifyAutoSales !== false,
+        notifyTickets: cfg.notifyTickets !== false,
+        notifyDelay35m: cfg.notifyDelay35m !== false
+    };
+}
+
+function escaparHtmlTelegram(texto) {
+    return String(texto ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+}
+
+async function enviarMensajeTelegramKZ(htmlText, inlineButtons = [], configOverride = null) {
+    try {
+        const cfg = configOverride || await obtenerConfigTelegramActiva();
+        if (!cfg.enabled || !cfg.botToken || !Array.isArray(cfg.chatIds) || cfg.chatIds.length === 0) {
+            return { ok: false, reason: 'Telegram no configurado o desactivado' };
+        }
+
+        const replyMarkup = (Array.isArray(inlineButtons) && inlineButtons.length > 0)
+            ? { inline_keyboard: inlineButtons }
+            : undefined;
+
+        const resultados = await Promise.all(cfg.chatIds.map(async (cid) => {
+            try {
+                const resp = await axios.post(`https://api.telegram.org/bot${cfg.botToken}/sendMessage`, {
+                    chat_id: cid,
+                    text: htmlText,
+                    parse_mode: 'HTML',
+                    disable_web_page_preview: true,
+                    ...(replyMarkup ? { reply_markup: replyMarkup } : {})
+                }, { timeout: 8000 });
+                return { chatId: cid, ok: Boolean(resp.data && resp.data.ok) };
+            } catch (err) {
+                return { chatId: cid, ok: false, error: err.response?.data?.description || err.message };
+            }
+        }));
+
+        const algunoExitoso = resultados.some(r => r.ok);
+        const primerError = resultados.find(r => !r.ok)?.error || '';
+        return { ok: algunoExitoso, results: resultados, error: algunoExitoso ? '' : primerError };
+    } catch (e) {
+        return { ok: false, error: e.message };
+    }
+}
+
+function armarBotonesTelegramParaOrden(orden) {
+    const fila1 = [
+        { text: '📋 Abrir Cola (Staff)', url: 'https://kemzone07.com/DashWork' },
+        { text: '👑 Dashwork Dueño', url: 'https://kemzone07.com/DashworkDueno' }
+    ];
+    const botones = [fila1];
+
+    const numWs = String(orden?.userWhatsapp || '').replace(/\D/g, '');
+    if (numWs.length >= 7) {
+        const numConCod = numWs.startsWith('0') ? '58' + numWs.slice(1) : (numWs.startsWith('58') ? numWs : '58' + numWs);
+        const msgWs = `¡Hola! Te escribe el soporte de Kem!Zone sobre tu pedido #${orden.orderId} (${orden.productName} - ${orden.packageName}).`;
+        botones.push([
+            { text: `💬 WhatsApp Cliente (${orden.userWhatsapp})`, url: `https://wa.me/${numConCod}?text=${encodeURIComponent(msgWs)}` }
+        ]);
+    }
+    return botones;
+}
+
+// 📥 EVENTO 1: Nueva Orden en Cola por Apartar (Pago Móvil, PayPal o Fallback Manual Binance)
+async function notificarTelegramNuevaOrdenEnCola(orden) {
+    try {
+        if (!orden || !orden.orderId) return;
+        const cfg = await obtenerConfigTelegramActiva();
+        if (!cfg.enabled || !cfg.notifyNewOrders || !cfg.botToken || cfg.chatIds.length === 0) return;
+
+        const horaVzla = new Date(Date.now() - 4 * 60 * 60 * 1000).toISOString().slice(11, 19);
+        const montoBs = Number(orden.totalAmountVES || 0).toFixed(2);
+        const montoUsdBcv = Number(orden.clientPayUSD || orden.bcvAmountUSD || orden.totalAmountUSD || 0).toFixed(2);
+        const montoUsdNeto = Number(orden.totalAmountUSD || 0).toFixed(2);
+        const refTxt = orden.paymentReference || 'N/A';
+
+        const alertaDuplicadaHtml = orden.isDuplicateRef
+            ? `\n🚨 <b>¡ALERTA ANTI-FRAUDE!</b> <i>${escaparHtmlTelegram(orden.duplicateWarningText || 'Esta referencia de 6 dígitos YA FUE USADA en otra orden.')}</i>\n`
+            : '';
+
+        const extrasJugador = [
+            orden.playerRegion ? `Región: ${orden.playerRegion}` : '',
+            orden.playerServer ? `Zona: ${orden.playerServer}` : '',
+            orden.playerNickname ? `Nick: ${orden.playerNickname}` : ''
+        ].filter(Boolean).join(' • ');
+
+        const tipoEntrega = orden.fulfillmentType === 'API_GIFT_CARD' || orden.isGiftCardPin
+            ? '🎁 Código Digital / PIN'
+            : (orden.fulfillmentType === 'MANUAL_INTERNAL' ? '🛡️ Recarga Interna (WhatsApp)' : '⚡ Recarga Directa por ID');
+
+        const html = [
+            `📥 <b>¡NUEVA ORDEN EN COLA POR APARTAR!</b> 🔥`,
+            alertaDuplicadaHtml,
+            `🧾 <b>Orden:</b> <code>#${escaparHtmlTelegram(orden.orderId)}</code>`,
+            `🏷️ <b>Tipo:</b> ${tipoEntrega}`,
+            `🎮 <b>Producto:</b> <b>${escaparHtmlTelegram(orden.productName)}</b>`,
+            `📦 <b>Paquete:</b> <b>${escaparHtmlTelegram(orden.packageName)}</b>`,
+            `────────────────────`,
+            `💳 <b>Método:</b> <b>${escaparHtmlTelegram(orden.paymentMethodName || orden.paymentMethodKey)}</b>`,
+            orden.paypalPayerName ? `👤 <b>Titular PayPal:</b> ${escaparHtmlTelegram(orden.paypalPayerName)}` : '',
+            `🔢 <b>Referencia (Toca para copiar):</b> <code>${escaparHtmlTelegram(refTxt)}</code>`,
+            `💰 <b>Monto a Verificar:</b> <code>Bs. ${montoBs}</code> <b>($${montoUsdBcv} BCV | Neto: $${montoUsdNeto})</b>`,
+            `────────────────────`,
+            `🆔 <b>Destino / UID (Toca para copiar):</b> <code>${escaparHtmlTelegram(orden.playerUid)}</code>`,
+            extrasJugador ? `🌐 <b>Datos Extra:</b> ${escaparHtmlTelegram(extrasJugador)}` : '',
+            orden.userEmail ? `📧 <b>Cliente:</b> ${escaparHtmlTelegram(orden.userEmail)}` : '',
+            orden.userWhatsapp ? `📱 <b>WhatsApp:</b> <code>${escaparHtmlTelegram(orden.userWhatsapp)}</code>` : '',
+            `🕒 <b>Hora Vzla:</b> ${horaVzla}`
+        ].filter(Boolean).join('\n');
+
+        await enviarMensajeTelegramKZ(html, armarBotonesTelegramParaOrden(orden), cfg);
+    } catch (e) {}
+}
+
+// 🟡 EVENTO 2: Venta Automática 24/7 (Binance Pay Auto o Saldo Tokems KZ)
+async function notificarTelegramVentaAutomatica(orden, origen = 'BINANCE_AUTO') {
+    try {
+        if (!orden || !orden.orderId) return;
+        const cfg = await obtenerConfigTelegramActiva();
+        if (!cfg.enabled || !cfg.notifyAutoSales || !cfg.botToken || cfg.chatIds.length === 0) return;
+
+        const montoBs = Number(orden.totalAmountVES || 0).toFixed(2);
+        const montoUsd = Number(orden.binanceExactAmountUSDT || orden.totalAmountUSD || 0).toFixed(origen === 'BINANCE_AUTO' ? 3 : 2);
+        const txId = orden.binanceTransactionId || orden.paymentReference || 'TOKEMS-KZ';
+
+        const html = [
+            `🤖 <b>¡VENTA AUTOMÁTICA ${origen === 'BINANCE_AUTO' ? 'BINANCE PAY 24/7' : 'CON TOKEMS KZ'}!</b> ✅`,
+            ``,
+            `🧾 <b>Orden:</b> <code>#${escaparHtmlTelegram(orden.orderId)}</code>`,
+            `🎮 <b>Producto:</b> <b>${escaparHtmlTelegram(orden.productName)}</b>`,
+            `📦 <b>Paquete:</b> <b>${escaparHtmlTelegram(orden.packageName)}</b>`,
+            `💳 <b>Pago Confirmado:</b> <b>${escaparHtmlTelegram(orden.paymentMethodName)}</b>`,
+            `🔢 <b>TxID / Ref:</b> <code>${escaparHtmlTelegram(txId)}</code>`,
+            `💰 <b>Monto:</b> <b>$${montoUsd} ${origen === 'BINANCE_AUTO' ? 'USDT' : 'USD'}</b> (Bs. ${montoBs})`,
+            `🆔 <b>Destino / UID:</b> <code>${escaparHtmlTelegram(orden.playerUid)}</code>`,
+            orden.userEmail ? `📧 <b>Cliente:</b> ${escaparHtmlTelegram(orden.userEmail)}` : '',
+            `📡 <b>Estado:</b> <b>${orden.status === 'ENTREGADO' ? '✅ ENTREGADO AL INSTANTE' : '⚡ PROCESANDO ENTREGA'}</b>`
+        ].filter(Boolean).join('\n');
+
+        await enviarMensajeTelegramKZ(html, armarBotonesTelegramParaOrden(orden), cfg);
+    } catch (e) {}
+}
+
+// 🎫 EVENTO 3: Nuevo Ticket de Soporte, Solicitud de Reembolso o Cliente deja su WhatsApp en Revisión
+async function notificarTelegramEventoSoporte(tituloEvento, detallesLineas = [], botonesExtras = []) {
+    try {
+        const cfg = await obtenerConfigTelegramActiva();
+        if (!cfg.enabled || !cfg.notifyTickets || !cfg.botToken || cfg.chatIds.length === 0) return;
+
+        const html = [
+            tituloEvento,
+            ``,
+            ...detallesLineas.filter(Boolean)
+        ].join('\n');
+
+        const botonesBase = [
+            [
+                { text: '🎧 Abrir Tickets (Staff)', url: 'https://kemzone07.com/DashWork' },
+                { text: '👑 Dashwork Dueño', url: 'https://kemzone07.com/DashworkDueno' }
+            ],
+            ...botonesExtras
+        ];
+
+        await enviarMensajeTelegramKZ(html, botonesBase, cfg);
+    } catch (e) {}
+}
+
+// ⏰ EVENTO 4: Vigilante Preventivo de Retraso a los 35 Minutos (Avisa 25 min antes de que se cumpla la hora)
+setInterval(async () => {
+    try {
+        const offsetVzlaMs = 4 * 60 * 60 * 1000;
+        const ahoraVzla = new Date(Date.now() - offsetVzlaMs);
+        const horaVzla = ahoraVzla.getUTCHours();
+        // Solo avisar en horario operativo (11:00 AM a 11:00 PM Venezuela)
+        if (horaVzla >= 23 || horaVzla < 11) return;
+
+        const cfg = await obtenerConfigTelegramActiva();
+        if (!cfg.enabled || !cfg.notifyDelay35m || !cfg.botToken || cfg.chatIds.length === 0) return;
+
+        const hace35Min = new Date(Date.now() - 35 * 60 * 1000);
+        const hace90Min = new Date(Date.now() - 90 * 60 * 1000);
+
+        const demoradas = await Order.find({
+            status: { $in: ['EN_PROCESO', 'ERROR_API'] },
+            isWaitingBinanceAuto: { $ne: true },
+            timerStartedAt: { $lte: hace35Min, $gte: hace90Min }
+        }).limit(15).lean();
+
+        for (const ord of demoradas) {
+            const keyAlert = `${ord.orderId}_c${ord.waitCyclesCount || 0}`;
+            if (_telegramPreventiveAlertSentSet.has(keyAlert)) continue;
+            _telegramPreventiveAlertSentSet.add(keyAlert);
+
+            const minTranscurridos = Math.round((Date.now() - new Date(ord.timerStartedAt || ord.fecha).getTime()) / 60000);
+            const estadoMesa = ord.claimedByWorker
+                ? `📌 Apartada por: <b>${escaparHtmlTelegram(ord.claimedByName || ord.claimedByWorker)}</b>`
+                : `📥 <b>¡SIN APARTAR EN LA COLA!</b>`;
+
+            const html = [
+                `⏰ <b>¡AVISO PREVENTIVO: ORDEN LLEVA ${minTranscurridos} MIN EN ESPERA!</b> ⚠️`,
+                `<i>Faltan ~${Math.max(1, 60 - minTranscurridos)} min para que se cumpla la hora del cliente.</i>`,
+                ``,
+                `🧾 <b>Orden:</b> <code>#${escaparHtmlTelegram(ord.orderId)}</code>`,
+                `👷 <b>Situación:</b> ${estadoMesa}`,
+                `🎮 <b>Producto:</b> <b>${escaparHtmlTelegram(ord.productName)} (${escaparHtmlTelegram(ord.packageName)})</b>`,
+                `💳 <b>Método:</b> ${escaparHtmlTelegram(ord.paymentMethodName)} • Ref: <code>${escaparHtmlTelegram(ord.paymentReference || 'N/A')}</code>`,
+                `💰 <b>Monto:</b> <code>Bs. ${Number(ord.totalAmountVES || 0).toFixed(2)}</code>`,
+                `🆔 <b>Destino:</b> <code>${escaparHtmlTelegram(ord.playerUid)}</code>`
+            ].join('\n');
+
+            await enviarMensajeTelegramKZ(html, armarBotonesTelegramParaOrden(ord), cfg);
+        }
+    } catch (e) {}
+}, 45000);
+
+// 🔗 Hook Automático en Mongoose: Dispara las alertas de Telegram en el milisegundo exacto sin tocar ni romper ninguna ruta existente
+Order.schema.post('save', function(doc) {
+    try {
+        if (!doc || !doc.orderId) return;
+
+        // 1. Si es una orden recién creada que entra a Cola por Apartar (Pago Móvil, PayPal)
+        if (doc.status === 'EN_PROCESO' && !doc.isWaitingBinanceAuto && !doc.paidWithTokems && !doc._tgNewNotified) {
+            const edadSeg = (Date.now() - new Date(doc.fecha || Date.now()).getTime()) / 1000;
+            if (edadSeg < 25 && !global._tgNotifiedOrdersSet?.has(doc.orderId)) {
+                global._tgNotifiedOrdersSet = global._tgNotifiedOrdersSet || new Set();
+                global._tgNotifiedOrdersSet.add(doc.orderId);
+                setImmediate(() => notificarTelegramNuevaOrdenEnCola(doc));
+            }
+        }
+
+        // 2. Si es un respaldo manual de Binance (cuando el cliente mete los 6 dígitos manuales en el checkout de Binance)
+        if (doc.status === 'EN_PROCESO' && String(doc.paymentMethodKey || '').includes('binance') && doc.paymentReference && !String(doc.paymentReference).startsWith('AUTO-')) {
+            const keyManualBn = `${doc.orderId}_BN_MANUAL`;
+            if (!global._tgNotifiedOrdersSet?.has(keyManualBn)) {
+                global._tgNotifiedOrdersSet = global._tgNotifiedOrdersSet || new Set();
+                global._tgNotifiedOrdersSet.add(keyManualBn);
+                setImmediate(() => notificarTelegramNuevaOrdenEnCola(doc));
+            }
+        }
+
+        // 3. Si es una venta automática completada por Tokems KZ o Binance Pay 24/7
+        const esAutoAprobada = (doc.approvedByWorker === 'AUTO-TOKEMS-API' || doc.approvedByWorker === 'AUTO-BINANCE-PAY');
+        if (esAutoAprobada && (doc.status === 'ENTREGADO' || doc.status === 'EJECUTANDO_API')) {
+            const keyAuto = `${doc.orderId}_AUTO_SALE`;
+            if (!global._tgNotifiedOrdersSet?.has(keyAuto)) {
+                global._tgNotifiedOrdersSet = global._tgNotifiedOrdersSet || new Set();
+                global._tgNotifiedOrdersSet.add(keyAuto);
+                const origen = doc.approvedByWorker === 'AUTO-BINANCE-PAY' ? 'BINANCE_AUTO' : 'TOKEMS_AUTO';
+                setImmediate(() => notificarTelegramVentaAutomatica(doc, origen));
+            }
+        }
+    } catch (e) {}
+});
+
+SupportTicket.schema.post('save', function(doc) {
+    try {
+        if (!doc || !doc.ticketId) return;
+        global._tgNotifiedTicketsSet = global._tgNotifiedTicketsSet || new Set();
+        if (doc.status === 'ABIERTO' && !global._tgNotifiedTicketsSet.has(doc.ticketId)) {
+            const edadSeg = (Date.now() - new Date(doc.createdAt || Date.now()).getTime()) / 1000;
+            if (edadSeg < 30) {
+                global._tgNotifiedTicketsSet.add(doc.ticketId);
+                const primerMsg = (doc.messages && doc.messages[0]) ? doc.messages[0].text : '';
+                setImmediate(() => {
+                    notificarTelegramEventoSoporte(
+                        `🎫 <b>¡NUEVO TICKET DE SOPORTE ABIERTO!</b> 🚨`,
+                        [
+                            `🎫 <b>Ticket:</b> <code>#${escaparHtmlTelegram(doc.ticketId)}</code>`,
+                            doc.orderId ? `🧾 <b>Orden Vinculada:</b> <code>#${escaparHtmlTelegram(doc.orderId)}</code>` : '',
+                            `📌 <b>Motivo:</b> <b>${escaparHtmlTelegram(doc.category || doc.subject)}</b>`,
+                            doc.gameName ? `🎮 <b>Producto:</b> ${escaparHtmlTelegram(doc.gameName)}` : '',
+                            doc.paymentReference ? `🔢 <b>Ref / Monto:</b> <code>${escaparHtmlTelegram(doc.paymentReference)}</code>` : '',
+                            `👤 <b>Cliente:</b> ${escaparHtmlTelegram(doc.userName || doc.userEmail || 'Invitado')}`,
+                            doc.userWhatsapp ? `📱 <b>WhatsApp:</b> <code>${escaparHtmlTelegram(doc.userWhatsapp)}</code>` : '',
+                            primerMsg ? `💬 <b>Mensaje:</b> <i>"${escaparHtmlTelegram(primerMsg.slice(0, 260))}"</i>` : ''
+                        ]
+                    );
+                });
+            }
+        }
+    } catch (e) {}
+});
+
+// Notificar también cuando un cliente deja su número de WhatsApp en una orden EN REVISIÓN
+Order.schema.post('findOneAndUpdate', function(doc) {
+    try {
+        if (!doc || !doc.orderId) return;
+        if (doc.clientReviewWhatsappSent && doc.userWhatsapp) {
+            const keyRevWs = `${doc.orderId}_REV_WS_${doc.userWhatsapp}`;
+            global._tgNotifiedOrdersSet = global._tgNotifiedOrdersSet || new Set();
+            if (!global._tgNotifiedOrdersSet.has(keyRevWs)) {
+                global._tgNotifiedOrdersSet.add(keyRevWs);
+                setImmediate(() => {
+                    notificarTelegramEventoSoporte(
+                        `📲 <b>¡CLIENTE EN REVISIÓN DEJÓ SU WHATSAPP!</b> 💬`,
+                        [
+                            `🧾 <b>Orden en Revisión:</b> <code>#${escaparHtmlTelegram(doc.orderId)}</code>`,
+                            `🎮 <b>Producto:</b> <b>${escaparHtmlTelegram(doc.productName)} (${escaparHtmlTelegram(doc.packageName)})</b>`,
+                            `⚠️ <b>Motivo de Revisión:</b> ${escaparHtmlTelegram(doc.reviewReason || doc.workerNotes || 'Verificar pago')}`,
+                            `📱 <b>WhatsApp del Cliente:</b> <code>${escaparHtmlTelegram(doc.userWhatsapp)}</code>`
+                        ],
+                        armarBotonesTelegramParaOrden(doc).slice(1)
+                    );
+                });
+            }
+        }
+    } catch (e) {}
+});
+
+// 🔍 ENDPOINT 1: Auto-Detectar el Chat ID o Grupo ID en 1 Clic después de escribirle "hola" al Bot
+app.post('/api/admin/telegram/detect-chat', verificarSoloAdmin, async (req, res) => {
+    try {
+        const { botToken } = req.body;
+        let settings = await StoreSettings.findOne({ key: 'main_settings' }).select('telegramConfig');
+        const prevCfg = (settings && settings.telegramConfig && typeof settings.telegramConfig === 'object')
+            ? settings.telegramConfig
+            : {};
+
+        const tokenUsar = (botToken && !String(botToken).includes('•') && String(botToken).trim().length > 15)
+            ? String(botToken).trim()
+            : String(prevCfg.botToken || process.env.TELEGRAM_BOT_TOKEN || '').trim();
+
+        if (!tokenUsar) {
+            return res.status(400).json({ error: 'Primero pega el Token de tu Bot de Telegram (el que te dio @BotFather).' });
+        }
+
+        const [resMe, resUpdates] = await Promise.all([
+            axios.get(`https://api.telegram.org/bot${tokenUsar}/getMe`, { timeout: 8000 }),
+            axios.get(`https://api.telegram.org/bot${tokenUsar}/getUpdates?limit=30`, { timeout: 8000 })
+        ]);
+
+        const botInfo = resMe.data?.result || {};
+        const updates = Array.isArray(resUpdates.data?.result) ? resUpdates.data.result : [];
+
+        const chatsDetectadosMap = new Map();
+        for (let i = updates.length - 1; i >= 0; i--) {
+            const u = updates[i];
+            const msg = u.message || u.channel_post || u.my_chat_member || u.edited_message;
+            const chat = msg?.chat;
+            if (chat && chat.id) {
+                const cidStr = String(chat.id);
+                if (!chatsDetectadosMap.has(cidStr)) {
+                    const label = chat.title
+                        ? `👥 Grupo/Canal: ${chat.title} (${cidStr})`
+                        : `👤 Chat Personal: ${[chat.first_name, chat.last_name].filter(Boolean).join(' ') || chat.username || 'Usuario'} (${cidStr})`;
+                    chatsDetectadosMap.set(cidStr, { id: cidStr, label, type: chat.type });
+                }
+            }
+        }
+
+        const chatsList = Array.from(chatsDetectadosMap.values());
+        if (chatsList.length === 0) {
+            return res.status(404).json({
+                error: `Conectado al bot @${botInfo.username || 'tu_bot'}, pero aún no hay mensajes recientes. Abre tu bot @${botInfo.username || ''} en Telegram (o mételo a tu grupo), envíale la palabra "hola" y vuelve a tocar este botón.`
+            });
+        }
+
+        return res.json({
+            success: true,
+            botUsername: botInfo.username || '',
+            botName: botInfo.first_name || '',
+            detectedChats: chatsList,
+            recommendedChatId: chatsList.map(c => c.id).join(', ')
+        });
+    } catch (error) {
+        const desc = error.response?.data?.description || error.message;
+        return res.status(400).json({ error: `Token de Telegram inválido o error de conexión: ${desc}` });
+    }
+});
+
+// 💾 ENDPOINT 2: Guardar Configuración de Telegram en MongoDB y Enviar Alerta de Prueba
+app.post('/api/admin/telegram/config', verificarSoloAdmin, async (req, res) => {
+    try {
+        const {
+            enabled,
+            botToken,
+            chatId,
+            notifyNewOrders,
+            notifyAutoSales,
+            notifyTickets,
+            notifyDelay35m,
+            sendTest
+        } = req.body;
+
+        const stExistente = await StoreSettings.findOne({ key: 'main_settings' }).select('telegramConfig').lean();
+        const prevCfg = (stExistente && stExistente.telegramConfig && typeof stExistente.telegramConfig === 'object')
+            ? { ...stExistente.telegramConfig }
+            : {};
+
+        if (typeof enabled === 'boolean') prevCfg.enabled = enabled;
+        if (botToken && !String(botToken).includes('•') && String(botToken).trim().length > 15) {
+            prevCfg.botToken = String(botToken).trim();
+        }
+        if (chatId !== undefined) {
+            prevCfg.chatId = String(chatId || '').trim();
+        }
+        if (typeof notifyNewOrders === 'boolean') prevCfg.notifyNewOrders = notifyNewOrders;
+        if (typeof notifyAutoSales === 'boolean') prevCfg.notifyAutoSales = notifyAutoSales;
+        if (typeof notifyTickets === 'boolean') prevCfg.notifyTickets = notifyTickets;
+        if (typeof notifyDelay35m === 'boolean') prevCfg.notifyDelay35m = notifyDelay35m;
+
+        await StoreSettings.collection.updateOne(
+            { key: 'main_settings' },
+            { $set: { telegramConfig: prevCfg } },
+            { upsert: true }
+        );
+
+        let testResult = null;
+        if (sendTest) {
+            const cfgActiva = await obtenerConfigTelegramActiva({ telegramConfig: prevCfg });
+            const htmlPrueba = [
+                `🟢 <b>¡BOT DE ALERTAS KEM!ZONE CONECTADO CON ÉXITO!</b> 🔥`,
+                ``,
+                `A partir de este momento recibirás aquí en <b>0.2 segundos</b>:`,
+                `${cfgActiva.notifyNewOrders ? '✅' : '⚪'} 📥 <b>Nuevas Órdenes en Cola por Apartar</b> (Pago Móvil / PayPal)`,
+                `${cfgActiva.notifyAutoSales ? '✅' : '⚪'} 🟡 <b>Ventas Automáticas 24/7</b> (Binance Pay y Tokems KZ)`,
+                `${cfgActiva.notifyTickets ? '✅' : '⚪'} 🎫 <b>Nuevos Tickets de Soporte y WhatsApp en Revisión</b>`,
+                `${cfgActiva.notifyDelay35m ? '✅' : '⚪'} ⏰ <b>Aviso Preventivo de Retraso</b> (a los 35 min en cola)`,
+                ``,
+                `🌐 <b>Tienda:</b> kemzone07.com`
+            ].join('\n');
+
+            testResult = await enviarMensajeTelegramKZ(htmlPrueba, [
+                [
+                    { text: '📋 Abrir Cola (Staff)', url: 'https://kemzone07.com/DashWork' },
+                    { text: '👑 Dashwork Dueño', url: 'https://kemzone07.com/DashworkDueno' }
+                ]
+            ], cfgActiva);
+        }
+
+        return res.json({
+            success: true,
+            testOk: testResult ? testResult.ok : true,
+            testError: testResult ? testResult.error : '',
+            config: {
+                enabled: prevCfg.enabled !== false,
+                hasBotToken: Boolean(prevCfg.botToken || process.env.TELEGRAM_BOT_TOKEN),
+                chatId: prevCfg.chatId || '',
+                notifyNewOrders: prevCfg.notifyNewOrders !== false,
+                notifyAutoSales: prevCfg.notifyAutoSales !== false,
+                notifyTickets: prevCfg.notifyTickets !== false,
+                notifyDelay35m: prevCfg.notifyDelay35m !== false
+            }
+        });
+    } catch (error) {
+        return res.status(500).json({ error: 'Error guardando configuración de Telegram.' });
+    }
+});
+
 app.listen(port, '0.0.0.0', () => {
     console.log(`🚀 Servidor Kem!Zone corriendo en el puerto ${port}`);
 });
