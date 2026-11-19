@@ -9014,13 +9014,15 @@ app.get('/api/verify/:drawId', async (req, res) => {
 });
 
 // =================================================================
-// 🤖 MOTOR DE NOTIFICACIONES EN VIVO POR TELEGRAM (4 EVENTOS + AUTO-DETECTOR DE CHAT/GRUPO)
+// 🤖 MOTOR DE NOTIFICACIONES EN VIVO POR TELEGRAM (4 EVENTOS + INTERCEPTOR DIRECTO DE .SAVE())
 // =================================================================
 StoreSettings.schema.add({
     telegramConfig: { type: mongoose.Schema.Types.Mixed, default: null }
 });
 
 const _telegramPreventiveAlertSentSet = new Set();
+global._tgNotifiedOrdersSet = global._tgNotifiedOrdersSet || new Set();
+global._tgNotifiedTicketsSet = global._tgNotifiedTicketsSet || new Set();
 
 async function obtenerConfigTelegramActiva(settingsDoc = null) {
     if (!settingsDoc) {
@@ -9209,147 +9211,200 @@ async function notificarTelegramEventoSoporte(tituloEvento, detallesLineas = [],
     } catch (e) {}
 }
 
-// ⏰ EVENTO 4: Vigilante Preventivo de Retraso a los 35 Minutos (Avisa 25 min antes de que se cumpla la hora)
-setInterval(async () => {
-    try {
-        const offsetVzlaMs = 4 * 60 * 60 * 1000;
-        const ahoraVzla = new Date(Date.now() - offsetVzlaMs);
-        const horaVzla = ahoraVzla.getUTCHours();
-        // Solo avisar en horario operativo (11:00 AM a 11:00 PM Venezuela)
-        if (horaVzla >= 23 || horaVzla < 11) return;
-
-        const cfg = await obtenerConfigTelegramActiva();
-        if (!cfg.enabled || !cfg.notifyDelay35m || !cfg.botToken || cfg.chatIds.length === 0) return;
-
-        const hace35Min = new Date(Date.now() - 35 * 60 * 1000);
-        const hace90Min = new Date(Date.now() - 90 * 60 * 1000);
-
-        const demoradas = await Order.find({
-            status: { $in: ['EN_PROCESO', 'ERROR_API'] },
-            isWaitingBinanceAuto: { $ne: true },
-            timerStartedAt: { $lte: hace35Min, $gte: hace90Min }
-        }).limit(15).lean();
-
-        for (const ord of demoradas) {
-            const keyAlert = `${ord.orderId}_c${ord.waitCyclesCount || 0}`;
-            if (_telegramPreventiveAlertSentSet.has(keyAlert)) continue;
-            _telegramPreventiveAlertSentSet.add(keyAlert);
-
-            const minTranscurridos = Math.round((Date.now() - new Date(ord.timerStartedAt || ord.fecha).getTime()) / 60000);
-            const estadoMesa = ord.claimedByWorker
-                ? `📌 Apartada por: <b>${escaparHtmlTelegram(ord.claimedByName || ord.claimedByWorker)}</b>`
-                : `📥 <b>¡SIN APARTAR EN LA COLA!</b>`;
-
-            const html = [
-                `⏰ <b>¡AVISO PREVENTIVO: ORDEN LLEVA ${minTranscurridos} MIN EN ESPERA!</b> ⚠️`,
-                `<i>Faltan ~${Math.max(1, 60 - minTranscurridos)} min para que se cumpla la hora del cliente.</i>`,
-                ``,
-                `🧾 <b>Orden:</b> <code>#${escaparHtmlTelegram(ord.orderId)}</code>`,
-                `👷 <b>Situación:</b> ${estadoMesa}`,
-                `🎮 <b>Producto:</b> <b>${escaparHtmlTelegram(ord.productName)} (${escaparHtmlTelegram(ord.packageName)})</b>`,
-                `💳 <b>Método:</b> ${escaparHtmlTelegram(ord.paymentMethodName)} • Ref: <code>${escaparHtmlTelegram(ord.paymentReference || 'N/A')}</code>`,
-                `💰 <b>Monto:</b> <code>Bs. ${Number(ord.totalAmountVES || 0).toFixed(2)}</code>`,
-                `🆔 <b>Destino:</b> <code>${escaparHtmlTelegram(ord.playerUid)}</code>`
-            ].join('\n');
-
-            await enviarMensajeTelegramKZ(html, armarBotonesTelegramParaOrden(ord), cfg);
-        }
-    } catch (e) {}
-}, 45000);
-
-// 🔗 Hook Automático en Mongoose: Dispara las alertas de Telegram en el milisegundo exacto sin tocar ni romper ninguna ruta existente
-Order.schema.post('save', function(doc) {
+// Evaluador Central de Orden para Disparar Alertas de Telegram sin Duplicados
+function evaluarYDispararAlertaTelegramOrden(doc) {
     try {
         if (!doc || !doc.orderId) return;
 
-        // 1. Si es una orden recién creada que entra a Cola por Apartar (Pago Móvil, PayPal)
-        if (doc.status === 'EN_PROCESO' && !doc.isWaitingBinanceAuto && !doc.paidWithTokems && !doc._tgNewNotified) {
-            const edadSeg = (Date.now() - new Date(doc.fecha || Date.now()).getTime()) / 1000;
-            if (edadSeg < 25 && !global._tgNotifiedOrdersSet?.has(doc.orderId)) {
-                global._tgNotifiedOrdersSet = global._tgNotifiedOrdersSet || new Set();
-                global._tgNotifiedOrdersSet.add(doc.orderId);
+        // 1. Orden en Cola por Apartar (Pago Móvil, PayPal o Fallback Manual de Binance)
+        const esEnColaPorApartar = doc.status === 'EN_PROCESO' &&
+                                   !doc.isWaitingBinanceAuto &&
+                                   !doc.paidWithTokems &&
+                                   !doc.claimedByWorker;
+
+        if (esEnColaPorApartar) {
+            const keyNew = `${doc.orderId}_NEW_QUEUE`;
+            if (!global._tgNotifiedOrdersSet.has(keyNew)) {
+                global._tgNotifiedOrdersSet.add(keyNew);
                 setImmediate(() => notificarTelegramNuevaOrdenEnCola(doc));
             }
         }
 
-        // 2. Si es un respaldo manual de Binance (cuando el cliente mete los 6 dígitos manuales en el checkout de Binance)
-        if (doc.status === 'EN_PROCESO' && String(doc.paymentMethodKey || '').includes('binance') && doc.paymentReference && !String(doc.paymentReference).startsWith('AUTO-')) {
-            const keyManualBn = `${doc.orderId}_BN_MANUAL`;
-            if (!global._tgNotifiedOrdersSet?.has(keyManualBn)) {
-                global._tgNotifiedOrdersSet = global._tgNotifiedOrdersSet || new Set();
-                global._tgNotifiedOrdersSet.add(keyManualBn);
-                setImmediate(() => notificarTelegramNuevaOrdenEnCola(doc));
-            }
-        }
-
-        // 3. Si es una venta automática completada por Tokems KZ o Binance Pay 24/7
+        // 2. Venta Automática 24/7 completada (Binance Pay Auto o Saldo Tokems KZ)
         const esAutoAprobada = (doc.approvedByWorker === 'AUTO-TOKEMS-API' || doc.approvedByWorker === 'AUTO-BINANCE-PAY');
         if (esAutoAprobada && (doc.status === 'ENTREGADO' || doc.status === 'EJECUTANDO_API')) {
             const keyAuto = `${doc.orderId}_AUTO_SALE`;
-            if (!global._tgNotifiedOrdersSet?.has(keyAuto)) {
-                global._tgNotifiedOrdersSet = global._tgNotifiedOrdersSet || new Set();
+            if (!global._tgNotifiedOrdersSet.has(keyAuto)) {
                 global._tgNotifiedOrdersSet.add(keyAuto);
                 const origen = doc.approvedByWorker === 'AUTO-BINANCE-PAY' ? 'BINANCE_AUTO' : 'TOKEMS_AUTO';
                 setImmediate(() => notificarTelegramVentaAutomatica(doc, origen));
             }
         }
     } catch (e) {}
-});
+}
 
-SupportTicket.schema.post('save', function(doc) {
+function evaluarYDispararAlertaTelegramTicket(doc) {
     try {
         if (!doc || !doc.ticketId) return;
-        global._tgNotifiedTicketsSet = global._tgNotifiedTicketsSet || new Set();
         if (doc.status === 'ABIERTO' && !global._tgNotifiedTicketsSet.has(doc.ticketId)) {
-            const edadSeg = (Date.now() - new Date(doc.createdAt || Date.now()).getTime()) / 1000;
-            if (edadSeg < 30) {
-                global._tgNotifiedTicketsSet.add(doc.ticketId);
-                const primerMsg = (doc.messages && doc.messages[0]) ? doc.messages[0].text : '';
-                setImmediate(() => {
-                    notificarTelegramEventoSoporte(
-                        `🎫 <b>¡NUEVO TICKET DE SOPORTE ABIERTO!</b> 🚨`,
-                        [
-                            `🎫 <b>Ticket:</b> <code>#${escaparHtmlTelegram(doc.ticketId)}</code>`,
-                            doc.orderId ? `🧾 <b>Orden Vinculada:</b> <code>#${escaparHtmlTelegram(doc.orderId)}</code>` : '',
-                            `📌 <b>Motivo:</b> <b>${escaparHtmlTelegram(doc.category || doc.subject)}</b>`,
-                            doc.gameName ? `🎮 <b>Producto:</b> ${escaparHtmlTelegram(doc.gameName)}` : '',
-                            doc.paymentReference ? `🔢 <b>Ref / Monto:</b> <code>${escaparHtmlTelegram(doc.paymentReference)}</code>` : '',
-                            `👤 <b>Cliente:</b> ${escaparHtmlTelegram(doc.userName || doc.userEmail || 'Invitado')}`,
-                            doc.userWhatsapp ? `📱 <b>WhatsApp:</b> <code>${escaparHtmlTelegram(doc.userWhatsapp)}</code>` : '',
-                            primerMsg ? `💬 <b>Mensaje:</b> <i>"${escaparHtmlTelegram(primerMsg.slice(0, 260))}"</i>` : ''
-                        ]
-                    );
-                });
-            }
+            global._tgNotifiedTicketsSet.add(doc.ticketId);
+            const primerMsg = (doc.messages && doc.messages[0]) ? doc.messages[0].text : '';
+            setImmediate(() => {
+                notificarTelegramEventoSoporte(
+                    `🎫 <b>¡NUEVO TICKET DE SOPORTE ABIERTO!</b> 🚨`,
+                    [
+                        `🎫 <b>Ticket:</b> <code>#${escaparHtmlTelegram(doc.ticketId)}</code>`,
+                        doc.orderId ? `🧾 <b>Orden Vinculada:</b> <code>#${escaparHtmlTelegram(doc.orderId)}</code>` : '',
+                        `📌 <b>Motivo:</b> <b>${escaparHtmlTelegram(doc.category || doc.subject)}</b>`,
+                        doc.gameName ? `🎮 <b>Producto:</b> ${escaparHtmlTelegram(doc.gameName)}` : '',
+                        doc.paymentReference ? `🔢 <b>Ref / Monto:</b> <code>${escaparHtmlTelegram(doc.paymentReference)}</code>` : '',
+                        `👤 <b>Cliente:</b> ${escaparHtmlTelegram(doc.userName || doc.userEmail || 'Invitado')}`,
+                        doc.userWhatsapp ? `📱 <b>WhatsApp:</b> <code>${escaparHtmlTelegram(doc.userWhatsapp)}</code>` : '',
+                        primerMsg ? `💬 <b>Mensaje:</b> <i>"${escaparHtmlTelegram(primerMsg.slice(0, 260))}"</i>` : ''
+                    ]
+                );
+            });
         }
     } catch (e) {}
-});
+}
 
-// Notificar también cuando un cliente deja su número de WhatsApp en una orden EN REVISIÓN
-Order.schema.post('findOneAndUpdate', function(doc) {
-    try {
-        if (!doc || !doc.orderId) return;
-        if (doc.clientReviewWhatsappSent && doc.userWhatsapp) {
-            const keyRevWs = `${doc.orderId}_REV_WS_${doc.userWhatsapp}`;
-            global._tgNotifiedOrdersSet = global._tgNotifiedOrdersSet || new Set();
+// ⚡ INTERCEPTOR DIRECTO SOBRE EL MODELO YA COMPILADO (Dispara en 0.00ms en cada .save() y .findOneAndUpdate())
+if (!Order.prototype._kzTelegramHooked) {
+    Order.prototype._kzTelegramHooked = true;
+    const _origOrderSave = Order.prototype.save;
+    Order.prototype.save = async function(...args) {
+        const resDoc = await _origOrderSave.apply(this, args);
+        evaluarYDispararAlertaTelegramOrden(resDoc || this);
+        return resDoc;
+    };
+}
+
+if (!SupportTicket.prototype._kzTelegramHooked) {
+    SupportTicket.prototype._kzTelegramHooked = true;
+    const _origTicketSave = SupportTicket.prototype.save;
+    SupportTicket.prototype.save = async function(...args) {
+        const resDoc = await _origTicketSave.apply(this, args);
+        evaluarYDispararAlertaTelegramTicket(resDoc || this);
+        return resDoc;
+    };
+}
+
+// Interceptar también cuando el cliente envía su WhatsApp en una orden EN REVISIÓN (/api/orders/client-review-contact)
+app.use('/api/orders/client-review-contact', (req, res, next) => {
+    const _origJson = res.json.bind(res);
+    res.json = function(body) {
+        if (body && body.success && body.order && body.order.userWhatsapp) {
+            const o = body.order;
+            const keyRevWs = `${o.orderId}_REV_WS_${o.userWhatsapp}`;
             if (!global._tgNotifiedOrdersSet.has(keyRevWs)) {
                 global._tgNotifiedOrdersSet.add(keyRevWs);
                 setImmediate(() => {
                     notificarTelegramEventoSoporte(
                         `📲 <b>¡CLIENTE EN REVISIÓN DEJÓ SU WHATSAPP!</b> 💬`,
                         [
-                            `🧾 <b>Orden en Revisión:</b> <code>#${escaparHtmlTelegram(doc.orderId)}</code>`,
-                            `🎮 <b>Producto:</b> <b>${escaparHtmlTelegram(doc.productName)} (${escaparHtmlTelegram(doc.packageName)})</b>`,
-                            `⚠️ <b>Motivo de Revisión:</b> ${escaparHtmlTelegram(doc.reviewReason || doc.workerNotes || 'Verificar pago')}`,
-                            `📱 <b>WhatsApp del Cliente:</b> <code>${escaparHtmlTelegram(doc.userWhatsapp)}</code>`
+                            `🧾 <b>Orden en Revisión:</b> <code>#${escaparHtmlTelegram(o.orderId)}</code>`,
+                            `🎮 <b>Producto:</b> <b>${escaparHtmlTelegram(o.productName)} (${escaparHtmlTelegram(o.packageName)})</b>`,
+                            `⚠️ <b>Motivo de Revisión:</b> ${escaparHtmlTelegram(o.reviewReason || o.workerNotes || 'Verificar pago')}`,
+                            `📱 <b>WhatsApp del Cliente:</b> <code>${escaparHtmlTelegram(o.userWhatsapp)}</code>`
                         ],
-                        armarBotonesTelegramParaOrden(doc).slice(1)
+                        armarBotonesTelegramParaOrden(o).slice(1)
                     );
                 });
             }
         }
-    } catch (e) {}
+        return _origJson(body);
+    };
+    next();
 });
+
+// 🛡️ RADAR DE RESPALDO CADA 5 SEGUNDOS + AVISO PREVENTIVO DE RETRASO A LOS 35 MINUTOS
+let _tgRadarInitialized = false;
+setInterval(async () => {
+    try {
+        const cfg = await obtenerConfigTelegramActiva();
+        if (!cfg.enabled || !cfg.botToken || cfg.chatIds.length === 0) return;
+
+        // En el primer arranque, registrar órdenes antiguas ya cerradas para no re-notificar historial viejo, pero SÍ notificar cualquier orden que esté ahorita mismo en Cola por Apartar (como #KZ-669095)
+        if (!_tgRadarInitialized) {
+            _tgRadarInitialized = true;
+            const hace2Horas = new Date(Date.now() - 2 * 60 * 60 * 1000);
+            const recientes = await Order.find({ fecha: { $gte: hace2Horas } }).select('orderId status claimedByWorker isWaitingBinanceAuto paidWithTokems approvedByWorker').lean();
+            recientes.forEach(r => {
+                const estaPorApartarAhora = (r.status === 'EN_PROCESO' && !r.claimedByWorker && !r.isWaitingBinanceAuto && !r.paidWithTokems);
+                if (!estaPorApartarAhora) {
+                    global._tgNotifiedOrdersSet.add(`${r.orderId}_NEW_QUEUE`);
+                }
+                if (r.approvedByWorker === 'AUTO-TOKEMS-API' || r.approvedByWorker === 'AUTO-BINANCE-PAY') {
+                    global._tgNotifiedOrdersSet.add(`${r.orderId}_AUTO_SALE`);
+                }
+            });
+
+            const ticketsRecientes = await SupportTicket.find({ createdAt: { $gte: hace2Horas } }).select('ticketId status').lean();
+            ticketsRecientes.forEach(tk => {
+                if (tk.status !== 'ABIERTO') {
+                    global._tgNotifiedTicketsSet.add(tk.ticketId);
+                }
+            });
+        }
+
+        // 1. Verificar cualquier orden en Cola por Apartar de los últimos 30 minutos que aún no haya sido notificada
+        const hace30Min = new Date(Date.now() - 30 * 60 * 1000);
+        const porApartarAhora = await Order.find({
+            status: 'EN_PROCESO',
+            isWaitingBinanceAuto: { $ne: true },
+            paidWithTokems: { $ne: true },
+            $or: [{ claimedByWorker: '' }, { claimedByWorker: null }, { claimedByWorker: { $exists: false } }],
+            fecha: { $gte: hace30Min }
+        }).sort({ fecha: 1 }).limit(10).lean();
+
+        for (const ord of porApartarAhora) {
+            evaluarYDispararAlertaTelegramOrden(ord);
+        }
+
+        // 2. Aviso Preventivo de Retraso a los 35 Minutos (en horario operativo 11:00 AM a 11:00 PM Venezuela)
+        if (cfg.notifyDelay35m) {
+            const offsetVzlaMs = 4 * 60 * 60 * 1000;
+            const ahoraVzla = new Date(Date.now() - offsetVzlaMs);
+            const horaVzla = ahoraVzla.getUTCHours();
+
+            if (horaVzla >= 11 && horaVzla < 23) {
+                const hace35Min = new Date(Date.now() - 35 * 60 * 1000);
+                const hace90Min = new Date(Date.now() - 90 * 60 * 1000);
+
+                const demoradas = await Order.find({
+                    status: { $in: ['EN_PROCESO', 'ERROR_API'] },
+                    isWaitingBinanceAuto: { $ne: true },
+                    timerStartedAt: { $lte: hace35Min, $gte: hace90Min }
+                }).limit(10).lean();
+
+                for (const ord of demoradas) {
+                    const keyAlert = `${ord.orderId}_c${ord.waitCyclesCount || 0}`;
+                    if (_telegramPreventiveAlertSentSet.has(keyAlert)) continue;
+                    _telegramPreventiveAlertSentSet.add(keyAlert);
+
+                    const minTranscurridos = Math.round((Date.now() - new Date(ord.timerStartedAt || ord.fecha).getTime()) / 60000);
+                    const estadoMesa = ord.claimedByWorker
+                        ? `📌 Apartada por: <b>${escaparHtmlTelegram(ord.claimedByName || ord.claimedByWorker)}</b>`
+                        : `📥 <b>¡SIN APARTAR EN LA COLA!</b>`;
+
+                    const html = [
+                        `⏰ <b>¡AVISO PREVENTIVO: ORDEN LLEVA ${minTranscurridos} MIN EN ESPERA!</b> ⚠️`,
+                        `<i>Faltan ~${Math.max(1, 60 - minTranscurridos)} min para que se cumpla la hora del cliente.</i>`,
+                        ``,
+                        `🧾 <b>Orden:</b> <code>#${escaparHtmlTelegram(ord.orderId)}</code>`,
+                        `👷 <b>Situación:</b> ${estadoMesa}`,
+                        `🎮 <b>Producto:</b> <b>${escaparHtmlTelegram(ord.productName)} (${escaparHtmlTelegram(ord.packageName)})</b>`,
+                        `💳 <b>Método:</b> ${escaparHtmlTelegram(ord.paymentMethodName)} • Ref: <code>${escaparHtmlTelegram(ord.paymentReference || 'N/A')}</code>`,
+                        `💰 <b>Monto:</b> <code>Bs. ${Number(ord.totalAmountVES || 0).toFixed(2)}</code>`,
+                        `🆔 <b>Destino:</b> <code>${escaparHtmlTelegram(ord.playerUid)}</code>`
+                    ].join('\n');
+
+                    await enviarMensajeTelegramKZ(html, armarBotonesTelegramParaOrden(ord), cfg);
+                }
+            }
+        }
+    } catch (e) {}
+}, 5000);
 
 // 🔍 ENDPOINT 1: Auto-Detectar el Chat ID o Grupo ID en 1 Clic después de escribirle "hola" al Bot
 app.post('/api/admin/telegram/detect-chat', verificarSoloAdmin, async (req, res) => {
