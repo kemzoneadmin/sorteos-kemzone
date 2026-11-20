@@ -9546,6 +9546,58 @@ app.post('/api/admin/telegram/config', verificarSoloAdmin, async (req, res) => {
     }
 });
 
+// =================================================================
+// 🟢 RADAR EN MEMORIA RAM DE VISITANTES EN LÍNEA AHORA MISMO EN LA TIENDA
+// =================================================================
+const _ramOnlineVisitorsMap = new Map();
+const VISITOR_TTL_MS = 75 * 1000; // 75 segundos de ventana activa en vivo
+
+function limpiarYObtenerVisitantesEnLineaAhora() {
+    const ahora = Date.now();
+    for (const [vid, ts] of _ramOnlineVisitorsMap.entries()) {
+        if (ahora - ts > VISITOR_TTL_MS) {
+            _ramOnlineVisitorsMap.delete(vid);
+        }
+    }
+    return _ramOnlineVisitorsMap.size;
+}
+
+// Endpoint ultraligero en RAM (0 escrituras en BD) para registrar visitantes reales con la tienda abierta
+app.post('/api/store/ping', (req, res) => {
+    try {
+        const { visitorId, inDashboard, leave } = req.body || {};
+        const ip = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.ip || '';
+        const key = String(visitorId || ip || '').trim().toLowerCase();
+
+        if (key) {
+            if (leave || inDashboard) {
+                _ramOnlineVisitorsMap.delete(key);
+            } else {
+                _ramOnlineVisitorsMap.set(key, Date.now());
+            }
+        }
+        return res.json({ onlineNow: limpiarYObtenerVisitantesEnLineaAhora() });
+    } catch (e) {
+        return res.json({ onlineNow: 0 });
+    }
+});
+
+// Inyectar automáticamente onlineVisitorsNow en /api/admin/overview y /api/worker/queue
+app.use(['/api/admin/overview', '/api/worker/queue'], (req, res, next) => {
+    const _origJson = res.json.bind(res);
+    res.json = function(body) {
+        if (body && typeof body === 'object') {
+            const countOnline = limpiarYObtenerVisitantesEnLineaAhora();
+            body.onlineVisitorsNow = countOnline;
+            if (body.analytics && typeof body.analytics === 'object') {
+                body.analytics.onlineVisitorsNow = countOnline;
+            }
+        }
+        return _origJson(body);
+    };
+    next();
+});
+
 app.listen(port, '0.0.0.0', () => {
     console.log(`🚀 Servidor Kem!Zone corriendo en el puerto ${port}`);
 });
