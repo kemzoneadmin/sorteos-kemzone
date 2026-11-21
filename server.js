@@ -1373,20 +1373,27 @@ function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, ba
         explorar(0, 0, {}, 0, 0);
         if (soluciones.length === 0) return null;
 
-        // 🏆 PRIORIDAD #1: Combinaciones cubiertas 100% con tu Stock Propio (como 1x $20 Xbox en tu stock) ganan SIEMPRE sobre pedir 2x $10 a la API
+// 🏆 ORDENAMIENTO INTELIGENTE EN SERVIDOR:
+        // Prioriza siempre el menor costo y menor exceso entregado (ej. 2x $5.10 = $10.20 sobre 1x $5.10 + 2x $2.89 = $10.88).
+        // Si dos combinaciones tienen un costo y exceso equivalentes (diferencia <= $0.18 USD), gana la que use más códigos de tu Stock Propio.
         soluciones.sort((a, b) => {
-            if (a.isFullyCoveredByOwnStock !== b.isFullyCoveredByOwnStock) {
-                return a.isFullyCoveredByOwnStock ? -1 : 1;
+            const diffCostoUSD = Math.abs(a.totalCostUSD - b.totalCostUSD);
+            const diffOvershootUSD = Math.abs(a.overshootUSD - b.overshootUSD);
+
+            if (diffCostoUSD <= 0.18 && diffOvershootUSD <= 0.25) {
+                if (a.isFullyCoveredByOwnStock !== b.isFullyCoveredByOwnStock) {
+                    return a.isFullyCoveredByOwnStock ? -1 : 1;
+                }
+                if (Math.abs(a.ownStockUSD - b.ownStockUSD) > 0.10) {
+                    return b.ownStockUSD - a.ownStockUSD;
+                }
             }
-            if (a.isFullyCoveredByOwnStock && b.isFullyCoveredByOwnStock) {
-                if (Math.abs(a.overshootUSD - b.overshootUSD) > 0.05) return a.overshootUSD - b.overshootUSD;
-                if (a.totalCards !== b.totalCards) return a.totalCards - b.totalCards;
-            }
-            if (Math.abs(a.ownStockUSD - b.ownStockUSD) > 0.50) {
-                return b.ownStockUSD - a.ownStockUSD;
-            }
-            if (Math.abs(a.scoreBeneficioMicro - b.scoreBeneficioMicro) > 100) {
+
+            if (Math.abs(a.scoreBeneficioMicro - b.scoreBeneficioMicro) > 120) {
                 return a.scoreBeneficioMicro - b.scoreBeneficioMicro;
+            }
+            if (Math.abs(a.ownStockUSD - b.ownStockUSD) > 0.10) {
+                return b.ownStockUSD - a.ownStockUSD;
             }
             if (a.totalCards !== b.totalCards) return a.totalCards - b.totalCards;
             return a.overshootUSD - b.overshootUSD;
@@ -9596,6 +9603,303 @@ app.use(['/api/admin/overview', '/api/worker/queue'], (req, res, next) => {
         return _origJson(body);
     };
     next();
+});
+
+// =================================================================
+// 🏦 RESCATADOR AUTOMÁTICO DE CÓDIGOS SUELTOS / HUÉRFANOS DE CENTRAL ONE
+// =================================================================
+app.post('/api/admin/central-one/recover-loose-codes', verificarSoloAdmin, async (req, res) => {
+    try {
+        const { mode = 'AUTO_SCAN', orderQuery = '' } = req.body || {};
+        const headers = obtenerHeadersCentralOne();
+        if (!headers) {
+            return res.status(400).json({ error: 'Falta configurar CENTRAL_ONE_API_KEY en Railway.' });
+        }
+
+        const settings = await StoreSettings.findOne({ key: 'main_settings' });
+        if (!settings) {
+            return res.status(404).json({ error: 'Configuración de tienda no encontrada.' });
+        }
+        if (!Array.isArray(settings.arbitrageBaseCards)) settings.arbitrageBaseCards = [];
+
+        // 1. Construir el conjunto de TODOS los códigos que ya fueron entregados a clientes o que están reservados en una orden activa en curso
+        const [ordenesConCodigos, productosTodos] = await Promise.all([
+            Order.find({
+                $or: [
+                    { deliveredCode: { $nin: ['', null] } },
+                    { 'algoExecutionState.deliveredCodesList.0': { $exists: true } },
+                    { status: 'EJECUTANDO_API' }
+                ]
+            }).select('orderId status apiOrderId deliveredCode algoExecutionState').lean(),
+            CatalogProduct.find().select('packages.backupPinVault altPackages.backupPinVault').lean()
+        ]);
+
+        const codigosEntregadosAClientesSet = new Set();
+        const coOrderIdsEnEjecucionActivaSet = new Set();
+
+        (ordenesConCodigos || []).forEach(o => {
+            if (o.status === 'EJECUTANDO_API' && o.apiOrderId) {
+                coOrderIdsEnEjecucionActivaSet.add(String(o.apiOrderId).trim());
+            }
+            if (o.deliveredCode) {
+                String(o.deliveredCode).split(/\s*\|\s*|\r?\n/).forEach(c => {
+                    const k = extraerCodigoCrudoDeTextoFormateado(c);
+                    if (k && k.length >= 4) codigosEntregadosAClientesSet.add(k);
+                });
+            }
+            const listaAlgo = o.algoExecutionState?.deliveredCodesList;
+            if (Array.isArray(listaAlgo)) {
+                listaAlgo.forEach(c => {
+                    // Si la orden fue cancelada/rechazada, sus códigos en listaAlgo no llegaron al cliente final
+                    if (o.status !== 'RECHAZADO') {
+                        const k = extraerCodigoCrudoDeTextoFormateado(c);
+                        if (k && k.length >= 4) codigosEntregadosAClientesSet.add(k);
+                    }
+                });
+            }
+        });
+
+        // 2. Construir el conjunto de códigos que YA están guardados actualmente en tu Stock Propio o en Bóvedas de Paquetes
+        const codigosYaEnStockPropioSet = new Set();
+        settings.arbitrageBaseCards.forEach(card => {
+            if (!Array.isArray(card.internalCodeStock)) card.internalCodeStock = [];
+            card.internalCodeStock.forEach(c => {
+                const k = extraerCodigoCrudoDeTextoFormateado(c);
+                if (k) codigosYaEnStockPropioSet.add(k);
+            });
+        });
+
+        (productosTodos || []).forEach(p => {
+            [...(p.packages || []), ...(p.altPackages || [])].forEach(pk => {
+                (pk.backupPinVault || []).forEach(c => {
+                    const k = extraerCodigoCrudoDeTextoFormateado(c);
+                    if (k) codigosYaEnStockPropioSet.add(k);
+                });
+            });
+        });
+
+        // 3. Resolver qué pedidos de Central One vamos a inspeccionar
+        const coOrdersToInspect = []; // [{ id, reference_code }]
+        const vistosCoId = new Set();
+
+        const agregarCoOrder = (id, ref = '') => {
+            const cleanId = String(id || '').trim();
+            if (!cleanId || cleanId.startsWith('VAULT-') || cleanId.startsWith('INTERNAL-') || cleanId.startsWith('MANUAL-') || cleanId.startsWith('API-') || cleanId.startsWith('kz-ord-')) {
+                return;
+            }
+            if (!vistosCoId.has(cleanId)) {
+                vistosCoId.add(cleanId);
+                coOrdersToInspect.push({ id: cleanId, reference_code: ref || cleanId });
+            }
+        };
+
+        if (mode === 'BY_ORDER') {
+            const qRaw = String(orderQuery || '').trim().replace(/^#/, '');
+            if (!qRaw) {
+                return res.status(400).json({ error: 'Ingresa la referencia (ej: C1-1MH168R3) o UUID del pedido.' });
+            }
+
+            // A) Verificar si escribió un ID de orden de KemZone (KZ-123456)
+            const ordKz = await Order.findOne({
+                $or: [
+                    { orderId: qRaw.toUpperCase() },
+                    { orderId: `KZ-${qRaw.toUpperCase()}` },
+                    { apiOrderId: qRaw }
+                ]
+            }).select('orderId apiOrderId').lean();
+
+            if (ordKz && ordKz.apiOrderId) {
+                agregarCoOrder(ordKz.apiOrderId, ordKz.orderId);
+            }
+
+            // B) Si es una referencia C1-... o aún no tenemos el UUID, buscar en la lista reciente de pedidos de Central One
+            if (coOrdersToInspect.length === 0) {
+                if (qRaw.toUpperCase().startsWith('C1-')) {
+                    try {
+                        const resList = await axios.get(`${CENTRAL_ONE_BASE_URL}/orders?limit=60`, { headers, timeout: 12000 });
+                        const itemsList = resList.data?.orders || resList.data?.items || resList.data?.data || [];
+                        const matchRef = itemsList.find(x => String(x.reference_code || '').trim().toUpperCase() === qRaw.toUpperCase());
+                        if (matchRef && matchRef.id) {
+                            agregarCoOrder(matchRef.id, matchRef.reference_code);
+                        }
+                    } catch (eList) {}
+                } else {
+                    agregarCoOrder(qRaw, qRaw);
+                }
+            }
+
+            if (coOrdersToInspect.length === 0) {
+                return res.status(404).json({
+                    error: `No encontramos ningún pedido en Central One con la referencia "${qRaw}". Si es un pedido antiguo, pega directamente su UUID de Central One.`
+                });
+            }
+        } else {
+            // MODO AUTO_SCAN:
+            // A) Consultar los últimos 30 pedidos directamente en tu cuenta de Central One
+            try {
+                const resList = await axios.get(`${CENTRAL_ONE_BASE_URL}/orders?limit=30`, { headers, timeout: 12000 });
+                const itemsList = resList.data?.orders || resList.data?.items || resList.data?.data || [];
+                itemsList.forEach(coOrd => {
+                    const st = String(coOrd.status || '').toLowerCase();
+                    if ((st === 'completed' || st === 'partially_completed') && coOrd.id && !coOrderIdsEnEjecucionActivaSet.has(coOrd.id)) {
+                        agregarCoOrder(coOrd.id, coOrd.reference_code || coOrd.id);
+                    }
+                });
+            } catch (eList) {}
+
+            // B) Agregar también cualquier orden reciente de KemZone que haya sido rechazada/cancelada o completada manualmente teniendo un apiOrderId
+            const ordenesKzCandidatas = await Order.find({
+                apiOrderId: { $nin: ['', null] },
+                $or: [
+                    { status: 'RECHAZADO' },
+                    { cancelledByDelayRefund: true },
+                    { 'algoExecutionState.manuallyCompletedWhilePendingCO': true }
+                ]
+            }).sort({ fecha: -1 }).limit(25).select('orderId apiOrderId').lean();
+
+            (ordenesKzCandidatas || []).forEach(o => {
+                if (o.apiOrderId && !coOrderIdsEnEjecucionActivaSet.has(o.apiOrderId)) {
+                    agregarCoOrder(o.apiOrderId, o.orderId);
+                }
+            });
+        }
+
+        let totalRescatados = 0;
+        let yaEntregadosCount = 0;
+        let yaEnStockCount = 0;
+        const desgloseRescatados = [];
+        const sinTarjetaMatch = [];
+
+        const lotesInspeccion = coOrdersToInspect.slice(0, 25);
+
+        for (const coTarget of lotesInspeccion) {
+            try {
+                const check = await verificarYExtraerEntregaCentralOne(
+                    coTarget.id,
+                    headers,
+                    settings.arbitrageBaseCards,
+                    false,
+                    0,
+                    null
+                );
+
+                if (!check || !Array.isArray(check.codigosPorItem) || check.codigosPorItem.length === 0) {
+                    continue;
+                }
+
+                for (const itemCode of check.codigosPorItem) {
+                    const metaMatch = emparejarItemCentralOneConMetaKZ(
+                        {
+                            catalog_item_id: itemCode.catalogItemId || '',
+                            sku: itemCode.sku || '',
+                            product_name: itemCode.name || '',
+                            unit_price: itemCode.unitCostUSD || 0
+                        },
+                        -1,
+                        [],
+                        settings.arbitrageBaseCards
+                    );
+
+                    const cPool = settings.arbitrageBaseCards.find(c =>
+                        (itemCode.cardId && c.cardId === itemCode.cardId) ||
+                        (metaMatch && metaMatch.cardId && c.cardId === metaMatch.cardId) ||
+                        (itemCode.catalogItemId && String(c.centralOneProductId || '').trim() === String(itemCode.catalogItemId).trim()) ||
+                        (itemCode.sku && String(c.centralOneSku || '').trim().toUpperCase() === String(itemCode.sku).trim().toUpperCase())
+                    );
+
+                    const listaCruda = Array.isArray(itemCode.rawCodes) && itemCode.rawCodes.length > 0
+                        ? itemCode.rawCodes
+                        : (Array.isArray(itemCode.codes) ? itemCode.codes : []);
+
+                    for (const rawC of listaCruda) {
+                        const limpio = rawC.includes('➔') ? rawC.split('➔').slice(1).join('➔').trim() : String(rawC || '').trim();
+                        const clave = extraerCodigoCrudoDeTextoFormateado(limpio);
+                        if (!limpio || !clave) continue;
+
+                        if (codigosEntregadosAClientesSet.has(clave)) {
+                            yaEntregadosCount++;
+                            continue;
+                        }
+                        if (codigosYaEnStockPropioSet.has(clave)) {
+                            yaEnStockCount++;
+                            continue;
+                        }
+
+                        if (cPool) {
+                            if (!Array.isArray(cPool.internalCodeStock)) cPool.internalCodeStock = [];
+                            cPool.internalCodeStock.push(limpio);
+                            codigosYaEnStockPropioSet.add(clave);
+                            totalRescatados++;
+                            desgloseRescatados.push(`<li><b>${cPool.name}</b> (${check.referenceCode || coTarget.reference_code}): <code style="color:#00e676; font-weight:900;">${limpio}</code></li>`);
+                        } else {
+                            sinTarjetaMatch.push(`<li><b>${itemCode.name || itemCode.sku || 'Tarjeta no vinculada'}</b> (${check.referenceCode || coTarget.reference_code}): <code style="color:#ffb700; font-weight:900;">${limpio}</code> <i>(Importa primero esta tarjeta base a la Bóveda para asignarlo)</i></li>`);
+                        }
+                    }
+                }
+            } catch (eOrder) {}
+        }
+
+        if (totalRescatados > 0) {
+            settings.markModified('arbitrageBaseCards');
+            await registrarAlertaCentralOne(settings, {
+                type: 'BACK_IN_STOCK',
+                severity: 'OK',
+                title: `🏦 +${totalRescatados} código(s) sueltos rescatados desde Central One`,
+                detail: `Se depositaron automáticamente en tu Inventario de Stock Propio listos para entregarse primero.`
+            });
+
+            await StoreSettings.collection.updateOne(
+                { key: 'main_settings' },
+                {
+                    $set: {
+                        arbitrageBaseCards: settings.arbitrageBaseCards.map(c => (c.toObject ? c.toObject() : c)),
+                        centralOneAlerts: settings.centralOneAlerts
+                    }
+                }
+            );
+
+            setImmediate(() => {
+                recalcularPreciosYAlgoritmoTiendaKZ().catch(() => {});
+            });
+        }
+
+        let summaryHtml = '';
+        if (totalRescatados > 0) {
+            summaryHtml = `
+                <strong style="color:#00e676; display:block; margin-bottom:4px;">✅ ¡Se rescataron y guardaron +${totalRescatados} código(s) sueltos en tu Stock Propio!</strong>
+                <ul style="margin:0; padding-left:18px;">${desgloseRescatados.join('')}</ul>
+                ${sinTarjetaMatch.length > 0 ? `<div style="margin-top:6px; color:#ffb700;">⚠️ Códigos de tarjetas que aún no tienes creadas en la Bóveda:<ul style="margin:2px 0 0 0; padding-left:18px;">${sinTarjetaMatch.join('')}</ul></div>` : ''}
+            `;
+        } else if (sinTarjetaMatch.length > 0) {
+            summaryHtml = `
+                <strong style="color:#ffb700; display:block; margin-bottom:4px;">⚠️ Se encontraron ${sinTarjetaMatch.length} código(s) sueltos, pero esa tarjeta aún no está agregada en tu Bóveda:</strong>
+                <ul style="margin:0; padding-left:18px;">${sinTarjetaMatch.join('')}</ul>
+            `;
+        } else {
+            summaryHtml = `
+                <span style="color:#cbd5e1;">
+                    🔎 Escaneo completado (${lotesInspeccion.length} pedido(s) de Central One verificados): <b>0 códigos sueltos pendientes</b>
+                    ${yaEntregadosCount > 0 ? ` • <b>${yaEntregadosCount}</b> ya habían sido entregados a clientes` : ''}
+                    ${yaEnStockCount > 0 ? ` • <b>${yaEnStockCount}</b> ya estaban guardados en tu Stock Propio` : ''}.
+                </span>
+            `;
+        }
+
+        return res.json({
+            success: true,
+            recoveredCount: totalRescatados,
+            alreadyDeliveredCount: yaEntregadosCount,
+            alreadyInStockCount: yaEnStockCount,
+            arbitrageBaseCards: settings.arbitrageBaseCards,
+            summaryHtml,
+            message: totalRescatados > 0
+                ? `Se rescataron +${totalRescatados} código(s) sueltos hacia tu Stock Propio.`
+                : `No se encontraron códigos sueltos sin usar (${yaEntregadosCount} entregados a clientes, ${yaEnStockCount} ya en tu Stock Propio).`
+        });
+    } catch (error) {
+        console.error('Error en /api/admin/central-one/recover-loose-codes:', error);
+        return res.status(500).json({ error: 'Error al escanear códigos sueltos en Central One.' });
+    }
 });
 
 app.listen(port, '0.0.0.0', () => {
