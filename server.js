@@ -9902,6 +9902,169 @@ app.post('/api/admin/central-one/recover-loose-codes', verificarSoloAdmin, async
     }
 });
 
+// =================================================================
+// 🌙 MOTOR DE HORARIO OPERATIVO PERSONALIZABLE EN SERVIDOR (VERIFICADOR Y TURNO)
+// =================================================================
+StoreSettings.schema.add({
+    scheduleConfig: { type: mongoose.Schema.Types.Mixed, default: null }
+});
+
+let _ramScheduleConfig = null;
+
+setTimeout(async () => {
+    try {
+        const docSch = await StoreSettings.collection.findOne(
+            { key: 'main_settings' },
+            { projection: { scheduleConfig: 1 } }
+        );
+        if (docSch && docSch.scheduleConfig) {
+            _ramScheduleConfig = docSch.scheduleConfig;
+        }
+    } catch (e) {}
+}, 1800);
+
+function formatearHora24a12AMPMServer(time24Str) {
+    const partes = String(time24Str || '11:00').trim().split(':');
+    let h = parseInt(partes[0], 10);
+    const m = parseInt(partes[1] || '0', 10);
+    if (isNaN(h)) h = 11;
+    const ampm = h >= 12 ? 'PM' : 'AM';
+    const h12 = h % 12 === 0 ? 12 : (h % 12);
+    const mStr = String(isNaN(m) ? 0 : m).padStart(2, '0');
+    return `${h12}:${mStr} ${ampm}`;
+}
+
+function calcularEstadoHorarioVenezuelaServer(scheduleConfig = null) {
+    const raw = scheduleConfig || _ramScheduleConfig || {};
+    const mode = ['AUTO', 'FORCE_OPEN', 'FORCE_OFFHOURS'].includes(raw.mode) ? raw.mode : 'AUTO';
+    const openTime = /^\d{2}:\d{2}$/.test(String(raw.openTime || '').trim()) ? String(raw.openTime).trim() : '11:00';
+    const closeTime = /^\d{2}:\d{2}$/.test(String(raw.closeTime || '').trim()) ? String(raw.closeTime).trim() : '23:00';
+
+    const ahoraUtcMs = Date.now();
+    const offsetVzlaMs = 4 * 60 * 60 * 1000; // UTC-4 Venezuela
+    const fechaVzla = new Date(ahoraUtcMs - offsetVzlaMs);
+
+    const anioVzla = fechaVzla.getUTCFullYear();
+    const mesVzla = fechaVzla.getUTCMonth();
+    const diaVzla = fechaVzla.getUTCDate();
+    const horaVzla = fechaVzla.getUTCHours();
+    const minVzla = fechaVzla.getUTCMinutes();
+
+    const [openH, openM] = openTime.split(':').map(Number);
+    const [closeH, closeM] = closeTime.split(':').map(Number);
+
+    const openMinDia = (openH * 60) + (openM || 0);
+    const closeMinDia = (closeH * 60) + (closeM || 0);
+    const actualMinDia = (horaVzla * 60) + minVzla;
+
+    let enHorarioPorReloj = true;
+    if (openMinDia < closeMinDia) {
+        enHorarioPorReloj = (actualMinDia >= openMinDia && actualMinDia < closeMinDia);
+    } else if (openMinDia > closeMinDia) {
+        enHorarioPorReloj = (actualMinDia >= openMinDia || actualMinDia < closeMinDia);
+    }
+
+    let fueraDeHorario = !enHorarioPorReloj;
+    if (mode === 'FORCE_OPEN') fueraDeHorario = false;
+    else if (mode === 'FORCE_OFFHOURS') fueraDeHorario = true;
+
+    const aperturaHoyUtcMs = Date.UTC(anioVzla, mesVzla, diaVzla, openH, openM || 0, 0, 0) + offsetVzlaMs;
+    let proximaAperturaUtcMs = aperturaHoyUtcMs;
+    if (actualMinDia >= openMinDia) {
+        proximaAperturaUtcMs += 24 * 60 * 60 * 1000;
+    }
+
+    return {
+        fueraDeHorario,
+        mode,
+        openTime,
+        closeTime,
+        openTimeFormatted: formatearHora24a12AMPMServer(openTime),
+        closeTimeFormatted: formatearHora24a12AMPMServer(closeTime),
+        aperturaHoyUtcMs,
+        proximaAperturaUtcMs
+    };
+}
+
+// Aplicar automáticamente el horario personalizado a toda nueva orden que se cree en la tienda
+Order.schema.pre('save', function(next) {
+    try {
+        if (this.isNew && this.status === 'EN_PROCESO' && !this.isWaitingBinanceAuto) {
+            const infoH = calcularEstadoHorarioVenezuelaServer(_ramScheduleConfig);
+            if (infoH.fueraDeHorario) {
+                this.timerStartedAt = new Date(infoH.proximaAperturaUtcMs);
+                this.statusMessage = `🌙 Compra registrada fuera de horario. Tu pedido está asegurado en cola prioritaria y se entregará a partir de las ${infoH.openTimeFormatted}.`;
+            } else {
+                this.timerStartedAt = new Date();
+                this.statusMessage = 'Tu orden está en proceso. Un operador está verificando tu referencia de pago...';
+            }
+        }
+    } catch (e) {}
+    if (typeof next === 'function') next();
+});
+
+// Endpoint para guardar el Horario Operativo desde "Verificador y Turno" (Trabajador o Dueño)
+app.post('/api/worker/schedule-config', verificarTrabajadorOAdmin, async (req, res) => {
+    try {
+        const { mode, openTime, closeTime } = req.body || {};
+        const nuevoConfig = {
+            mode: ['AUTO', 'FORCE_OPEN', 'FORCE_OFFHOURS'].includes(mode) ? mode : 'AUTO',
+            openTime: /^\d{2}:\d{2}$/.test(String(openTime || '').trim()) ? String(openTime).trim() : '11:00',
+            closeTime: /^\d{2}:\d{2}$/.test(String(closeTime || '').trim()) ? String(closeTime).trim() : '23:00',
+            updatedBy: req.staffUser?.email || 'staff',
+            updatedAt: new Date()
+        };
+
+        _ramScheduleConfig = nuevoConfig;
+        _ramBootstrapPayload = null;
+        _ramBootstrapTs = 0;
+        _ramFastSettingsTs = 0;
+
+        await StoreSettings.collection.updateOne(
+            { key: 'main_settings' },
+            { $set: { scheduleConfig: nuevoConfig } },
+            { upsert: true }
+        );
+
+        // Sincronizar también el reloj y mensaje de cualquier orden que esté actualmente EN_PROCESO
+        const infoH = calcularEstadoHorarioVenezuelaServer(nuevoConfig);
+        if (infoH.fueraDeHorario) {
+            await Order.updateMany(
+                { status: 'EN_PROCESO', isWaitingBinanceAuto: { $ne: true } },
+                {
+                    $set: {
+                        timerStartedAt: new Date(infoH.proximaAperturaUtcMs),
+                        statusMessage: `🌙 Compra registrada fuera de horario. Tu pedido está asegurado en cola prioritaria y se entregará a partir de las ${infoH.openTimeFormatted}.`
+                    }
+                }
+            ).catch(() => {});
+        } else {
+            await Order.updateMany(
+                {
+                    status: 'EN_PROCESO',
+                    isWaitingBinanceAuto: { $ne: true },
+                    timerStartedAt: { $gt: new Date() }
+                },
+                {
+                    $set: {
+                        timerStartedAt: new Date(),
+                        statusMessage: 'Tu orden está en proceso. Un operador está verificando tu referencia de pago...'
+                    }
+                }
+            ).catch(() => {});
+        }
+
+        return res.json({
+            success: true,
+            scheduleConfig: nuevoConfig,
+            liveInfo: infoH
+        });
+    } catch (error) {
+        console.error('Error en /api/worker/schedule-config:', error);
+        return res.status(500).json({ error: 'Error guardando el horario operativo.' });
+    }
+});
+
 app.listen(port, '0.0.0.0', () => {
     console.log(`🚀 Servidor Kem!Zone corriendo en el puerto ${port}`);
 });
