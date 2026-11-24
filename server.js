@@ -1136,14 +1136,14 @@ Order.schema.add({
 
 function obtenerLimiteHumanoCodigosServer(metaUSD) {
     const m = Number(metaUSD) || 0;
-    if (m <= 3.00) return { max: 2, ideal: 1 };
-    if (m <= 6.00) return { max: 2, ideal: 2 };
-    if (m <= 12.00) return { max: 3, ideal: 2 };
-    if (m <= 25.00) return { max: 4, ideal: 3 };
-    if (m <= 40.00) return { max: 5, ideal: 3 };
-    if (m <= 60.00) return { max: 6, ideal: 4 };
-    if (m <= 105.00) return { max: 8, ideal: 5 };
-    return { max: 10, ideal: 6 };
+    if (m <= 3.00) return { max: 3, ideal: 1 };
+    if (m <= 6.00) return { max: 3, ideal: 2 };
+    if (m <= 12.00) return { max: 4, ideal: 2 };
+    if (m <= 25.00) return { max: 5, ideal: 3 };
+    if (m <= 40.00) return { max: 6, ideal: 3 };
+    if (m <= 60.00) return { max: 7, ideal: 4 };
+    if (m <= 105.00) return { max: 9, ideal: 5 };
+    return { max: 11, ideal: 6 };
 }
 
 function extraerMetaUsdDeNombrePaqueteServer(pkg) {
@@ -1250,22 +1250,33 @@ function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, ba
         };
     }
 
-    // 🔒 Techo máximo estricto: JAMÁS permite asignar una tarjeta de $10 o $100 a un paquete de $2, $4 o $5
-    const calcularTechoMaximoPermitidoUSD = (targetUSD) => {
-        if (targetUSD <= 2.50) return Number((targetUSD + 1.15).toFixed(2));
-        if (targetUSD <= 6.00) return Number((targetUSD + 1.35).toFixed(2));
-        if (targetUSD <= 15.00) return Number((targetUSD + 2.10).toFixed(2));
-        if (targetUSD <= 35.00) return Number((targetUSD + 3.50).toFixed(2));
-        return Number((targetUSD * 1.12).toFixed(2));
+    const menorCartaGlobalUSD = Math.min(...candidatas.map(c => c.effectiveClientUSD));
+
+    // 🔒 Techo máximo calibrado: impide sobrecostos exagerados pero permite cubrir montos pequeños como $1.50 USD
+    const calcularTechoMaximoPermitidoUSD = (targetUSD, menorCartaDispUSD = 0) => {
+        let techoBase = 0;
+        if (targetUSD <= 3.00) techoBase = Number((targetUSD + 1.65).toFixed(2));
+        else if (targetUSD <= 6.00) techoBase = Number((targetUSD + 1.85).toFixed(2));
+        else if (targetUSD <= 15.00) techoBase = Number((targetUSD + 2.50).toFixed(2));
+        else if (targetUSD <= 35.00) techoBase = Number((targetUSD + 3.80).toFixed(2));
+        else techoBase = Number((targetUSD * 1.14).toFixed(2));
+
+        if (menorCartaDispUSD > 0 && menorCartaDispUSD <= targetUSD + 2.10) {
+            techoBase = Math.max(techoBase, Number((menorCartaDispUSD + 0.05).toFixed(2)));
+        }
+        return techoBase;
     };
 
-    const resolverTramoConAlgoritmoExacto = (targetTramoUSD, listaDisp, limiteCartas) => {
-        const techoMaximoUSD = calcularTechoMaximoPermitidoUSD(targetTramoUSD);
+    const resolverTramoConAlgoritmoExacto = (targetTramoUSD, listaDisp, limiteCartas, techoCustomUSD = null) => {
+        const techoMaximoUSD = techoCustomUSD !== null
+            ? techoCustomUSD
+            : calcularTechoMaximoPermitidoUSD(targetTramoUSD, menorCartaGlobalUSD);
+
         let cands = listaDisp.filter(c => c.effectiveClientUSD <= techoMaximoUSD + 0.01);
         if (cands.length === 0) return null;
 
         if (targetTramoUSD >= 10) {
-            const umbralMin = (targetTramoUSD / limiteCartas) * 0.45;
+            const umbralMin = (targetTramoUSD / limiteCartas) * 0.40;
             const grandesOConStockPropio = cands.filter(c => c.effectiveClientUSD >= umbralMin || c.internalStockCount > 0);
             if (grandesOConStockPropio.length > 0) cands = grandesOConStockPropio;
         }
@@ -1289,13 +1300,14 @@ function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, ba
             maxCartaGlobalPorIndice[i] = maxRunning;
         }
 
-        const penalizacionPorCartaMicro = Math.round(Math.max(0.15, targetTramoUSD * 0.012) * 10000);
+        // Penalización progresiva por tarjeta extra: obliga al algoritmo a preferir siempre la menor cantidad de tarjetas posible
+        const penalizacionPorCartaMicro = Math.round(Math.max(0.22, targetTramoUSD * 0.015) * 10000);
         const soluciones = [];
         let nodosExplorados = 0;
 
         function explorar(startIndex, cartasUsadas, conteoPorIndice, sumaClienteUSD, sumaCostoMicro) {
             nodosExplorados++;
-            if (nodosExplorados > 1800) return;
+            if (nodosExplorados > 2200) return;
 
             const sumaRedondeada = Number(sumaClienteUSD.toFixed(2));
             if (cartasUsadas > 0 && sumaRedondeada >= pisoMinimoUSD && sumaRedondeada <= techoMaximoUSD) {
@@ -1373,9 +1385,8 @@ function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, ba
         explorar(0, 0, {}, 0, 0);
         if (soluciones.length === 0) return null;
 
-// 🏆 ORDENAMIENTO INTELIGENTE EN SERVIDOR:
-        // Prioriza siempre el menor costo y menor exceso entregado (ej. 2x $5.10 = $10.20 sobre 1x $5.10 + 2x $2.89 = $10.88).
-        // Si dos combinaciones tienen un costo y exceso equivalentes (diferencia <= $0.18 USD), gana la que use más códigos de tu Stock Propio.
+        // 🏆 ORDENAMIENTO INTELIGENTE EN SERVIDOR:
+        // Prioriza siempre el menor costo, Stock Propio y la menor cantidad de tarjetas posible.
         soluciones.sort((a, b) => {
             const diffCostoUSD = Math.abs(a.totalCostUSD - b.totalCostUSD);
             const diffOvershootUSD = Math.abs(a.overshootUSD - b.overshootUSD);
@@ -1387,22 +1398,23 @@ function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, ba
                 if (Math.abs(a.ownStockUSD - b.ownStockUSD) > 0.10) {
                     return b.ownStockUSD - a.ownStockUSD;
                 }
+                if (a.totalCards !== b.totalCards) {
+                    return a.totalCards - b.totalCards;
+                }
             }
 
             if (Math.abs(a.scoreBeneficioMicro - b.scoreBeneficioMicro) > 120) {
                 return a.scoreBeneficioMicro - b.scoreBeneficioMicro;
             }
-            if (Math.abs(a.ownStockUSD - b.ownStockUSD) > 0.10) {
-                return b.ownStockUSD - a.ownStockUSD;
-            }
             if (a.totalCards !== b.totalCards) return a.totalCards - b.totalCards;
+            if (Math.abs(a.ownStockUSD - b.ownStockUSD) > 0.10) return b.ownStockUSD - a.ownStockUSD;
             return a.overshootUSD - b.overshootUSD;
         });
         return soluciones[0];
     };
 
     const { max: maxCartasHumano } = obtenerLimiteHumanoCodigosServer(metaUSD);
-    const techoGlobalMeta = calcularTechoMaximoPermitidoUSD(metaUSD);
+    const techoGlobalMeta = calcularTechoMaximoPermitidoUSD(metaUSD, menorCartaGlobalUSD);
     const candidatasValidasParaMeta = candidatas.filter(c => c.effectiveClientUSD <= techoGlobalMeta + 0.01);
 
     if (candidatasValidasParaMeta.length === 0) {
@@ -1417,8 +1429,18 @@ function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, ba
 
     let solucionFinal = null;
 
+    // 1. Intento principal con el límite ampliado (+1 tarjeta en cada rango)
     if (minCodigosRequeridos <= maxCartasHumano) {
-        solucionFinal = resolverTramoConAlgoritmoExacto(metaUSD, candidatasValidasParaMeta, maxCartasHumano);
+        solucionFinal = resolverTramoConAlgoritmoExacto(metaUSD, candidatasValidasParaMeta, maxCartasHumano, techoGlobalMeta);
+    }
+
+    // 2. Rescate flexible (+1 tarjeta extra adicional o techo ligeramente ampliado) si aún no hubo combinación
+    if (!solucionFinal) {
+        const techoFlexible = Number((techoGlobalMeta + 0.85).toFixed(2));
+        const candsFlexibles = candidatas.filter(c => c.effectiveClientUSD <= techoFlexible + 0.01);
+        if (candsFlexibles.length > 0) {
+            solucionFinal = resolverTramoConAlgoritmoExacto(metaUSD, candsFlexibles, Math.min(12, maxCartasHumano + 1), techoFlexible);
+        }
     }
 
     if (!solucionFinal) {
