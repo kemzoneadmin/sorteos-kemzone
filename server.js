@@ -5437,37 +5437,53 @@ const _origFindOrders = Order.find;
 // 🏪 ENDPOINTS PÚBLICOS DE LA TIENDA KEM!ZONE (CATÁLOGO Y COMPRAS)
 // =================================================================
 
-// ⚡ CACHÉ EN RAM PARA BOOTSTRAP PÚBLICO Y VERIFICACIÓN INSTANTÁNEA DE JUGADORES
 let _ramBootstrapPayload = null;
 let _ramBootstrapTs = 0;
 const _ramVerifiedPlayersCache = new Map();
 
-app.use(['/api/admin/settings', '/api/admin/central-one/sync', '/api/admin/product/save', '/api/admin/product/delete', '/api/admin/product/reorder', '/api/admin/payment-method/save', '/api/admin/payment-method/delete', '/api/admin/binance-pay/config'], (req, res, next) => {
-    res.on('finish', () => {
-        _ramBootstrapPayload = null;
-        _ramBootstrapTs = 0;
-    });
+// Invalidar en 0ms toda caché en RAM apenas el Dueño o Trabajador guarde cualquier cambio
+app.use((req, res, next) => {
+    if (req.method === 'POST' && (req.path.startsWith('/api/admin/') || req.path.startsWith('/api/worker/'))) {
+        res.on('finish', () => {
+            _ramBootstrapPayload = null;
+            _ramBootstrapTs = 0;
+            if (typeof _ramFastSettingsTs !== 'undefined') _ramFastSettingsTs = 0;
+            if (typeof _ramFastProductsTs !== 'undefined') _ramFastProductsTs = 0;
+            if (typeof _ramFastPaymentMethodsTs !== 'undefined') _ramFastPaymentMethodsTs = 0;
+        });
+    }
     next();
 });
 
 app.get('/api/store/bootstrap', async (req, res) => {
-    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0');
     res.set('Pragma', 'no-cache');
     res.set('Expires', '0');
     res.set('Surrogate-Control', 'no-store');
     try {
         const ahora = Date.now();
-        if (_ramBootstrapPayload && (ahora - _ramBootstrapTs < 15000)) {
+        const forzarFresco = Boolean(req.query.nocache === '1' || req.query._t);
+
+        if (!forzarFresco && _ramBootstrapPayload && (ahora - _ramBootstrapTs < 3000)) {
             return res.json({
                 ..._ramBootstrapPayload,
                 serverTimestamp: ahora
             });
         }
 
-        const [settings, products, paymentMethods] = await Promise.all([
-            StoreSettings.findOne({ key: 'main_settings' })
-                .select('-centralOneCatalogCache -centralOneCoverageCache -centralOneAlerts -processedWebhookIds -flyersCanvaConfig')
-                .lean(),
+        const [settingsRaw, products, paymentMethods] = await Promise.all([
+            StoreSettings.collection.findOne(
+                { key: 'main_settings' },
+                {
+                    projection: {
+                        centralOneCatalogCache: 0,
+                        centralOneCoverageCache: 0,
+                        centralOneAlerts: 0,
+                        processedWebhookIds: 0,
+                        flyersCanvaConfig: 0
+                    }
+                }
+            ),
             CatalogProduct.find()
                 .sort({ sortOrder: 1, createdAt: 1 })
                 .select('-packages.costUSD -packages.backupPinVault -packages.targetSchemaCache -altPackages.costUSD -altPackages.backupPinVault -altPackages.targetSchemaCache')
@@ -5475,9 +5491,14 @@ app.get('/api/store/bootstrap', async (req, res) => {
             PaymentMethod.find({ active: true }).sort({ sortOrder: 1 }).lean()
         ]);
 
+        const settings = settingsRaw || { exchangeRateVES: 1012.00, bcvRateVES: 889.25, tokemValueUSD: 1.00, storeOpen: true };
+        if (typeof _ramScheduleConfig !== 'undefined' && _ramScheduleConfig) {
+            settings.scheduleConfig = _ramScheduleConfig;
+        }
+
         _ramBootstrapPayload = {
             success: true,
-            settings: settings || { exchangeRateVES: 55.00, tokemValueUSD: 1.00, storeOpen: true },
+            settings,
             products: products || [],
             paymentMethods: paymentMethods || []
         };
