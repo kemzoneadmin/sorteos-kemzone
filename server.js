@@ -1457,65 +1457,7 @@ function calcularMejorCombinacionTarjetasPool(targetClientUSD, platformGroup, ba
     return solucionFinal;
 }
 
-// 🏦 Guarda en el Stock Interno de la Bóveda cualquier código que llegue después de que el cliente pidió reembolso por demora
-async function guardarCodigosRecuperadosEnStockInterno(ordenDB, listaObjetosCodigos = [], codigosPlanos = []) {
-    try {
-        const settings = await StoreSettings.findOne({ key: 'main_settings' });
-        if (!settings) return;
-        let guardadosCount = 0;
-
-        if (Array.isArray(listaObjetosCodigos) && listaObjetosCodigos.length > 0 && Array.isArray(settings.arbitrageBaseCards)) {
-            for (const itemCode of listaObjetosCodigos) {
-                const cPool = settings.arbitrageBaseCards.find(c =>
-                    (itemCode.cardId && c.cardId === itemCode.cardId) ||
-                    (itemCode.catalogItemId && c.centralOneProductId === itemCode.catalogItemId)
-                );
-                if (cPool && Array.isArray(itemCode.codes)) {
-                    if (!Array.isArray(cPool.internalCodeStock)) cPool.internalCodeStock = [];
-                    for (const codeStr of itemCode.codes) {
-                        const limpio = String(codeStr || '').trim();
-                        if (limpio && !cPool.internalCodeStock.includes(limpio)) {
-                            cPool.internalCodeStock.push(limpio);
-                            guardadosCount++;
-                        }
-                    }
-                }
-            }
-            if (guardadosCount > 0) settings.markModified('arbitrageBaseCards');
-        }
-
-        if (guardadosCount === 0 && Array.isArray(codigosPlanos) && codigosPlanos.length > 0 && ordenDB) {
-            const prodDB = await CatalogProduct.findOne({ slug: ordenDB.productSlug });
-            if (prodDB) {
-                const pkg = (prodDB.packages || []).find(p => p.packageId === ordenDB.packageId);
-                if (pkg) {
-                    if (!Array.isArray(pkg.backupPinVault)) pkg.backupPinVault = [];
-                    codigosPlanos.forEach(cStr => {
-                        const limpio = String(cStr || '').trim();
-                        if (limpio && !pkg.backupPinVault.includes(limpio)) {
-                            pkg.backupPinVault.push(limpio);
-                            guardadosCount++;
-                        }
-                    });
-                    prodDB.markModified('packages');
-                    await prodDB.save();
-                }
-            }
-        }
-
-        if (guardadosCount > 0) {
-            await registrarAlertaCentralOne(settings, {
-                type: 'BACK_IN_STOCK',
-                severity: 'OK',
-                title: `🏦 ${guardadosCount} código(s) guardados en Stock Interno (#${ordenDB ? ordenDB.orderId : 'KZ'})`,
-                detail: `El cliente había solicitado reembolso tras 1 hora de espera, por lo que los códigos entregados por el proveedor se guardaron en tu Bóveda para usarlos automáticamente en la próxima venta.`
-            });
-            await settings.save();
-        }
-    } catch (e) {
-        console.error('Aviso guardando en stock interno:', e.message);
-    }
-}
+// 🏦 (guardarCodigosRecuperadosEnStockInterno unificada en la versión blindada por plataforma más abajo)
 
 // 🔄 RECALCULADOR GLOBAL DE PRECIOS POR GANANCIA FIJA + ALGORITMO + AUTO-PAUSA Y CURACIÓN DE PRECIOS INFLADOS
 async function recalcularPreciosYAlgoritmoTiendaKZ(settingsDoc = null, targetSlugOnly = null, desdeSyncAPI = false) {
