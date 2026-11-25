@@ -6971,7 +6971,6 @@ app.post('/api/tickets/cleanup', verificarTrabajadorOAdmin, async (req, res) => 
 // 👷 DASHBOARD 2: ENDPOINTS PARA TRABAJADORES / OPERADORES
 // =================================================================
 
-// 1. Cola de órdenes, tickets y lista de operadores en tiempo real (Respuesta instantánea ~20ms + Sincronización Central One en 2do plano)
 let _lastWorkerQueueCoSyncMs = 0;
 
 app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
@@ -7081,14 +7080,18 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
             ];
         }
 
-        // Caché en RAM de 30s para la lista de trabajadores (evita consultar User.find en cada latido de la cola)
         if (!global._ramWorkersListCache || (Date.now() - (global._ramWorkersListTs || 0) > 30000)) {
             global._ramWorkersListCache = await User.find({ role: { $in: ['worker', 'admin'] } }).select('email accountName role tokems').lean();
             global._ramWorkersListTs = Date.now();
         }
 
+        // 🚀 Sin el corte antiguo de 180 órdenes para que jamás se estanquen las Aprobadas en ~89/100 y la paginación muestre todo el historial real
         const [orders, ticketsAbiertos, pendientesSinApartarCount] = await Promise.all([
-            Order.find(query).sort({ fecha: -1 }).limit(180).select('-costUSD -apiRawResponse -algoExecutionState.pendingReplacementBody').lean(),
+            Order.find(query)
+                .sort({ fecha: -1 })
+                .limit(5000)
+                .select('-costUSD -apiRawResponse -internalAccountLogin.accountPass -algoExecutionState.pendingReplacementBody')
+                .lean(),
             SupportTicket.find(
                 isOwner
                     ? {}
@@ -7098,7 +7101,7 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
                             { assignedWorker: workerEmail }
                         ]
                     }
-            ).sort({ updatedAt: -1 }).limit(80).lean(),
+            ).sort({ updatedAt: -1 }).limit(120).lean(),
             Order.countDocuments({
                 status: 'EN_PROCESO',
                 isWaitingBinanceAuto: { $ne: true },
@@ -7121,16 +7124,20 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
     }
 });
 
-// 📌 1.5 APARTAR, LIBERAR O TOMAR CONTROL DE UNA ORDEN (CANDADO ATÓMICO)
+// 📌 1.5 APARTAR, LIBERAR O TOMAR CONTROL DE UNA ORDEN (RESPETA SI EL DUEÑO APARTA DESDE LA COLA DE UN EMPLEADO)
 app.post('/api/worker/claim-order', verificarTrabajadorOAdmin, async (req, res) => {
     try {
-        const { orderId, action } = req.body; // 'CLAIM' | 'RELEASE' | 'FORCE_TAKE'
+        const { orderId, action, targetOperatorEmail } = req.body; // 'CLAIM' | 'RELEASE' | 'FORCE_TAKE'
         if (!orderId || !action) return res.status(400).json({ error: 'Faltan parámetros.' });
 
         const idLimpio = String(orderId).trim().toUpperCase();
         const staffEmail = (req.staffUser.email || '').trim().toLowerCase();
         const staffName = req.staffUser.accountName || staffEmail.split('@')[0];
         const isOwner = req.effectiveRole === 'admin';
+
+        const targetOpClean = String(targetOperatorEmail || '').trim().toLowerCase();
+        const emailAsignar = (isOwner && targetOpClean && targetOpClean.includes('@')) ? targetOpClean : staffEmail;
+        const nombreAsignar = emailAsignar === staffEmail ? staffName : emailAsignar.split('@')[0];
 
         if (action === 'CLAIM') {
             const ordenApartada = await Order.findOneAndUpdate(
@@ -7140,13 +7147,14 @@ app.post('/api/worker/claim-order', verificarTrabajadorOAdmin, async (req, res) 
                         { claimedByWorker: '' },
                         { claimedByWorker: null },
                         { claimedByWorker: { $exists: false } },
-                        { claimedByWorker: staffEmail }
+                        { claimedByWorker: emailAsignar },
+                        ...(isOwner ? [{ claimedByWorker: { $exists: true } }] : [])
                     ]
                 },
                 {
                     $set: {
-                        claimedByWorker: staffEmail,
-                        claimedByName: staffName,
+                        claimedByWorker: emailAsignar,
+                        claimedByName: nombreAsignar,
                         claimedAt: new Date()
                     }
                 },
@@ -7163,7 +7171,7 @@ app.post('/api/worker/claim-order', verificarTrabajadorOAdmin, async (req, res) 
 
             return res.json({
                 success: true,
-                message: `Orden #${idLimpio} apartada en tu zona privada.`,
+                message: `Orden #${idLimpio} apartada en la cola de ${nombreAsignar}.`,
                 order: ordenApartada
             });
         }
@@ -7206,7 +7214,7 @@ app.post('/api/worker/claim-order', verificarTrabajadorOAdmin, async (req, res) 
 
             return res.json({
                 success: true,
-                message: `Has tomado el control de la orden #${idLimpio} en tu zona privada.`,
+                message: `Has movido la orden #${idLimpio} a tu cola personal.`,
                 order: ordenTomada
             });
         }
@@ -7221,7 +7229,7 @@ app.post('/api/worker/claim-order', verificarTrabajadorOAdmin, async (req, res) 
 // 🔒 Candado en RAM para impedir que 2 clics seguidos de "Aprobar" disparen dos veces el pedido en Central One
 const activeWorkerApprovalLocks = new Set();
 
-// 2. Acción del Trabajador: APROBAR, REVISIÓN o RECHAZAR (Con Candado Anti-Doble Disparo)
+// 2. Acción del Trabajador/Dueño: APROBAR, REVISIÓN o RECHAZAR (Mantiene la orden en el empleado correspondiente si es de un empleado)
 app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res) => {
     const idLock = String(req.body?.orderId || '').trim().toUpperCase();
     if (!idLock || !req.body?.action) return res.status(400).json({ error: 'Faltan parámetros.' });
@@ -7241,7 +7249,7 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
     }
 
     try {
-        const { orderId, action, manualPinCode, workerNotes } = req.body;
+        const { orderId, action, manualPinCode, workerNotes, targetOperatorEmail } = req.body;
         const orden = await Order.findOne({ orderId: idLock });
         if (!orden) return res.status(404).json({ error: 'Orden no encontrada.' });
 
@@ -7255,9 +7263,31 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
             });
         }
 
+        // 🎯 DETERMINAR PROPIETARIO DE LA ORDEN:
+        // Si la orden fue apartada por un empleado (o si el Dueño la está procesando dentro del apartado del empleado), se queda en el empleado
+        const targetOpClean = String(targetOperatorEmail || '').trim().toLowerCase();
+        const claimedExistente = String(orden.claimedByWorker || '').trim().toLowerCase();
+        const reviewedExistente = String(orden.reviewedByWorker || '').trim().toLowerCase();
+        const approvedExistente = String(orden.approvedByWorker || '').trim().toLowerCase();
+
+        let operadorPropietario = staffEmail;
+        if (claimedExistente && claimedExistente !== staffEmail) {
+            operadorPropietario = claimedExistente;
+        } else if (isOwner && targetOpClean && targetOpClean.includes('@') && targetOpClean !== staffEmail) {
+            operadorPropietario = targetOpClean;
+        } else if (reviewedExistente && reviewedExistente !== staffEmail) {
+            operadorPropietario = reviewedExistente;
+        } else if (approvedExistente && !approvedExistente.startsWith('auto-') && approvedExistente !== staffEmail) {
+            operadorPropietario = approvedExistente;
+        }
+
+        const nombrePropietario = operadorPropietario === staffEmail
+            ? staffName
+            : (orden.claimedByName || operadorPropietario.split('@')[0]);
+
         if (!orden.claimedByWorker) {
-            orden.claimedByWorker = staffEmail;
-            orden.claimedByName = staffName;
+            orden.claimedByWorker = operadorPropietario;
+            orden.claimedByName = nombrePropietario;
             orden.claimedAt = new Date();
         }
 
@@ -7270,6 +7300,7 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
                 if (workerNotes !== undefined) {
                     orden.workerNotes = String(workerNotes || '').trim();
                 }
+                orden.approvedByWorker = operadorPropietario;
                 await orden.save();
                 return res.json({
                     success: true,
@@ -7298,7 +7329,7 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
                 orden.statusMessage = orden.fulfillmentType === 'API_GIFT_CARD' || orden.isGiftCardPin
                     ? '¡Entrega completada! Cópiala aquí abajo.'
                     : '¡Pedido entregado con éxito! Verifica tu cuenta.';
-                orden.approvedByWorker = staffEmail;
+                orden.approvedByWorker = operadorPropietario;
                 orden.completedAt = new Date();
 
                 if (habiaOrdenEnCentralOne) {
@@ -7352,7 +7383,7 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
                             orden.progressPercent = 100;
                             orden.deliveredCode = todos.length > 0 ? todos.join('  |  ') : checkPrev.deliveredCode;
                             orden.statusMessage = '¡Entrega completada! Cópiala aquí abajo.';
-                            orden.approvedByWorker = orden.approvedByWorker || staffEmail;
+                            orden.approvedByWorker = operadorPropietario;
                             orden.completedAt = new Date();
                             await orden.save();
                             return res.json({ success: true, message: `¡Orden #${orden.orderId} ya liberada por Central One y entregada!`, order: orden });
@@ -7377,7 +7408,7 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
                 orden.deliveredCode = algoSt.deliveredCodesList.join('  |  ');
                 if (workerNotes) orden.workerNotes = workerNotes.trim();
                 orden.statusMessage = '¡Tu pedido ha sido entregado con éxito!';
-                orden.approvedByWorker = staffEmail;
+                orden.approvedByWorker = operadorPropietario;
                 orden.completedAt = new Date();
                 await orden.save();
                 return res.json({ success: true, message: `Orden #${orden.orderId} marcada como entregada.`, order: orden });
@@ -7409,7 +7440,7 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
                             orden.deliveredCode = todos.length > 0 ? todos.join('  |  ') : checkPrev.deliveredCode;
                             if (workerNotes) orden.workerNotes = workerNotes.trim();
                             orden.statusMessage = '¡Entrega completada! Cópiala aquí abajo.';
-                            orden.approvedByWorker = staffEmail;
+                            orden.approvedByWorker = operadorPropietario;
                             orden.completedAt = new Date();
                             await orden.save();
                             return res.json({ success: true, message: `Orden #${orden.orderId} recuperada de Central One y entregada.`, order: orden });
@@ -7423,7 +7454,7 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
             orden.status = 'EJECUTANDO_API';
             orden.statusMessage = 'Pago verificado. Ejecutando entrega automática...';
             orden.progressPercent = 80;
-            orden.approvedByWorker = staffEmail;
+            orden.approvedByWorker = operadorPropietario;
             if (workerNotes) orden.workerNotes = workerNotes.trim();
             await orden.save();
 
@@ -7448,7 +7479,7 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
                 orden.statusMessage = `¡Se han acreditado +${orden.tokemsAmount} Tokems KZ en tu cuenta!`;
                 orden.progressPercent = 100;
                 orden.deliveredCode = `+${orden.tokemsAmount} TOKEMS KZ ACREDITADOS`;
-                orden.approvedByWorker = staffEmail;
+                orden.approvedByWorker = operadorPropietario;
                 orden.completedAt = new Date();
                 await orden.save();
 
@@ -7472,7 +7503,7 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
                 orden.apiOrderId = apiResultado.apiOrderId || '';
                 orden.apiRawResponse = apiResultado.raw || null;
                 orden.statusMessage = 'Pago verificado. Procesando la entrega automática de tu compra...';
-                orden.approvedByWorker = staffEmail;
+                orden.approvedByWorker = operadorPropietario;
                 await orden.save();
                 return res.json({
                     success: true,
@@ -7489,7 +7520,7 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
             orden.statusMessage = orden.fulfillmentType === 'API_GIFT_CARD'
                 ? '¡Entrega completada! Cópiala aquí abajo.'
                 : '¡Pedido entregado con éxito! Verifica tu cuenta.';
-            orden.approvedByWorker = staffEmail;
+            orden.approvedByWorker = operadorPropietario;
             orden.completedAt = new Date();
             await orden.save();
 
@@ -7516,7 +7547,7 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
             return res.json({ success: true, message: `Orden #${orden.orderId} aprobada y entregada al cliente.`, order: orden });
         }
 
-        // ⚠️ SI EL TRABAJADOR PONE LA ORDEN EN REVISIÓN
+        // ⚠️ SI EL TRABAJADOR / DUEÑO PONE LA ORDEN EN REVISIÓN
         if (action === 'REVISION') {
             const motivo = (workerNotes || 'Detectamos un detalle con tu pago que debemos verificar contigo.').trim();
             orden.status = 'EN_REVISION';
@@ -7526,7 +7557,7 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
             orden.reviewReason = motivo;
             orden.workerNotes = motivo;
             orden.statusMessage = '⚠️ Tu pedido se encuentra en revisión. Revisa el mensaje del operador aquí abajo.';
-            orden.reviewedByWorker = staffEmail;
+            orden.reviewedByWorker = operadorPropietario;
             await orden.save();
 
             return res.json({
@@ -7536,7 +7567,7 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
             });
         }
 
-        // ❌ SI EL TRABAJADOR RECHAZA LA ORDEN
+        // ❌ SI EL TRABAJADOR / DUEÑO RECHAZA LA ORDEN
         if (action === 'RECHAZAR') {
             const yaEstabaRechazada = orden.status === 'RECHAZADO';
             if (orden.status === 'EN_REVISION') {
@@ -7546,7 +7577,7 @@ app.post('/api/worker/process-order', verificarTrabajadorOAdmin, async (req, res
             orden.progressPercent = 100;
             orden.statusMessage = (workerNotes || '').trim() || 'No pudimos verificar tu referencia de pago. Si crees que es un error, abre un ticket de soporte.';
             orden.workerNotes = (workerNotes || '').trim() || 'Referencia no encontrada';
-            orden.approvedByWorker = staffEmail;
+            orden.approvedByWorker = operadorPropietario;
             orden.completedAt = new Date();
             await orden.save();
 
@@ -9693,8 +9724,7 @@ app.use(['/api/admin/overview', '/api/worker/queue'], (req, res, next) => {
     next();
 });
 
-// =================================================================
-// 🏦 RESCATADOR AUTOMÁTICO DE CÓDIGOS SUELTOS + AUTO-CORRECTOR DE PLATAFORMA EN STOCK PROPIO
+// 🏦 RESCATADOR AUTOMÁTICO DE CÓDIGOS SUELTOS + FILTRO ESTRICTO POR FIRMA KEM!ZONE (PROTEGE COMPRAS DIRECTAS DE WHATSAPP)
 // =================================================================
 let _autoRescueInFlight = false;
 
@@ -9716,16 +9746,17 @@ async function ejecutarRescateYCorreccionCodigosSueltosCentralOne({ mode = 'AUTO
         }
         if (!Array.isArray(settings.arbitrageBaseCards)) settings.arbitrageBaseCards = [];
 
-        // 1. Obtener todos los códigos que YA fueron entregados a clientes y las órdenes que están ejecutándose en este instante
-        const [ordenesConCodigos, productosTodos] = await Promise.all([
+        // 1. Obtener todas las órdenes de Kem!Zone para mapear códigos ya entregados y los IDs de Central One creados por Kem!Zone
+        const [ordenesKzTodas, productosTodos] = await Promise.all([
             Order.find({
                 $or: [
+                    { apiOrderId: { $nin: ['', null] } },
                     { deliveredCode: { $nin: ['', null] } },
                     { 'algoExecutionState.deliveredCodesList.0': { $exists: true } },
                     { status: 'EJECUTANDO_API' },
                     { status: 'EN_PROCESO' }
                 ]
-            }).select('orderId status fecha apiOrderId deliveredCode algoExecutionState').lean(),
+            }).select('orderId status fecha apiOrderId deliveredCode cancelledByDelayRefund algoExecutionState').lean(),
             CatalogProduct.collection.find(
                 {},
                 { projection: { 'packages.backupPinVault': 1, 'altPackages.backupPinVault': 1 } }
@@ -9734,17 +9765,31 @@ async function ejecutarRescateYCorreccionCodigosSueltosCentralOne({ mode = 'AUTO
 
         const codigosEntregadosAClientesSet = new Set();
         const coOrderIdsEnEjecucionActivaSet = new Set();
+        const coIdsVinculadosAKemZoneSet = new Set();
 
-        (ordenesConCodigos || []).forEach(o => {
-            if ((o.status === 'EJECUTANDO_API' || o.status === 'EN_PROCESO') && o.apiOrderId) {
-                coOrderIdsEnEjecucionActivaSet.add(String(o.apiOrderId).trim());
+        (ordenesKzTodas || []).forEach(o => {
+            const apiIdClean = String(o.apiOrderId || '').trim();
+            if (apiIdClean && !apiIdClean.startsWith('VAULT-') && !apiIdClean.startsWith('INTERNAL-') && !apiIdClean.startsWith('MANUAL-') && !apiIdClean.startsWith('API-')) {
+                coIdsVinculadosAKemZoneSet.add(apiIdClean);
             }
+            const partialIds = o.algoExecutionState?.processedPartialOrderIds;
+            if (Array.isArray(partialIds)) {
+                partialIds.forEach(pid => {
+                    if (pid) coIdsVinculadosAKemZoneSet.add(String(pid).trim());
+                });
+            }
+
+            if ((o.status === 'EJECUTANDO_API' || o.status === 'EN_PROCESO') && apiIdClean) {
+                coOrderIdsEnEjecucionActivaSet.add(apiIdClean);
+            }
+
             if (o.deliveredCode) {
                 String(o.deliveredCode).split(/\s*\|\s*|\r?\n/).forEach(c => {
                     const k = extraerCodigoCrudoDeTextoFormateado(c);
                     if (k && k.length >= 4) codigosEntregadosAClientesSet.add(k);
                 });
             }
+
             const listaAlgo = o.algoExecutionState?.deliveredCodesList;
             if (Array.isArray(listaAlgo) && o.status !== 'RECHAZADO') {
                 listaAlgo.forEach(c => {
@@ -9754,8 +9799,27 @@ async function ejecutarRescateYCorreccionCodigosSueltosCentralOne({ mode = 'AUTO
             }
         });
 
-        // 2. Mapear en qué tarjeta de tu Stock Propio está guardado cada código actualmente (para detectar y reubicar si alguno cayó en la plataforma equivocada, ej. Xbox -> PlayStation)
-        const mapaCodigoATarjetaActual = new Map(); // clave -> cardObj
+        // 🛡️ DETECTOR DE HUELLA DIGITAL KEM!ZONE:
+        // Devuelve true SOLO si el pedido de Central One fue disparado por Kem!Zone (tiene kz-ord-, nota KemZone #KZ-... o está en MongoDB)
+        const tieneHuellaDigitalKemZone = (coObj, fallbackId = '') => {
+            const idCheck = String(coObj?.id || fallbackId || '').trim();
+            const refCheck = String(coObj?.reference_code || '').trim();
+            if ((idCheck && coIdsVinculadosAKemZoneSet.has(idCheck)) || (refCheck && coIdsVinculadosAKemZoneSet.has(refCheck))) {
+                return true;
+            }
+            const idemp = String(coObj?.idempotency_key || coObj?.idempotencyKey || '').trim();
+            if (idemp.startsWith('kz-ord-') || /KZ-\d{6}/i.test(idemp)) {
+                return true;
+            }
+            const nota = String(coObj?.note || coObj?.notes || coObj?.customer_reference || '').trim();
+            if (/KemZone\s*(Faltante)?\s*#?KZ-/i.test(nota) || /#KZ-\d{6}/i.test(nota)) {
+                return true;
+            }
+            return false;
+        };
+
+        // 2. Mapear en qué tarjeta de tu Stock Propio está guardado cada código actualmente
+        const mapaCodigoATarjetaActual = new Map();
         settings.arbitrageBaseCards.forEach(card => {
             if (!Array.isArray(card.internalCodeStock)) card.internalCodeStock = [];
             card.internalCodeStock.forEach(c => {
@@ -9777,19 +9841,25 @@ async function ejecutarRescateYCorreccionCodigosSueltosCentralOne({ mode = 'AUTO
         // 3. Resolver qué pedidos de Central One vamos a inspeccionar
         const coOrdersToInspect = [];
         const vistosCoId = new Set();
+        let ignoradosPortalDirectoCount = 0;
 
-        const agregarCoOrder = (id, ref = '') => {
+        const agregarCoOrder = (id, ref = '', confirmedKzOrigin = false) => {
             const cleanId = String(id || '').trim();
             if (!cleanId || cleanId.startsWith('VAULT-') || cleanId.startsWith('INTERNAL-') || cleanId.startsWith('MANUAL-') || cleanId.startsWith('API-') || cleanId.startsWith('kz-ord-')) {
                 return;
             }
             if (!vistosCoId.has(cleanId)) {
                 vistosCoId.add(cleanId);
-                coOrdersToInspect.push({ id: cleanId, reference_code: ref || cleanId });
+                coOrdersToInspect.push({
+                    id: cleanId,
+                    reference_code: ref || cleanId,
+                    confirmedKzOrigin: Boolean(confirmedKzOrigin || coIdsVinculadosAKemZoneSet.has(cleanId))
+                });
             }
         };
 
         if (mode === 'BY_ORDER') {
+            // Modo Manual Explícito: Cuando tú pegas un C1-... a propósito en la casilla para meterlo a tu Stock Propio
             const qRaw = String(orderQuery || '').trim().replace(/^#/, '');
             if (!qRaw) {
                 return { success: false, statusHttp: 400, error: 'Ingresa la referencia (ej: C1-1MH168R3 o CO-ORD-...) o UUID del pedido.' };
@@ -9804,7 +9874,7 @@ async function ejecutarRescateYCorreccionCodigosSueltosCentralOne({ mode = 'AUTO
             }).select('orderId apiOrderId').lean();
 
             if (ordKz && ordKz.apiOrderId) {
-                agregarCoOrder(ordKz.apiOrderId, ordKz.orderId);
+                agregarCoOrder(ordKz.apiOrderId, ordKz.orderId, true);
             }
 
             if (coOrdersToInspect.length === 0) {
@@ -9815,11 +9885,11 @@ async function ejecutarRescateYCorreccionCodigosSueltosCentralOne({ mode = 'AUTO
                         const itemsList = resList.data?.orders || resList.data?.items || resList.data?.data || [];
                         const matchRef = itemsList.find(x => String(x.reference_code || '').trim().toUpperCase() === qUp);
                         if (matchRef && matchRef.id) {
-                            agregarCoOrder(matchRef.id, matchRef.reference_code);
+                            agregarCoOrder(matchRef.id, matchRef.reference_code, true);
                         }
                     } catch (eList) {}
                 } else {
-                    agregarCoOrder(qRaw, qRaw);
+                    agregarCoOrder(qRaw, qRaw, true);
                 }
             }
 
@@ -9831,7 +9901,27 @@ async function ejecutarRescateYCorreccionCodigosSueltosCentralOne({ mode = 'AUTO
                 };
             }
         } else {
-            // MODO AUTO_SCAN (Manual o Automático en 2do plano)
+            // 🔒 MODO AUTO_SCAN: Primero revisa órdenes candidatas de MongoDB (canceladas tras 1h, entregadas manual mientras estaban en Recibida, o con entregas parciales)
+            (ordenesKzTodas || []).forEach(o => {
+                const apiId = String(o.apiOrderId || '').trim();
+                if (!apiId || coOrderIdsEnEjecucionActivaSet.has(apiId)) return;
+                const esCandidataRescate = (
+                    o.status === 'RECHAZADO' ||
+                    o.cancelledByDelayRefund === true ||
+                    o.algoExecutionState?.manuallyCompletedWhilePendingCO === true ||
+                    (Array.isArray(o.algoExecutionState?.processedPartialOrderIds) && o.algoExecutionState.processedPartialOrderIds.length > 0)
+                );
+                if (esCandidataRescate) {
+                    agregarCoOrder(apiId, o.orderId, true);
+                    (o.algoExecutionState?.processedPartialOrderIds || []).forEach(pid => {
+                        if (pid && !coOrderIdsEnEjecucionActivaSet.has(String(pid).trim())) {
+                            agregarCoOrder(pid, o.orderId, true);
+                        }
+                    });
+                }
+            });
+
+            // Segundo: Revisa los últimos 30 pedidos de Central One, pero SOLO acepta los que tengan la Huella Digital de Kem!Zone
             try {
                 const resList = await axios.get(`${CENTRAL_ONE_BASE_URL}/orders?limit=30`, { headers, timeout: 12000 });
                 const itemsList = resList.data?.orders || resList.data?.items || resList.data?.data || [];
@@ -9839,31 +9929,33 @@ async function ejecutarRescateYCorreccionCodigosSueltosCentralOne({ mode = 'AUTO
 
                 itemsList.forEach(coOrd => {
                     const st = String(coOrd.status || '').toLowerCase();
-                    if ((st === 'completed' || st === 'partially_completed') && coOrd.id && !coOrderIdsEnEjecucionActivaSet.has(coOrd.id)) {
-                        // Si es barrido automático en segundo plano, dar 3 minutos de margen a pedidos recién creados por si están en pleno vuelo
-                        if (isBackgroundAuto && coOrd.created_at) {
-                            const edadMs = ahoraMs - new Date(coOrd.created_at).getTime();
-                            if (edadMs >= 0 && edadMs < 3 * 60 * 1000) return;
-                        }
-                        agregarCoOrder(coOrd.id, coOrd.reference_code || coOrd.id);
+                    if ((st !== 'completed' && st !== 'partially_completed') || !coOrd.id) return;
+                    if (coOrderIdsEnEjecucionActivaSet.has(coOrd.id)) return;
+
+                    if (isBackgroundAuto && coOrd.created_at) {
+                        const edadMs = ahoraMs - new Date(coOrd.created_at).getTime();
+                        if (edadMs >= 0 && edadMs < 3 * 60 * 1000) return;
+                    }
+
+                    const vieneConFirmaEnLista = tieneHuellaDigitalKemZone(coOrd, coOrd.id);
+                    const listadoTraeMetadatos = (
+                        coOrd.note !== undefined ||
+                        coOrd.notes !== undefined ||
+                        coOrd.idempotency_key !== undefined ||
+                        coOrd.idempotencyKey !== undefined
+                    );
+
+                    if (vieneConFirmaEnLista) {
+                        agregarCoOrder(coOrd.id, coOrd.reference_code || coOrd.id, true);
+                    } else if (listadoTraeMetadatos) {
+                        // El listado ya trajo nota/idempotency_key y NO tiene firma de Kem!Zone -> Es compra directa tuya en el portal para WhatsApp
+                        ignoradosPortalDirectoCount++;
+                    } else {
+                        // Si el listado resumido no incluía el campo note/idempotency_key, lo marcamos como false para verificar su firma al pedir el detalle GET /orders/:id
+                        agregarCoOrder(coOrd.id, coOrd.reference_code || coOrd.id, false);
                     }
                 });
             } catch (eList) {}
-
-            const ordenesKzCandidatas = await Order.find({
-                apiOrderId: { $nin: ['', null] },
-                $or: [
-                    { status: 'RECHAZADO' },
-                    { cancelledByDelayRefund: true },
-                    { 'algoExecutionState.manuallyCompletedWhilePendingCO': true }
-                ]
-            }).sort({ fecha: -1 }).limit(25).select('orderId apiOrderId').lean();
-
-            (ordenesKzCandidatas || []).forEach(o => {
-                if (o.apiOrderId && !coOrderIdsEnEjecucionActivaSet.has(o.apiOrderId)) {
-                    agregarCoOrder(o.apiOrderId, o.orderId);
-                }
-            });
         }
 
         let totalRescatados = 0;
@@ -9886,7 +9978,16 @@ async function ejecutarRescateYCorreccionCodigosSueltosCentralOne({ mode = 'AUTO
                     null
                 );
 
-                if (!check || !Array.isArray(check.codigosPorItem) || check.codigosPorItem.length === 0) {
+                if (!check) continue;
+
+                // 🔒 DOBLE CANDADO EN DETALLE COMPLETO (GET /orders/:id):
+                // Si estamos en AUTO_SCAN y al ver el detalle completo del pedido en Central One NO tiene firma de Kem!Zone, lo ignoramos por completo
+                if (mode !== 'BY_ORDER' && !coTarget.confirmedKzOrigin && !tieneHuellaDigitalKemZone(check.raw, coTarget.id)) {
+                    ignoradosPortalDirectoCount++;
+                    continue;
+                }
+
+                if (!Array.isArray(check.codigosPorItem) || check.codigosPorItem.length === 0) {
                     continue;
                 }
 
@@ -9907,7 +10008,6 @@ async function ejecutarRescateYCorreccionCodigosSueltosCentralOne({ mode = 'AUTO
                         settings.arbitrageBaseCards
                     );
 
-                    // Buscar la tarjeta destino en la Bóveda exigiendo que coincida la plataforma real
                     let cPool = settings.arbitrageBaseCards.find(c => {
                         if (platRealCO && String(c.platformGroup || '').toLowerCase() !== platRealCO) return false;
                         if (itemCode.cardId && c.cardId === itemCode.cardId) return true;
@@ -9917,7 +10017,6 @@ async function ejecutarRescateYCorreccionCodigosSueltosCentralOne({ mode = 'AUTO
                         return false;
                     });
 
-                    // Si el SKU no estaba vinculado directo pero conocemos la plataforma (ej. 'playstation') y el monto ($10 USD), empatar con la tarjeta de esa plataforma y monto
                     if (!cPool && platRealCO && montoFacialCO > 0) {
                         cPool = settings.arbitrageBaseCards.find(c =>
                             String(c.platformGroup || '').toLowerCase() === platRealCO &&
@@ -9946,7 +10045,6 @@ async function ejecutarRescateYCorreccionCodigosSueltosCentralOne({ mode = 'AUTO
 
                         const tarjetaDondeEstaAhora = mapaCodigoATarjetaActual.get(clave);
 
-                        // 🔄 CASO ESPECIAL: El código ya estaba en Stock Propio, ¡pero metido en la tarjeta/plataforma EQUIVOCADA (ej. PlayStation $10 metido en Xbox $10)!
                         if (tarjetaDondeEstaAhora) {
                             if (cPool && tarjetaDondeEstaAhora.cardId !== cPool.cardId) {
                                 tarjetaDondeEstaAhora.internalCodeStock = (tarjetaDondeEstaAhora.internalCodeStock || []).filter(
@@ -9984,8 +10082,8 @@ async function ejecutarRescateYCorreccionCodigosSueltosCentralOne({ mode = 'AUTO
             await registrarAlertaCentralOne(settings, {
                 type: 'BACK_IN_STOCK',
                 severity: 'OK',
-                title: `🏦 Stock Propio actualizado: +${totalRescatados} rescatado(s)${totalReubicados > 0 ? ` y ${totalReubicados} reubicado(s) a su plataforma correcta` : ''}`,
-                detail: `Se sincronizaron automáticamente con Central One en tu Inventario de Stock Propio.`
+                title: `🏦 Stock Propio actualizado: +${totalRescatados} rescatado(s) de Kem!Zone${totalReubicados > 0 ? ` y ${totalReubicados} reubicado(s)` : ''}`,
+                detail: `Se sincronizaron automáticamente en tu Inventario de Stock Propio (ignorando compras directas de portal).`
             });
 
             await StoreSettings.collection.updateOne(
@@ -9998,7 +10096,6 @@ async function ejecutarRescateYCorreccionCodigosSueltosCentralOne({ mode = 'AUTO
                 }
             );
 
-            // Invalidar toda caché en RAM para que el navegador vea el cambio de inmediato
             if (typeof _ramFastSettingsTs !== 'undefined') _ramFastSettingsTs = 0;
             if (typeof _ramBootstrapPayload !== 'undefined') _ramBootstrapPayload = null;
             if (typeof _ramBootstrapTs !== 'undefined') _ramBootstrapTs = 0;
@@ -10008,27 +10105,34 @@ async function ejecutarRescateYCorreccionCodigosSueltosCentralOne({ mode = 'AUTO
             });
         }
 
+        const notaProteccionPortal = ignoradosPortalDirectoCount > 0
+            ? `<div style="margin-top:6px; font-size:0.74rem; color:#00e5ff;">🛡️ <b>Protección WhatsApp Activa:</b> Se ignoraron <b>${ignoradosPortalDirectoCount}</b> pedido(s) comprados directamente en el portal de Central One (sin firma de Kem!Zone) para no tocar códigos de tus clientes de WhatsApp.</div>`
+            : '';
+
         let summaryHtml = '';
         if (totalRescatados > 0 || totalReubicados > 0) {
             summaryHtml = `
                 <strong style="color:#00e676; display:block; margin-bottom:4px;">
-                    ✅ ¡Stock Propio sincronizado! (${totalRescatados} nuevo(s) rescatado(s)${totalReubicados > 0 ? `, ${totalReubicados} movido(s) a su plataforma correcta` : ''}):
+                    ✅ ¡Stock Propio sincronizado! (${totalRescatados} nuevo(s) de Kem!Zone rescatado(s)${totalReubicados > 0 ? `, ${totalReubicados} movido(s) a su plataforma correcta` : ''}):
                 </strong>
                 <ul style="margin:0; padding-left:18px;">${desgloseRescatados.join('')}</ul>
                 ${sinTarjetaMatch.length > 0 ? `<div style="margin-top:6px; color:#ffb700;">⚠️ Códigos de tarjetas que aún no tienes creadas en la Bóveda:<ul style="margin:2px 0 0 0; padding-left:18px;">${sinTarjetaMatch.join('')}</ul></div>` : ''}
+                ${notaProteccionPortal}
             `;
         } else if (sinTarjetaMatch.length > 0) {
             summaryHtml = `
-                <strong style="color:#ffb700; display:block; margin-bottom:4px;">⚠️ Se encontraron ${sinTarjetaMatch.length} código(s) sueltos, pero esa tarjeta aún no está agregada en tu Bóveda:</strong>
+                <strong style="color:#ffb700; display:block; margin-bottom:4px;">⚠️ Se encontraron ${sinTarjetaMatch.length} código(s) sueltos de Kem!Zone, pero esa tarjeta aún no está agregada en tu Bóveda:</strong>
                 <ul style="margin:0; padding-left:18px;">${sinTarjetaMatch.join('')}</ul>
+                ${notaProteccionPortal}
             `;
         } else {
             summaryHtml = `
                 <span style="color:#cbd5e1;">
-                    🔎 Escaneo completado (${lotesInspeccion.length} pedido(s) de Central One verificados): <b>0 códigos sueltos pendientes</b>
-                    ${yaEntregadosCount > 0 ? ` • <b>${yaEntregadosCount}</b> ya habían sido entregados a clientes` : ''}
-                    ${yaEnStockCount > 0 ? ` • <b>${yaEnStockCount}</b> ya están guardados correctamente en tu Stock Propio` : ''}.
+                    🔎 Escaneo completado: <b>0 códigos sueltos pendientes de Kem!Zone</b>
+                    ${yaEntregadosCount > 0 ? ` • <b>${yaEntregadosCount}</b> ya entregados a clientes` : ''}
+                    ${yaEnStockCount > 0 ? ` • <b>${yaEnStockCount}</b> ya en tu Stock Propio` : ''}.
                 </span>
+                ${notaProteccionPortal}
             `;
         }
 
@@ -10037,11 +10141,12 @@ async function ejecutarRescateYCorreccionCodigosSueltosCentralOne({ mode = 'AUTO
             recoveredCount: totalRescatados + totalReubicados,
             alreadyDeliveredCount: yaEntregadosCount,
             alreadyInStockCount: yaEnStockCount,
+            ignoredPortalDirectCount: ignoradosPortalDirectoCount,
             arbitrageBaseCards: settings.arbitrageBaseCards,
             summaryHtml,
             message: (totalRescatados + totalReubicados) > 0
-                ? `Se actualizaron +${totalRescatados + totalReubicados} código(s) en tu Stock Propio.`
-                : `No se encontraron códigos sueltos sin usar (${yaEntregadosCount} entregados a clientes, ${yaEnStockCount} ya en tu Stock Propio).`
+                ? `Se actualizaron +${totalRescatados + totalReubicados} código(s) de Kem!Zone en tu Stock Propio.`
+                : `Sin códigos sueltos de Kem!Zone pendientes (${ignoradosPortalDirectoCount} compras directas de portal ignoradas).`
         };
     } catch (error) {
         console.error('Error en ejecutarRescateYCorreccionCodigosSueltosCentralOne:', error);
@@ -10064,7 +10169,7 @@ app.post('/api/admin/central-one/recover-loose-codes', verificarSoloAdmin, async
     return res.json(resultado);
 });
 
-// 🔄 Barrido automático en segundo plano: al iniciar el servidor (a los 14s) y cada 90 segundos rescata códigos sueltos y corrige plataformas automáticamente
+// 🔄 Barrido automático en segundo plano: solo rescata órdenes con huella digital de Kem!Zone
 setTimeout(() => {
     if (process.env.CENTRAL_ONE_API_KEY) {
         ejecutarRescateYCorreccionCodigosSueltosCentralOne({ mode: 'AUTO_SCAN', isBackgroundAuto: true }).catch(() => {});
@@ -10076,6 +10181,8 @@ setInterval(() => {
         ejecutarRescateYCorreccionCodigosSueltosCentralOne({ mode: 'AUTO_SCAN', isBackgroundAuto: true }).catch(() => {});
     }
 }, 90 * 1000);
+
+// =================================================================
 
 // =================================================================
 // 🌙 MOTOR DE HORARIO OPERATIVO PERSONALIZABLE EN SERVIDOR (VERIFICADOR Y TURNO)
