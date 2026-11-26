@@ -6972,6 +6972,32 @@ app.post('/api/tickets/cleanup', verificarTrabajadorOAdmin, async (req, res) => 
 // =================================================================
 
 let _lastWorkerQueueCoSyncMs = 0;
+let _ramQueueAllOrdersCache = null;
+let _ramQueueAllOrdersTs = 0;
+let _ramQueueAllTicketsCache = null;
+let _ramQueueAllTicketsTs = 0;
+
+function invalidarCacheColaTrabajadorRAM() {
+    _ramQueueAllOrdersCache = null;
+    _ramQueueAllOrdersTs = 0;
+    _ramQueueAllTicketsCache = null;
+    _ramQueueAllTicketsTs = 0;
+}
+
+// Invalidar en 0ms la caché en RAM de la cola apenas se cree, aparte, apruebe, edite o elimine cualquier orden o ticket
+app.use((req, res, next) => {
+    if (req.method === 'POST' && (
+        req.path.startsWith('/api/orders/') ||
+        req.path.startsWith('/api/worker/') ||
+        req.path.startsWith('/api/tickets/') ||
+        req.path.startsWith('/api/binance-pay/') ||
+        req.path.startsWith('/webhooks/')
+    )) {
+        invalidarCacheColaTrabajadorRAM();
+        res.on('finish', invalidarCacheColaTrabajadorRAM);
+    }
+    next();
+});
 
 app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
     res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
@@ -6979,10 +7005,11 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
         const { statusFilter } = req.query;
         const workerEmail = (req.staffUser.email || '').trim().toLowerCase();
         const isOwner = req.effectiveRole === 'admin';
+        const ahoraMs = Date.now();
 
         // 🔄 Verificar en segundo plano (sin frenar la respuesta) cualquier orden que esté en EJECUTANDO_API ("Recibida" en Central One)
-        if (Date.now() - _lastWorkerQueueCoSyncMs > 10000) {
-            _lastWorkerQueueCoSyncMs = Date.now();
+        if (ahoraMs - _lastWorkerQueueCoSyncMs > 10000) {
+            _lastWorkerQueueCoSyncMs = ahoraMs;
             setImmediate(async () => {
                 try {
                     const enEjecucion = await Order.find({ status: 'EJECUTANDO_API' }).limit(10);
@@ -7006,6 +7033,7 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
                             ordExec.statusMessage = '¡Tu pedido ha sido entregado automáticamente con éxito!';
                             ordExec.completedAt = ordExec.completedAt || new Date();
                             await ordExec.save();
+                            invalidarCacheColaTrabajadorRAM();
                             continue;
                         }
 
@@ -7036,6 +7064,7 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
                                         ordExec.markModified('algoExecutionState');
                                     }
                                     await ordExec.save();
+                                    invalidarCacheColaTrabajadorRAM();
                                 } else if (check.state === 'PROCESSING') {
                                     if (!activeCentralOnePollers.has(ordExec.orderId)) {
                                         programarSeguimientoOrdenCentralOne(ordExec.orderId, ordExec.apiOrderId);
@@ -7051,6 +7080,7 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
                                         ordExec.workerNotes = `⚠️ Central One reembolsó/canceló el intento (${check.failureCode || 'fallo'}): ${check.errorMsg || 'Puedes reintentar el envío.'}`;
                                         ordExec.apiOrderId = '';
                                         await ordExec.save();
+                                        invalidarCacheColaTrabajadorRAM();
                                     }
                                 }
                             } catch (eCheck) {}
@@ -7060,54 +7090,63 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
             });
         }
 
-        // No enviar checkouts de Binance que siguen esperando pago en la ventana del QR
-        const query = {
-            $nor: [{ status: 'INICIANDO', isWaitingBinanceAuto: true }]
-        };
+        if (!global._ramWorkersListCache || (ahoraMs - (global._ramWorkersListTs || 0) > 60000)) {
+            global._ramWorkersListCache = await User.find({ role: { $in: ['worker', 'admin'] } }).select('email accountName role tokems').lean();
+            global._ramWorkersListTs = ahoraMs;
+        }
+
+        // ⚡ LECTURA DESDE CACHÉ EN RAM (Si no ha cambiado ninguna orden en los últimos 5s, responde en 1ms sin esperar a MongoDB)
+        if (!_ramQueueAllOrdersCache || (ahoraMs - _ramQueueAllOrdersTs > 5000)) {
+            const [ordenesFrescas, ticketsFrescos] = await Promise.all([
+                Order.find({
+                    $nor: [{ status: 'INICIANDO', isWaitingBinanceAuto: true }]
+                })
+                .sort({ fecha: -1 })
+                .limit(5000)
+                .select('-costUSD -apiRawResponse -internalAccountLogin.accountPass -algoExecutionState.pendingReplacementBody -algoExecutionState.perGamePlans')
+                .lean(),
+                SupportTicket.find({})
+                .sort({ updatedAt: -1 })
+                .limit(120)
+                .select('-messages.attachmentUrl')
+                .lean()
+            ]);
+
+            _ramQueueAllOrdersCache = ordenesFrescas || [];
+            _ramQueueAllOrdersTs = ahoraMs;
+            _ramQueueAllTicketsCache = ticketsFrescos || [];
+            _ramQueueAllTicketsTs = ahoraMs;
+        }
+
+        // Filtrar en memoria RAM (< 1ms) según si es Dueño o Trabajador
+        let orders = _ramQueueAllOrdersCache;
         if (statusFilter && statusFilter !== 'TODAS') {
-            query.status = statusFilter;
+            orders = orders.filter(o => o.status === statusFilter);
         }
 
         if (!isOwner) {
-            query.$or = [
-                {
-                    status: { $in: ['EN_PROCESO', 'ERROR_API', 'EJECUTANDO_API'] },
-                    $or: [{ claimedByWorker: '' }, { claimedByWorker: null }, { claimedByWorker: { $exists: false } }]
-                },
-                { claimedByWorker: workerEmail },
-                { approvedByWorker: workerEmail },
-                { reviewedByWorker: workerEmail }
-            ];
+            orders = orders.filter(o => {
+                const claimed = String(o.claimedByWorker || '').trim().toLowerCase();
+                const approved = String(o.approvedByWorker || '').trim().toLowerCase();
+                const reviewed = String(o.reviewedByWorker || '').trim().toLowerCase();
+                const esSinApartarActiva = (o.status === 'EN_PROCESO' || o.status === 'ERROR_API' || o.status === 'EJECUTANDO_API') && !claimed;
+                return esSinApartarActiva || claimed === workerEmail || approved === workerEmail || reviewed === workerEmail;
+            });
         }
 
-        if (!global._ramWorkersListCache || (Date.now() - (global._ramWorkersListTs || 0) > 30000)) {
-            global._ramWorkersListCache = await User.find({ role: { $in: ['worker', 'admin'] } }).select('email accountName role tokems').lean();
-            global._ramWorkersListTs = Date.now();
+        let ticketsAbiertos = _ramQueueAllTicketsCache;
+        if (!isOwner) {
+            ticketsAbiertos = ticketsAbiertos.filter(t => {
+                const assigned = String(t.assignedWorker || '').trim().toLowerCase();
+                return (t.status === 'ABIERTO' && !assigned) || assigned === workerEmail;
+            });
         }
 
-        // 🚀 Sin el corte antiguo de 180 órdenes para que jamás se estanquen las Aprobadas en ~89/100 y la paginación muestre todo el historial real
-        const [orders, ticketsAbiertos, pendientesSinApartarCount] = await Promise.all([
-            Order.find(query)
-                .sort({ fecha: -1 })
-                .limit(5000)
-                .select('-costUSD -apiRawResponse -internalAccountLogin.accountPass -algoExecutionState.pendingReplacementBody')
-                .lean(),
-            SupportTicket.find(
-                isOwner
-                    ? {}
-                    : {
-                        $or: [
-                            { status: 'ABIERTO', $or: [{ assignedWorker: '' }, { assignedWorker: null }, { assignedWorker: { $exists: false } }] },
-                            { assignedWorker: workerEmail }
-                        ]
-                    }
-            ).sort({ updatedAt: -1 }).limit(120).lean(),
-            Order.countDocuments({
-                status: 'EN_PROCESO',
-                isWaitingBinanceAuto: { $ne: true },
-                $or: [{ claimedByWorker: '' }, { claimedByWorker: null }, { claimedByWorker: { $exists: false } }]
-            })
-        ]);
+        const pendientesSinApartarCount = _ramQueueAllOrdersCache.filter(o =>
+            o.status === 'EN_PROCESO' &&
+            !o.isWaitingBinanceAuto &&
+            !o.claimedByWorker
+        ).length;
 
         return res.json({
             success: true,
@@ -10181,8 +10220,6 @@ setInterval(() => {
         ejecutarRescateYCorreccionCodigosSueltosCentralOne({ mode: 'AUTO_SCAN', isBackgroundAuto: true }).catch(() => {});
     }
 }, 90 * 1000);
-
-// =================================================================
 
 // =================================================================
 // 🌙 MOTOR DE HORARIO OPERATIVO PERSONALIZABLE EN SERVIDOR (VERIFICADOR Y TURNO)
