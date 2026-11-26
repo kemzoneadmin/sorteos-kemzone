@@ -6971,30 +6971,132 @@ app.post('/api/tickets/cleanup', verificarTrabajadorOAdmin, async (req, res) => 
 // 👷 DASHBOARD 2: ENDPOINTS PARA TRABAJADORES / OPERADORES
 // =================================================================
 
+const zlib = require('zlib');
 let _lastWorkerQueueCoSyncMs = 0;
 let _ramQueueAllOrdersCache = null;
 let _ramQueueAllOrdersTs = 0;
 let _ramQueueAllTicketsCache = null;
 let _ramQueueAllTicketsTs = 0;
+let _ramQueueMutationCounter = 1;
+let _ramBootstrapMutationCounter = 1;
 
 function invalidarCacheColaTrabajadorRAM() {
     _ramQueueAllOrdersCache = null;
     _ramQueueAllOrdersTs = 0;
     _ramQueueAllTicketsCache = null;
     _ramQueueAllTicketsTs = 0;
+    _ramQueueMutationCounter++;
 }
 
-// Invalidar en 0ms la caché en RAM de la cola apenas se cree, aparte, apruebe, edite o elimine cualquier orden o ticket
-app.use((req, res, next) => {
-    if (req.method === 'POST' && (
-        req.path.startsWith('/api/orders/') ||
-        req.path.startsWith('/api/worker/') ||
-        req.path.startsWith('/api/tickets/') ||
-        req.path.startsWith('/api/binance-pay/') ||
-        req.path.startsWith('/webhooks/')
-    )) {
+function invalidarCacheTiendaBootstrapRAM() {
+    _ramBootstrapPayload = null;
+    _ramBootstrapTs = 0;
+    if (typeof _ramFastSettingsTs !== 'undefined') _ramFastSettingsTs = 0;
+    if (typeof _ramFastProductsTs !== 'undefined') _ramFastProductsTs = 0;
+    if (typeof _ramFastPaymentMethodsTs !== 'undefined') _ramFastPaymentMethodsTs = 0;
+    _ramBootstrapMutationCounter++;
+}
+
+// 1. Compresor Gzip Nativo + Control de Versión de 65 Bytes para ahorrar ~95% de Red (Network) en Railway
+if (!app.response._kzBandwidthOptimizerInstalled) {
+    app.response._kzBandwidthOptimizerInstalled = true;
+    const _origExpressJson = app.response.json;
+
+    app.response.json = function(body) {
+        const req = this.req;
+        try {
+            if (req && req.path === '/api/store/bootstrap' && body && body.success && Array.isArray(body.products)) {
+                const verTienda = `bv_${_ramBootstrapMutationCounter}_${body.products.length}_${body.settings?.exchangeRateVES || 0}_${body.settings?.bcvRateVES || 0}_${body.settings?.storeOpen === false ? 0 : 1}`;
+                body.version = verTienda;
+                const clientVer = String(req.query?.knownVersion || '').trim();
+                if (clientVer && clientVer === verTienda) {
+                    return _origExpressJson.call(this, {
+                        success: true,
+                        notModified: true,
+                        version: verTienda,
+                        serverTimestamp: Date.now()
+                    });
+                }
+            }
+
+            const acceptEncoding = String(req?.headers?.['accept-encoding'] || '');
+            if (acceptEncoding.includes('gzip') && body && typeof body === 'object' && !this.headersSent) {
+                const jsonStr = JSON.stringify(body);
+                if (jsonStr.length > 1200) {
+                    const gzBuf = zlib.gzipSync(Buffer.from(jsonStr, 'utf8'), { level: 6 });
+                    this.set('Content-Type', 'application/json; charset=utf-8');
+                    this.set('Content-Encoding', 'gzip');
+                    this.set('Vary', 'Accept-Encoding');
+                    this.set('Content-Length', String(gzBuf.length));
+                    return this.send(gzBuf);
+                }
+            }
+        } catch (e) {}
+        return _origExpressJson.call(this, body);
+    };
+}
+
+// Interceptar cualquier cambio en órdenes, tickets o configuración para actualizar versiones en 0ms
+if (!Order.prototype._kzQueueCacheHooked) {
+    Order.prototype._kzQueueCacheHooked = true;
+    const _prevOrdSave = Order.prototype.save;
+    Order.prototype.save = async function(...args) {
+        const r = await _prevOrdSave.apply(this, args);
         invalidarCacheColaTrabajadorRAM();
-        res.on('finish', invalidarCacheColaTrabajadorRAM);
+        return r;
+    };
+}
+
+if (!SupportTicket.prototype._kzQueueCacheHooked) {
+    SupportTicket.prototype._kzQueueCacheHooked = true;
+    const _prevTkSave = SupportTicket.prototype.save;
+    SupportTicket.prototype.save = async function(...args) {
+        const r = await _prevTkSave.apply(this, args);
+        invalidarCacheColaTrabajadorRAM();
+        return r;
+    };
+}
+
+app.use((req, res, next) => {
+    // Atajo en 0.2ms para /api/store/bootstrap desde RAM sin golpear MongoDB cada 20s
+    if (req.method === 'GET' && req.path === '/api/store/bootstrap' && _ramBootstrapPayload && (Date.now() - _ramBootstrapTs < 45000)) {
+        const verTienda = `bv_${_ramBootstrapMutationCounter}_${(_ramBootstrapPayload.products || []).length}_${_ramBootstrapPayload.settings?.exchangeRateVES || 0}_${_ramBootstrapPayload.settings?.bcvRateVES || 0}_${_ramBootstrapPayload.settings?.storeOpen === false ? 0 : 1}`;
+        const clientVer = String(req.query?.knownVersion || '').trim();
+        res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+        if (clientVer && clientVer === verTienda) {
+            return res.json({
+                success: true,
+                notModified: true,
+                version: verTienda,
+                serverTimestamp: Date.now()
+            });
+        }
+        return res.json({
+            ..._ramBootstrapPayload,
+            version: verTienda,
+            serverTimestamp: Date.now()
+        });
+    }
+
+    if (req.method === 'POST') {
+        if (
+            req.path.startsWith('/api/orders/') ||
+            req.path.startsWith('/api/worker/') ||
+            req.path.startsWith('/api/tickets/') ||
+            req.path.startsWith('/api/binance-pay/') ||
+            req.path.startsWith('/webhooks/')
+        ) {
+            invalidarCacheColaTrabajadorRAM();
+            res.on('finish', invalidarCacheColaTrabajadorRAM);
+        }
+        if (
+            req.path.startsWith('/api/admin/') ||
+            req.path === '/api/worker/schedule-config' ||
+            req.path.startsWith('/webhooks/central-one')
+        ) {
+            invalidarCacheTiendaBootstrapRAM();
+            res.on('finish', invalidarCacheTiendaBootstrapRAM);
+        }
     }
     next();
 });
@@ -7002,7 +7104,7 @@ app.use((req, res, next) => {
 app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
     res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     try {
-        const { statusFilter } = req.query;
+        const { statusFilter, knownVersion } = req.query;
         const workerEmail = (req.staffUser.email || '').trim().toLowerCase();
         const isOwner = req.effectiveRole === 'admin';
         const ahoraMs = Date.now();
@@ -7095,8 +7197,8 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
             global._ramWorkersListTs = ahoraMs;
         }
 
-        // ⚡ LECTURA DESDE CACHÉ EN RAM (Si no ha cambiado ninguna orden en los últimos 5s, responde en 1ms sin esperar a MongoDB)
-        if (!_ramQueueAllOrdersCache || (ahoraMs - _ramQueueAllOrdersTs > 5000)) {
+        // ⚡ LECTURA DESDE CACHÉ EN RAM (Se mantiene en RAM hasta 15s y se invalida en 0ms si entra o cambia cualquier orden)
+        if (!_ramQueueAllOrdersCache || (ahoraMs - _ramQueueAllOrdersTs > 15000)) {
             const [ordenesFrescas, ticketsFrescos] = await Promise.all([
                 Order.find({
                     $nor: [{ status: 'INICIANDO', isWaitingBinanceAuto: true }]
@@ -7118,7 +7220,27 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
             _ramQueueAllTicketsTs = ahoraMs;
         }
 
-        // Filtrar en memoria RAM (< 1ms) según si es Dueño o Trabajador
+        const pendientesSinApartarCount = _ramQueueAllOrdersCache.filter(o =>
+            o.status === 'EN_PROCESO' &&
+            !o.isWaitingBinanceAuto &&
+            !o.claimedByWorker
+        ).length;
+
+        // Firma instantánea del estado actual de la cola y tickets
+        const topOrd = _ramQueueAllOrdersCache[0];
+        const topTk = _ramQueueAllTicketsCache[0];
+        const versionActualCola = `qv_${_ramQueueMutationCounter}_${_ramQueueAllOrdersCache.length}_${pendientesSinApartarCount}_${topOrd ? `${topOrd.orderId}:${topOrd.status}:${topOrd.claimedByWorker || ''}:${(topOrd.deliveredCode || '').length}` : '0'}_${_ramQueueAllTicketsCache.length}_${topTk ? `${topTk.ticketId}:${topTk.status}:${(topTk.messages || []).length}` : '0'}`;
+
+        // 🚀 Si el navegador ya tiene exactamente esta misma versión, responder solo 85 bytes en 0.1ms (Ahorra 99.9% de Red en Railway)
+        if (knownVersion && String(knownVersion).trim() === versionActualCola) {
+            return res.json({
+                success: true,
+                notModified: true,
+                version: versionActualCola,
+                pendientesCount: pendientesSinApartarCount
+            });
+        }
+
         let orders = _ramQueueAllOrdersCache;
         if (statusFilter && statusFilter !== 'TODAS') {
             orders = orders.filter(o => o.status === statusFilter);
@@ -7142,14 +7264,9 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
             });
         }
 
-        const pendientesSinApartarCount = _ramQueueAllOrdersCache.filter(o =>
-            o.status === 'EN_PROCESO' &&
-            !o.isWaitingBinanceAuto &&
-            !o.claimedByWorker
-        ).length;
-
         return res.json({
             success: true,
+            version: versionActualCola,
             workerEmail,
             workerName: req.staffUser.accountName || workerEmail.split('@')[0],
             role: req.effectiveRole,
