@@ -3277,12 +3277,12 @@ async function ejecutarEntregaPorAPI(orden, productoDB) {
 
     const headersBase = obtenerHeadersCentralOne();
 
-// ⚡ Sondeo en caliente ultrarrápido (máx 1s): si Central One entrega al instante lo devuelve; si tarda más, delega al vigilante sin frenar al operador
-    const consultarConEsperaCalienteCO = async (coOrderId, initialStatus, esSteamFlag, fallbackUsdVal, algoStObj) => {
+const consultarConEsperaCalienteCO = async (coOrderId, initialStatus, esSteamFlag, fallbackUsdVal, algoStObj) => {
         if (String(initialStatus || '').toLowerCase() === 'completed') {
             return await verificarYExtraerEntregaCentralOne(coOrderId, headersBase, poolCards, esSteamFlag, fallbackUsdVal, algoStObj);
         }
-        const pausasMs = [350, 650];
+        // Sondeo rápido en caliente (hasta 3.2s) para que el código salga aprobado de una vez en el mismo clic
+        const pausasMs = [450, 650, 850, 1100];
         let ultimoCheck = null;
         for (let p = 0; p < pausasMs.length; p++) {
             await new Promise(r => setTimeout(r, pausasMs[p]));
@@ -7183,7 +7183,7 @@ function invalidarCacheTiendaBootstrapRAM() {
     _ramBootstrapMutationCounter++;
 }
 
-// 1. Compresor Gzip Nativo + Control de Versión de 65 Bytes para ahorrar ~95% de Red (Network) en Railway
+// 1. Compresor Gzip Nativo + Invalidación Global en 0ms al Crear/Modificar Órdenes en Cualquier Ruta
 if (!app.response._kzBandwidthOptimizerInstalled) {
     app.response._kzBandwidthOptimizerInstalled = true;
     const _origExpressJson = app.response.json;
@@ -7191,6 +7191,27 @@ if (!app.response._kzBandwidthOptimizerInstalled) {
     app.response.json = function(body) {
         const req = this.req;
         try {
+            // ⚡ Si cualquier ruta POST acaba de crear o modificar una orden, ticket o ajuste, limpiar la caché en RAM en 0ms
+            if (req && req.method === 'POST') {
+                const p = req.path || '';
+                if (
+                    p.startsWith('/api/orders/') ||
+                    p.startsWith('/api/worker/') ||
+                    p.startsWith('/api/tickets/') ||
+                    p.startsWith('/api/binance-pay/') ||
+                    p.startsWith('/webhooks/')
+                ) {
+                    invalidarCacheColaTrabajadorRAM();
+                }
+                if (
+                    p.startsWith('/api/admin/') ||
+                    p === '/api/worker/schedule-config' ||
+                    p.startsWith('/webhooks/central-one')
+                ) {
+                    invalidarCacheTiendaBootstrapRAM();
+                }
+            }
+
             if (req && req.path === '/api/store/bootstrap' && body && body.success && Array.isArray(body.products)) {
                 const verTienda = `bv_${_ramBootstrapMutationCounter}_${body.products.length}_${body.settings?.exchangeRateVES || 0}_${body.settings?.bcvRateVES || 0}_${body.settings?.storeOpen === false ? 0 : 1}`;
                 body.version = verTienda;
@@ -7222,7 +7243,6 @@ if (!app.response._kzBandwidthOptimizerInstalled) {
     };
 }
 
-// Interceptar cualquier cambio en órdenes, tickets o configuración para actualizar versiones en 0ms
 if (!Order.prototype._kzQueueCacheHooked) {
     Order.prototype._kzQueueCacheHooked = true;
     const _prevOrdSave = Order.prototype.save;
@@ -7243,50 +7263,6 @@ if (!SupportTicket.prototype._kzQueueCacheHooked) {
     };
 }
 
-app.use((req, res, next) => {
-    // Atajo en 0.2ms para /api/store/bootstrap desde RAM sin golpear MongoDB cada 20s
-    if (req.method === 'GET' && req.path === '/api/store/bootstrap' && _ramBootstrapPayload && (Date.now() - _ramBootstrapTs < 45000)) {
-        const verTienda = `bv_${_ramBootstrapMutationCounter}_${(_ramBootstrapPayload.products || []).length}_${_ramBootstrapPayload.settings?.exchangeRateVES || 0}_${_ramBootstrapPayload.settings?.bcvRateVES || 0}_${_ramBootstrapPayload.settings?.storeOpen === false ? 0 : 1}`;
-        const clientVer = String(req.query?.knownVersion || '').trim();
-        res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-        if (clientVer && clientVer === verTienda) {
-            return res.json({
-                success: true,
-                notModified: true,
-                version: verTienda,
-                serverTimestamp: Date.now()
-            });
-        }
-        return res.json({
-            ..._ramBootstrapPayload,
-            version: verTienda,
-            serverTimestamp: Date.now()
-        });
-    }
-
-    if (req.method === 'POST') {
-        if (
-            req.path.startsWith('/api/orders/') ||
-            req.path.startsWith('/api/worker/') ||
-            req.path.startsWith('/api/tickets/') ||
-            req.path.startsWith('/api/binance-pay/') ||
-            req.path.startsWith('/webhooks/')
-        ) {
-            invalidarCacheColaTrabajadorRAM();
-            res.on('finish', invalidarCacheColaTrabajadorRAM);
-        }
-        if (
-            req.path.startsWith('/api/admin/') ||
-            req.path === '/api/worker/schedule-config' ||
-            req.path.startsWith('/webhooks/central-one')
-        ) {
-            invalidarCacheTiendaBootstrapRAM();
-            res.on('finish', invalidarCacheTiendaBootstrapRAM);
-        }
-    }
-    next();
-});
-
 app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
     res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     try {
@@ -7295,8 +7271,11 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
         const isOwner = req.effectiveRole === 'admin';
         const ahoraMs = Date.now();
 
-        // 🔄 Verificar en segundo plano (sin frenar la respuesta) cualquier orden que esté en EJECUTANDO_API ("Recibida" en Central One)
-        if (ahoraMs - _lastWorkerQueueCoSyncMs > 10000) {
+        // 🔄 Si hay alguna orden en EJECUTANDO_API, verificarla contra Central One cada 2.5 segundos
+        const hayEnEjecucionEnCache = Array.isArray(_ramQueueAllOrdersCache) && _ramQueueAllOrdersCache.some(o => o.status === 'EJECUTANDO_API');
+        const intervaloCoCheck = hayEnEjecucionEnCache ? 2500 : 10000;
+
+        if (ahoraMs - _lastWorkerQueueCoSyncMs > intervaloCoCheck) {
             _lastWorkerQueueCoSyncMs = ahoraMs;
             setImmediate(async () => {
                 try {
@@ -7310,13 +7289,16 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
                     for (const ordExec of enEjecucion) {
                         if (activeOrderProcessingLocks.has(ordExec.orderId)) continue;
                         const algoSt = ordExec.algoExecutionState || null;
-                        const codigosGuardados = (algoSt && Array.isArray(algoSt.deliveredCodesList)) ? algoSt.deliveredCodesList : [];
+                        const codigosGuardados = [
+                            ...((algoSt && Array.isArray(algoSt.ownStockCodesReserved)) ? algoSt.ownStockCodesReserved : []),
+                            ...((algoSt && Array.isArray(algoSt.deliveredCodesList)) ? algoSt.deliveredCodesList : [])
+                        ];
 
                         if (ordExec.deliveredCode || (algoSt && Number(algoSt.totalCardsExpected) > 0 && codigosGuardados.length >= Number(algoSt.totalCardsExpected))) {
                             ordExec.status = 'ENTREGADO';
                             ordExec.progressPercent = 100;
                             if (!ordExec.deliveredCode && codigosGuardados.length > 0) {
-                                ordExec.deliveredCode = codigosGuardados.join('  |  ');
+                                ordExec.deliveredCode = Array.from(new Set(codigosGuardados)).join('  |  ');
                             }
                             ordExec.statusMessage = '¡Tu pedido ha sido entregado automáticamente con éxito!';
                             ordExec.completedAt = ordExec.completedAt || new Date();
@@ -7331,15 +7313,15 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
                                 const check = await verificarYExtraerEntregaCentralOne(ordExec.apiOrderId, headersCO, poolCards, esSteamOrd, 0, algoSt);
 
                                 if (check.state === 'COMPLETED') {
-                                    const vistosRaw = new Set(codigosGuardados.map(extraerCodigoCrudoDeTextoFormateado));
-                                    const todos = [...codigosGuardados];
-                                    for (const cNuevo of (check.codigosPlanos || [])) {
-                                        const rk = extraerCodigoCrudoDeTextoFormateado(cNuevo);
+                                    const vistosRaw = new Set();
+                                    const todos = [];
+                                    [...codigosGuardados, ...(check.codigosPlanos || [])].forEach(c => {
+                                        const rk = extraerCodigoCrudoDeTextoFormateado(c);
                                         if (rk && !vistosRaw.has(rk)) {
                                             vistosRaw.add(rk);
-                                            todos.push(cNuevo);
+                                            todos.push(c);
                                         }
-                                    }
+                                    });
                                     ordExec.status = 'ENTREGADO';
                                     ordExec.progressPercent = 100;
                                     ordExec.deliveredCode = todos.length > 0 ? todos.join('  |  ') : check.deliveredCode;
@@ -7383,8 +7365,8 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
             global._ramWorkersListTs = ahoraMs;
         }
 
-        // ⚡ LECTURA DESDE CACHÉ EN RAM (Se mantiene en RAM hasta 15s y se invalida en 0ms si entra o cambia cualquier orden)
-        if (!_ramQueueAllOrdersCache || (ahoraMs - _ramQueueAllOrdersTs > 15000)) {
+        // ⚡ Caché en RAM de 2.5 segundos (y se invalida en 0ms cada vez que cualquier POST crea o modifica una orden)
+        if (!_ramQueueAllOrdersCache || (ahoraMs - _ramQueueAllOrdersTs > 2500)) {
             const [ordenesFrescas, ticketsFrescos] = await Promise.all([
                 Order.find({
                     $nor: [{ status: 'INICIANDO', isWaitingBinanceAuto: true }]
@@ -7412,12 +7394,13 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
             !o.claimedByWorker
         ).length;
 
-        // Firma instantánea del estado actual de la cola y tickets
-        const topOrd = _ramQueueAllOrdersCache[0];
+        // Firma calculada sobre las primeras 35 órdenes para detectar cualquier cambio de estado en cualquier orden activa
+        const firmaTop35 = _ramQueueAllOrdersCache.slice(0, 35).map(o =>
+            `${o.orderId}:${o.status}:${o.claimedByWorker || ''}:${(o.deliveredCode || '').length}`
+        ).join('|');
         const topTk = _ramQueueAllTicketsCache[0];
-        const versionActualCola = `qv_${_ramQueueMutationCounter}_${_ramQueueAllOrdersCache.length}_${pendientesSinApartarCount}_${topOrd ? `${topOrd.orderId}:${topOrd.status}:${topOrd.claimedByWorker || ''}:${(topOrd.deliveredCode || '').length}` : '0'}_${_ramQueueAllTicketsCache.length}_${topTk ? `${topTk.ticketId}:${topTk.status}:${(topTk.messages || []).length}` : '0'}`;
+        const versionActualCola = `qv_${_ramQueueMutationCounter}_${_ramQueueAllOrdersCache.length}_${pendientesSinApartarCount}_${firmaTop35}_${_ramQueueAllTicketsCache.length}_${topTk ? `${topTk.ticketId}:${topTk.status}:${(topTk.messages || []).length}` : '0'}`;
 
-        // 🚀 Si el navegador ya tiene exactamente esta misma versión, responder solo 85 bytes en 0.1ms (Ahorra 99.9% de Red en Railway)
         if (knownVersion && String(knownVersion).trim() === versionActualCola) {
             return res.json({
                 success: true,
