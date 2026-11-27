@@ -7161,14 +7161,19 @@ const zlib = require('zlib');
 let _lastWorkerQueueCoSyncMs = 0;
 let _ramQueueAllOrdersCache = null;
 let _ramQueueAllOrdersTs = 0;
+let _ramFastQueueOrdersCache = null;
+let _ramFastQueueOrdersTs = 0;
 let _ramQueueAllTicketsCache = null;
 let _ramQueueAllTicketsTs = 0;
 let _ramQueueMutationCounter = 1;
 let _ramBootstrapMutationCounter = 1;
+const _ramRecentDeletedOrderIds = new Set();
 
 function invalidarCacheColaTrabajadorRAM() {
     _ramQueueAllOrdersCache = null;
     _ramQueueAllOrdersTs = 0;
+    _ramFastQueueOrdersCache = null;
+    _ramFastQueueOrdersTs = 0;
     _ramQueueAllTicketsCache = null;
     _ramQueueAllTicketsTs = 0;
     _ramQueueMutationCounter++;
@@ -7183,6 +7188,48 @@ function invalidarCacheTiendaBootstrapRAM() {
     _ramBootstrapMutationCounter++;
 }
 
+// Inyecta o actualiza en 0ms cualquier orden recién creada/modificada directamente en la caché RAM de la cola
+function inyectarOrdenEnRamQueueCache(doc) {
+    try {
+        _ramQueueMutationCounter++;
+        _ramQueueAllOrdersCache = null;
+        _ramQueueAllOrdersTs = 0;
+
+        if (!doc || !doc.orderId) {
+            _ramFastQueueOrdersCache = null;
+            _ramFastQueueOrdersTs = 0;
+            return;
+        }
+
+        const obj = typeof doc.toObject === 'function' ? doc.toObject() : { ...doc };
+        const idUp = String(obj.orderId || '').trim().toUpperCase();
+        if (!idUp || _ramRecentDeletedOrderIds.has(idUp)) return;
+
+        // Ocultar checkouts de Binance que aún no han sido pagados
+        if (obj.status === 'INICIANDO' && obj.isWaitingBinanceAuto) return;
+
+        delete obj.costUSD;
+        delete obj.apiRawResponse;
+        if (obj.internalAccountLogin) delete obj.internalAccountLogin.accountPass;
+        if (obj.algoExecutionState) {
+            delete obj.algoExecutionState.pendingReplacementBody;
+            delete obj.algoExecutionState.perGamePlans;
+        }
+
+        if (Array.isArray(_ramFastQueueOrdersCache)) {
+            const idx = _ramFastQueueOrdersCache.findIndex(o => String(o.orderId || '').trim().toUpperCase() === idUp);
+            if (idx !== -1) {
+                _ramFastQueueOrdersCache[idx] = { ..._ramFastQueueOrdersCache[idx], ...obj, orderId: idUp };
+            } else {
+                _ramFastQueueOrdersCache.unshift({ ...obj, orderId: idUp });
+            }
+        }
+    } catch (e) {
+        _ramFastQueueOrdersCache = null;
+        _ramFastQueueOrdersTs = 0;
+    }
+}
+
 // 1. Compresor Gzip Nativo + Invalidación Global en 0ms al Crear/Modificar Órdenes en Cualquier Ruta
 if (!app.response._kzBandwidthOptimizerInstalled) {
     app.response._kzBandwidthOptimizerInstalled = true;
@@ -7191,17 +7238,28 @@ if (!app.response._kzBandwidthOptimizerInstalled) {
     app.response.json = function(body) {
         const req = this.req;
         try {
-            // ⚡ Si cualquier ruta POST acaba de crear o modificar una orden, ticket o ajuste, limpiar la caché en RAM en 0ms
             if (req && req.method === 'POST') {
                 const p = req.path || '';
-                if (
+                if (p === '/api/worker/delete-order' && req.body?.orderId) {
+                    const idDel = String(req.body.orderId).trim().toUpperCase();
+                    _ramRecentDeletedOrderIds.add(idDel);
+                    if (_ramRecentDeletedOrderIds.size > 200) {
+                        const first = _ramRecentDeletedOrderIds.values().next().value;
+                        _ramRecentDeletedOrderIds.delete(first);
+                    }
+                    invalidarCacheColaTrabajadorRAM();
+                } else if (
                     p.startsWith('/api/orders/') ||
                     p.startsWith('/api/worker/') ||
                     p.startsWith('/api/tickets/') ||
                     p.startsWith('/api/binance-pay/') ||
                     p.startsWith('/webhooks/')
                 ) {
-                    invalidarCacheColaTrabajadorRAM();
+                    if (body && body.order && body.order.orderId) {
+                        inyectarOrdenEnRamQueueCache(body.order);
+                    } else {
+                        invalidarCacheColaTrabajadorRAM();
+                    }
                 }
                 if (
                     p.startsWith('/api/admin/') ||
@@ -7248,7 +7306,7 @@ if (!Order.prototype._kzQueueCacheHooked) {
     const _prevOrdSave = Order.prototype.save;
     Order.prototype.save = async function(...args) {
         const r = await _prevOrdSave.apply(this, args);
-        invalidarCacheColaTrabajadorRAM();
+        inyectarOrdenEnRamQueueCache(r || this);
         return r;
     };
 }
@@ -7258,7 +7316,9 @@ if (!SupportTicket.prototype._kzQueueCacheHooked) {
     const _prevTkSave = SupportTicket.prototype.save;
     SupportTicket.prototype.save = async function(...args) {
         const r = await _prevTkSave.apply(this, args);
-        invalidarCacheColaTrabajadorRAM();
+        _ramQueueAllTicketsCache = null;
+        _ramQueueAllTicketsTs = 0;
+        _ramQueueMutationCounter++;
         return r;
     };
 }
@@ -7266,13 +7326,14 @@ if (!SupportTicket.prototype._kzQueueCacheHooked) {
 app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
     res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     try {
-        const { statusFilter, knownVersion } = req.query;
+        const { statusFilter, knownVersion, fastPoll, fullHistory } = req.query;
+        const esModoRapido = (fastPoll === '1' && fullHistory !== '1');
         const workerEmail = (req.staffUser.email || '').trim().toLowerCase();
         const isOwner = req.effectiveRole === 'admin';
         const ahoraMs = Date.now();
 
-        // 🔄 Si hay alguna orden en EJECUTANDO_API, verificarla contra Central One cada 2.5 segundos
-        const hayEnEjecucionEnCache = Array.isArray(_ramQueueAllOrdersCache) && _ramQueueAllOrdersCache.some(o => o.status === 'EJECUTANDO_API');
+        const fuenteEnMemoria = _ramFastQueueOrdersCache || _ramQueueAllOrdersCache || [];
+        const hayEnEjecucionEnCache = Array.isArray(fuenteEnMemoria) && fuenteEnMemoria.some(o => o.status === 'EJECUTANDO_API');
         const intervaloCoCheck = hayEnEjecucionEnCache ? 2500 : 10000;
 
         if (ahoraMs - _lastWorkerQueueCoSyncMs > intervaloCoCheck) {
@@ -7303,7 +7364,6 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
                             ordExec.statusMessage = '¡Tu pedido ha sido entregado automáticamente con éxito!';
                             ordExec.completedAt = ordExec.completedAt || new Date();
                             await ordExec.save();
-                            invalidarCacheColaTrabajadorRAM();
                             continue;
                         }
 
@@ -7334,7 +7394,6 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
                                         ordExec.markModified('algoExecutionState');
                                     }
                                     await ordExec.save();
-                                    invalidarCacheColaTrabajadorRAM();
                                 } else if (check.state === 'PROCESSING') {
                                     if (!activeCentralOnePollers.has(ordExec.orderId)) {
                                         programarSeguimientoOrdenCentralOne(ordExec.orderId, ordExec.apiOrderId);
@@ -7350,7 +7409,6 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
                                         ordExec.workerNotes = `⚠️ Central One reembolsó/canceló el intento (${check.failureCode || 'fallo'}): ${check.errorMsg || 'Puedes reintentar el envío.'}`;
                                         ordExec.apiOrderId = '';
                                         await ordExec.save();
-                                        invalidarCacheColaTrabajadorRAM();
                                     }
                                 }
                             } catch (eCheck) {}
@@ -7365,41 +7423,66 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
             global._ramWorkersListTs = ahoraMs;
         }
 
-        // ⚡ Caché en RAM de 2.5 segundos (y se invalida en 0ms cada vez que cualquier POST crea o modifica una orden)
-        if (!_ramQueueAllOrdersCache || (ahoraMs - _ramQueueAllOrdersTs > 2500)) {
-            const [ordenesFrescas, ticketsFrescos] = await Promise.all([
-                Order.find({
-                    $nor: [{ status: 'INICIANDO', isWaitingBinanceAuto: true }]
-                })
-                .sort({ fecha: -1 })
-                .limit(5000)
-                .select('-costUSD -apiRawResponse -internalAccountLogin.accountPass -algoExecutionState.pendingReplacementBody -algoExecutionState.perGamePlans')
-                .lean(),
-                SupportTicket.find({})
-                .sort({ updatedAt: -1 })
-                .limit(120)
-                .select('-messages.attachmentUrl')
-                .lean()
-            ]);
+        const projectionCola = '-costUSD -apiRawResponse -internalAccountLogin.accountPass -algoExecutionState.pendingReplacementBody -algoExecutionState.perGamePlans';
 
-            _ramQueueAllOrdersCache = ordenesFrescas || [];
-            _ramQueueAllOrdersTs = ahoraMs;
-            _ramQueueAllTicketsCache = ticketsFrescos || [];
+        if (!_ramQueueAllTicketsCache || (ahoraMs - _ramQueueAllTicketsTs > 3500)) {
+            _ramQueueAllTicketsCache = await SupportTicket.find({})
+                .sort({ updatedAt: -1 })
+                .limit(100)
+                .select('-messages.attachmentUrl')
+                .lean() || [];
             _ramQueueAllTicketsTs = ahoraMs;
         }
 
-        const pendientesSinApartarCount = _ramQueueAllOrdersCache.filter(o =>
+        let listaBaseOrdenes = [];
+
+        if (esModoRapido) {
+            // 🚀 MODO FAST-POLL (~15ms): Todas las órdenes activas + las últimas 120 cerradas (~15 KB en vez de 5,000 órdenes)
+            if (!_ramFastQueueOrdersCache || (ahoraMs - _ramFastQueueOrdersTs > 2000)) {
+                const [activas, recientesCerradas] = await Promise.all([
+                    Order.find({
+                        status: { $in: ['EN_PROCESO', 'EN_REVISION', 'EJECUTANDO_API', 'ERROR_API'] },
+                        isWaitingBinanceAuto: { $ne: true }
+                    }).sort({ fecha: -1 }).limit(150).select(projectionCola).lean(),
+                    Order.find({
+                        status: { $in: ['ENTREGADO', 'RECHAZADO'] }
+                    }).sort({ fecha: -1 }).limit(120).select(projectionCola).lean()
+                ]);
+
+                const mapaUnico = new Map();
+                [...(activas || []), ...(recientesCerradas || [])].forEach(o => {
+                    if (o && o.orderId) mapaUnico.set(o.orderId, o);
+                });
+                _ramFastQueueOrdersCache = Array.from(mapaUnico.values()).sort((a, b) => new Date(b.fecha) - new Date(a.fecha));
+                _ramFastQueueOrdersTs = ahoraMs;
+            }
+            listaBaseOrdenes = _ramFastQueueOrdersCache;
+        } else {
+            // 📚 MODO HISTORIAL PROFUNDO (Se carga 1 sola vez en segundo plano, tope ágil de 600 órdenes = 40 páginas)
+            if (!_ramQueueAllOrdersCache || (ahoraMs - _ramQueueAllOrdersTs > 10000)) {
+                _ramQueueAllOrdersCache = await Order.find({
+                    $nor: [{ status: 'INICIANDO', isWaitingBinanceAuto: true }]
+                })
+                .sort({ fecha: -1 })
+                .limit(600)
+                .select(projectionCola)
+                .lean() || [];
+                _ramQueueAllOrdersTs = ahoraMs;
+            }
+            listaBaseOrdenes = _ramQueueAllOrdersCache;
+        }
+
+        const pendientesSinApartarCount = listaBaseOrdenes.filter(o =>
             o.status === 'EN_PROCESO' &&
             !o.isWaitingBinanceAuto &&
             !o.claimedByWorker
         ).length;
 
-        // Firma calculada sobre las primeras 35 órdenes para detectar cualquier cambio de estado en cualquier orden activa
-        const firmaTop35 = _ramQueueAllOrdersCache.slice(0, 35).map(o =>
+        const firmaTop35 = listaBaseOrdenes.slice(0, 35).map(o =>
             `${o.orderId}:${o.status}:${o.claimedByWorker || ''}:${(o.deliveredCode || '').length}`
         ).join('|');
         const topTk = _ramQueueAllTicketsCache[0];
-        const versionActualCola = `qv_${_ramQueueMutationCounter}_${_ramQueueAllOrdersCache.length}_${pendientesSinApartarCount}_${firmaTop35}_${_ramQueueAllTicketsCache.length}_${topTk ? `${topTk.ticketId}:${topTk.status}:${(topTk.messages || []).length}` : '0'}`;
+        const versionActualCola = `qv_${esModoRapido ? 'F' : 'H'}_${_ramQueueMutationCounter}_${listaBaseOrdenes.length}_${pendientesSinApartarCount}_${firmaTop35}_${_ramQueueAllTicketsCache.length}_${topTk ? `${topTk.ticketId}:${topTk.status}:${(topTk.messages || []).length}` : '0'}`;
 
         if (knownVersion && String(knownVersion).trim() === versionActualCola) {
             return res.json({
@@ -7410,7 +7493,7 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
             });
         }
 
-        let orders = _ramQueueAllOrdersCache;
+        let orders = listaBaseOrdenes;
         if (statusFilter && statusFilter !== 'TODAS') {
             orders = orders.filter(o => o.status === statusFilter);
         }
@@ -7435,11 +7518,13 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
 
         return res.json({
             success: true,
+            isFullHistory: !esModoRapido,
             version: versionActualCola,
             workerEmail,
             workerName: req.staffUser.accountName || workerEmail.split('@')[0],
             role: req.effectiveRole,
             pendientesCount: pendientesSinApartarCount,
+            deletedOrderIds: Array.from(_ramRecentDeletedOrderIds),
             orders,
             tickets: ticketsAbiertos,
             workersList: isOwner ? (global._ramWorkersListCache || []) : []
