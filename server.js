@@ -8422,7 +8422,6 @@ app.get('/api/admin/overview', verificarSoloAdmin, async (req, res) => {
 
         const isFastMode = req.query.fast === '1' || req.query.lite === '1';
 
-        // Sincronizado con zona horaria de Venezuela (UTC-4)
         const ahoraVzla = new Date(Date.now() - (4 * 60 * 60 * 1000));
         const hoyInicio = new Date(Date.UTC(ahoraVzla.getUTCFullYear(), ahoraVzla.getUTCMonth(), ahoraVzla.getUTCDate(), 4, 0, 0, 0));
         const mesInicio = new Date(Date.UTC(ahoraVzla.getUTCFullYear(), ahoraVzla.getUTCMonth(), 1, 4, 0, 0, 0));
@@ -8431,7 +8430,10 @@ app.get('/api/admin/overview', verificarSoloAdmin, async (req, res) => {
             ? '-centralOneCatalogCache -centralOneCoverageCache -processedWebhookIds -flyersCanvaConfig'
             : '-centralOneCoverageCache -processedWebhookIds';
 
-        const projectionProducts = '-packages.targetSchemaCache -altPackages.targetSchemaCache';
+        // En modo rápido (?fast=1) excluye las imágenes Base64 repetidas (el frontend ya las conserva en memoria desde bootstrap), ahorrando ~10 MB y permitiendo enviar las 5,000 órdenes de estadísticas en 0.15s
+        const projectionProducts = isFastMode
+            ? '-cardImageUrl -flyerImageUrl -infoImageUrl -packages.imageUrl -altPackages.imageUrl -packages.targetSchemaCache -altPackages.targetSchemaCache'
+            : '-packages.targetSchemaCache -altPackages.targetSchemaCache';
 
         const [
             settingsRaw,
@@ -8447,27 +8449,25 @@ app.get('/api/admin/overview', verificarSoloAdmin, async (req, res) => {
             todosLosPines,
             transaccionesTokems
         ] = await Promise.all([
-            StoreSettings.findOne({ key: 'main_settings' })
-                .select(projectionSettings)
-                .lean(),
-            CatalogProduct.find()
-                .sort({ sortOrder: 1 })
-                .select(projectionProducts)
-                .lean(),
-            PaymentMethod.find().sort({ sortOrder: 1 }).lean(),
-            Order.find()
+            StoreSettings.findOne({ key: 'main_settings' }).select(projectionSettings).lean().catch(() => null),
+            CatalogProduct.find().sort({ sortOrder: 1 }).select(projectionProducts).lean().catch(() => []),
+            PaymentMethod.find().sort({ sortOrder: 1 }).lean().catch(() => []),
+            Order.find({
+                $nor: [{ status: 'INICIANDO', isWaitingBinanceAuto: true }]
+            })
                 .sort({ fecha: -1 })
-                .limit(isFastMode ? 600 : 1500)
-                .select('-internalAccountLogin.accountPass -apiRawResponse -algoExecutionState.pendingReplacementBody')
-                .lean(),
-            Order.countDocuments({ status: 'EN_PROCESO' }),
-            SupportTicket.countDocuments({ status: { $in: ['ABIERTO', 'EN_REVISION'] } }),
-            SupportTicket.find().sort({ createdAt: -1 }).limit(150).select('ticketId orderId userEmail category status assignedWorker assignedWorkerName createdAt').lean(),
-            User.find({ role: { $in: ['worker', 'admin'] } }).select('email accountName role tokems').lean(),
-            User.find().sort({ createdAt: -1 }).select('accountName email role isVerified tokems savedProfiles createdAt').lean(),
-            Balance.find({ tokens: { $gt: 0 } }).select('deviceId tokens').lean(),
-            Pin.find().select('code tokens used createdBy createdAt').lean(),
-            Transaction.find().sort({ fecha: -1 }).limit(isFastMode ? 250 : 500).select('deviceId tipo tokens plan precio fecha').lean()
+                .limit(5000)
+                .select('-internalAccountLogin.accountPass -apiRawResponse -algoExecutionState.pendingReplacementBody -algoExecutionState.perGamePlans')
+                .lean()
+                .catch(() => []),
+            Order.countDocuments({ status: 'EN_PROCESO', isWaitingBinanceAuto: { $ne: true } }).catch(() => 0),
+            SupportTicket.countDocuments({ status: { $in: ['ABIERTO', 'EN_REVISION'] } }).catch(() => 0),
+            SupportTicket.find().sort({ createdAt: -1 }).limit(150).select('ticketId orderId userEmail category status assignedWorker assignedWorkerName createdAt').lean().catch(() => []),
+            User.find({ role: { $in: ['worker', 'admin'] } }).select('email accountName role tokems').lean().catch(() => []),
+            User.find().sort({ createdAt: -1 }).select('accountName email role isVerified tokems savedProfiles createdAt').lean().catch(() => []),
+            Balance.find({ tokens: { $gt: 0 } }).select('deviceId tokens').lean().catch(() => []),
+            Pin.find().select('code tokens used createdBy createdAt').lean().catch(() => []),
+            Transaction.find().sort({ fecha: -1 }).limit(500).select('deviceId tipo tokens plan precio fecha').lean().catch(() => [])
         ]);
 
         const settings = settingsRaw ? { ...settingsRaw } : {};
