@@ -7326,14 +7326,15 @@ if (!SupportTicket.prototype._kzQueueCacheHooked) {
 app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
     res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     try {
-        const { statusFilter, knownVersion, fastPoll, fullHistory } = req.query;
-        const esModoRapido = (fastPoll === '1' && fullHistory !== '1');
+        const { statusFilter, knownVersion, closedLimit, searchQuery } = req.query;
+        // Por defecto envía solo 3 páginas (45 órdenes cerradas por operador) para que vuele en 0.08s
+        const limiteCerradasPorOp = Math.min(5000, Math.max(45, parseInt(closedLimit, 10) || 45));
+        const qBusqueda = String(searchQuery || '').trim().toLowerCase();
         const workerEmail = (req.staffUser.email || '').trim().toLowerCase();
         const isOwner = req.effectiveRole === 'admin';
         const ahoraMs = Date.now();
 
-        const fuenteEnMemoria = _ramFastQueueOrdersCache || _ramQueueAllOrdersCache || [];
-        const hayEnEjecucionEnCache = Array.isArray(fuenteEnMemoria) && fuenteEnMemoria.some(o => o.status === 'EJECUTANDO_API');
+        const hayEnEjecucionEnCache = Array.isArray(_ramQueueAllOrdersCache) && _ramQueueAllOrdersCache.some(o => o.status === 'EJECUTANDO_API');
         const intervaloCoCheck = hayEnEjecucionEnCache ? 2500 : 10000;
 
         if (ahoraMs - _lastWorkerQueueCoSyncMs > intervaloCoCheck) {
@@ -7425,64 +7426,40 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
 
         const projectionCola = '-costUSD -apiRawResponse -internalAccountLogin.accountPass -algoExecutionState.pendingReplacementBody -algoExecutionState.perGamePlans';
 
-        if (!_ramQueueAllTicketsCache || (ahoraMs - _ramQueueAllTicketsTs > 3500)) {
+        if (!_ramQueueAllOrdersCache || (ahoraMs - _ramQueueAllOrdersTs > 600000)) {
+            _ramQueueAllOrdersCache = await Order.find({
+                $nor: [{ status: 'INICIANDO', isWaitingBinanceAuto: true }]
+            })
+            .sort({ fecha: -1 })
+            .limit(5000)
+            .select(projectionCola)
+            .lean() || [];
+            _ramQueueAllOrdersTs = ahoraMs;
+        }
+
+        if (!_ramQueueAllTicketsCache || (ahoraMs - _ramQueueAllTicketsTs > 4000)) {
             _ramQueueAllTicketsCache = await SupportTicket.find({})
                 .sort({ updatedAt: -1 })
-                .limit(100)
+                .limit(120)
                 .select('-messages.attachmentUrl')
                 .lean() || [];
             _ramQueueAllTicketsTs = ahoraMs;
         }
 
-        let listaBaseOrdenes = [];
-
-        if (esModoRapido) {
-            // 🚀 MODO FAST-POLL (~15ms): Todas las órdenes activas + las últimas 120 cerradas (~15 KB en vez de 5,000 órdenes)
-            if (!_ramFastQueueOrdersCache || (ahoraMs - _ramFastQueueOrdersTs > 2000)) {
-                const [activas, recientesCerradas] = await Promise.all([
-                    Order.find({
-                        status: { $in: ['EN_PROCESO', 'EN_REVISION', 'EJECUTANDO_API', 'ERROR_API'] },
-                        isWaitingBinanceAuto: { $ne: true }
-                    }).sort({ fecha: -1 }).limit(150).select(projectionCola).lean(),
-                    Order.find({
-                        status: { $in: ['ENTREGADO', 'RECHAZADO'] }
-                    }).sort({ fecha: -1 }).limit(120).select(projectionCola).lean()
-                ]);
-
-                const mapaUnico = new Map();
-                [...(activas || []), ...(recientesCerradas || [])].forEach(o => {
-                    if (o && o.orderId) mapaUnico.set(o.orderId, o);
-                });
-                _ramFastQueueOrdersCache = Array.from(mapaUnico.values()).sort((a, b) => new Date(b.fecha) - new Date(a.fecha));
-                _ramFastQueueOrdersTs = ahoraMs;
-            }
-            listaBaseOrdenes = _ramFastQueueOrdersCache;
-        } else {
-            // 📚 MODO HISTORIAL PROFUNDO (Se carga 1 sola vez en segundo plano, tope ágil de 600 órdenes = 40 páginas)
-            if (!_ramQueueAllOrdersCache || (ahoraMs - _ramQueueAllOrdersTs > 10000)) {
-                _ramQueueAllOrdersCache = await Order.find({
-                    $nor: [{ status: 'INICIANDO', isWaitingBinanceAuto: true }]
-                })
-                .sort({ fecha: -1 })
-                .limit(600)
-                .select(projectionCola)
-                .lean() || [];
-                _ramQueueAllOrdersTs = ahoraMs;
-            }
-            listaBaseOrdenes = _ramQueueAllOrdersCache;
-        }
-
-        const pendientesSinApartarCount = listaBaseOrdenes.filter(o =>
-            o.status === 'EN_PROCESO' &&
+        const pendientesSinApartarCount = _ramQueueAllOrdersCache.filter(o =>
+            (o.status === 'EN_PROCESO' || o.status === 'ERROR_API') &&
             !o.isWaitingBinanceAuto &&
-            !o.claimedByWorker
+            !o.claimedByWorker &&
+            !String(o.approvedByWorker || '').toUpperCase().startsWith('AUTO-') &&
+            !o.paidWithTokems &&
+            !o.binanceCheckoutId
         ).length;
 
-        const firmaTop35 = listaBaseOrdenes.slice(0, 35).map(o =>
+        const firmaTop35 = _ramQueueAllOrdersCache.slice(0, 35).map(o =>
             `${o.orderId}:${o.status}:${o.claimedByWorker || ''}:${(o.deliveredCode || '').length}`
         ).join('|');
         const topTk = _ramQueueAllTicketsCache[0];
-        const versionActualCola = `qv_${esModoRapido ? 'F' : 'H'}_${_ramQueueMutationCounter}_${listaBaseOrdenes.length}_${pendientesSinApartarCount}_${firmaTop35}_${_ramQueueAllTicketsCache.length}_${topTk ? `${topTk.ticketId}:${topTk.status}:${(topTk.messages || []).length}` : '0'}`;
+        const versionActualCola = `qv_L${limiteCerradasPorOp}_Q${qBusqueda}_${_ramQueueMutationCounter}_${_ramQueueAllOrdersCache.length}_${pendientesSinApartarCount}_${firmaTop35}_${_ramQueueAllTicketsCache.length}_${topTk ? `${topTk.ticketId}:${topTk.status}:${(topTk.messages || []).length}` : '0'}`;
 
         if (knownVersion && String(knownVersion).trim() === versionActualCola) {
             return res.json({
@@ -7493,19 +7470,85 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
             });
         }
 
-        let orders = listaBaseOrdenes;
-        if (statusFilter && statusFilter !== 'TODAS') {
-            orders = orders.filter(o => o.status === statusFilter);
+        // 📊 Calcular los Totales Históricos Reales por Operador en RAM y recortar solo las páginas pedidas (Múltiplos de 45 = 3 páginas de 15)
+        const operatorTotals = {};
+        const cerradasEnviadasPorOp = {};
+        const ordenesRecortadas = [];
+
+        const asegurarBucketOp = (em) => {
+            if (!operatorTotals[em]) {
+                operatorTotals[em] = { approved: 0, rejected: 0, review: 0, claimed: 0, all: 0, loadedClosed: 0 };
+                cerradasEnviadasPorOp[em] = 0;
+            }
+        };
+
+        const detectarOpPropietarioServer = (o) => {
+            const claimed = String(o.claimedByWorker || '').trim().toLowerCase();
+            if (claimed && claimed.includes('@')) return claimed;
+            const approved = String(o.approvedByWorker || '').trim().toLowerCase();
+            if (approved && approved.includes('@') && !approved.startsWith('auto-')) return approved;
+            const reviewed = String(o.reviewedByWorker || '').trim().toLowerCase();
+            if (reviewed && reviewed.includes('@')) return reviewed;
+            return '__AUTO_OR_OWNER__';
+        };
+
+        for (let i = 0; i < _ramQueueAllOrdersCache.length; i++) {
+            const o = _ramQueueAllOrdersCache[i];
+            const opKey = detectarOpPropietarioServer(o);
+            asegurarBucketOp(opKey);
+
+            const st = o.status;
+            const esActiva = (st === 'EN_PROCESO' || st === 'EN_REVISION' || st === 'EJECUTANDO_API' || st === 'ERROR_API');
+            const esAutoEjecutando = (st === 'EJECUTANDO_API' && (String(o.approvedByWorker || '').toUpperCase().startsWith('AUTO-') || o.paidWithTokems || o.binanceCheckoutId));
+
+            // Contabilizar en los totales históricos reales
+            if (st === 'ENTREGADO' || esAutoEjecutando) {
+                operatorTotals[opKey].approved++;
+                operatorTotals[opKey].all++;
+            } else if (st === 'RECHAZADO') {
+                operatorTotals[opKey].rejected++;
+                operatorTotals[opKey].all++;
+            } else if (st === 'EN_REVISION') {
+                operatorTotals[opKey].review++;
+                operatorTotals[opKey].all++;
+            } else if (esActiva && o.claimedByWorker) {
+                operatorTotals[opKey].claimed++;
+                operatorTotals[opKey].all++;
+            }
+
+            // Si el trabajador no es Dueño, filtrar solo las suyas o las libres por apartar
+            if (!isOwner) {
+                const claimed = String(o.claimedByWorker || '').trim().toLowerCase();
+                const esSinApartar = esActiva && !claimed;
+                if (!esSinApartar && opKey !== workerEmail) continue;
+            }
+
+            // Si hay búsqueda activa, incluir cualquier orden histórica que coincida con la búsqueda
+            if (qBusqueda) {
+                const txt = `${o.orderId || ''} ${o.paymentReference || ''} ${o.binanceTransactionId || ''} ${o.playerUid || ''} ${o.productName || ''} ${o.userEmail || ''} ${o.userWhatsapp || ''} ${o.deliveredCode || ''}`.toLowerCase();
+                if (txt.includes(qBusqueda)) {
+                    ordenesRecortadas.push(o);
+                }
+                continue;
+            }
+
+            // Incluir SIEMPRE el 100% de las órdenes activas (Por Apartar, Mis Apartadas, En Revisión)
+            if (esActiva && !esAutoEjecutando) {
+                ordenesRecortadas.push(o);
+                continue;
+            }
+
+            // Para órdenes cerradas (Aprobadas y Rechazadas), enviar solo hasta el límite de páginas pedido (ej: 45 = 3 páginas de 15 por operador)
+            if (cerradasEnviadasPorOp[opKey] < limiteCerradasPorOp) {
+                cerradasEnviadasPorOp[opKey]++;
+                operatorTotals[opKey].loadedClosed++;
+                ordenesRecortadas.push(o);
+            }
         }
 
-        if (!isOwner) {
-            orders = orders.filter(o => {
-                const claimed = String(o.claimedByWorker || '').trim().toLowerCase();
-                const approved = String(o.approvedByWorker || '').trim().toLowerCase();
-                const reviewed = String(o.reviewedByWorker || '').trim().toLowerCase();
-                const esSinApartarActiva = (o.status === 'EN_PROCESO' || o.status === 'ERROR_API' || o.status === 'EJECUTANDO_API') && !claimed;
-                return esSinApartarActiva || claimed === workerEmail || approved === workerEmail || reviewed === workerEmail;
-            });
+        let orders = ordenesRecortadas;
+        if (statusFilter && statusFilter !== 'TODAS') {
+            orders = orders.filter(o => o.status === statusFilter);
         }
 
         let ticketsAbiertos = _ramQueueAllTicketsCache;
@@ -7518,7 +7561,8 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
 
         return res.json({
             success: true,
-            isFullHistory: !esModoRapido,
+            closedLimitApplied: limiteCerradasPorOp,
+            operatorTotals,
             version: versionActualCola,
             workerEmail,
             workerName: req.staffUser.accountName || workerEmail.split('@')[0],
