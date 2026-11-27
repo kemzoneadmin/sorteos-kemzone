@@ -10098,7 +10098,55 @@ function limpiarYObtenerVisitantesEnLineaAhora() {
     return _ramOnlineVisitorsMap.size;
 }
 
-// Endpoint ultraligero en RAM (0 escrituras en BD) para registrar visitantes reales con la tienda abierta
+// ⚡ SEÑAL GLOBAL DE REINICIO REMOTO Y ROMPE-CACHÉ PARA TODOS LOS USUARIOS Y STAFF
+StoreSettings.schema.add({
+    forceReloadEpoch: { type: Number, default: 0 }
+});
+
+let _ramForceReloadEpoch = Date.now();
+
+setTimeout(async () => {
+    try {
+        const docEpoch = await StoreSettings.collection.findOne(
+            { key: 'main_settings' },
+            { projection: { forceReloadEpoch: 1 } }
+        );
+        if (docEpoch && Number(docEpoch.forceReloadEpoch) > 0) {
+            _ramForceReloadEpoch = Number(docEpoch.forceReloadEpoch);
+        } else {
+            await StoreSettings.collection.updateOne(
+                { key: 'main_settings' },
+                { $set: { forceReloadEpoch: _ramForceReloadEpoch } },
+                { upsert: true }
+            );
+        }
+    } catch (e) {}
+}, 1600);
+
+// Endpoint exclusivo del Dueño para reiniciarle la página y limpiar caché a todos los clientes y trabajadores
+app.post('/api/admin/force-reload-all', verificarSoloAdmin, async (req, res) => {
+    try {
+        _ramForceReloadEpoch = Date.now();
+        invalidarCacheTiendaBootstrapRAM();
+        invalidarCacheColaTrabajadorRAM();
+
+        await StoreSettings.collection.updateOne(
+            { key: 'main_settings' },
+            { $set: { forceReloadEpoch: _ramForceReloadEpoch, updatedAt: new Date() } },
+            { upsert: true }
+        );
+
+        return res.json({
+            success: true,
+            forceReloadEpoch: _ramForceReloadEpoch,
+            message: 'Señal de reinicio global enviada a todos los clientes y trabajadores.'
+        });
+    } catch (error) {
+        return res.status(500).json({ error: 'Error enviando señal de reinicio global.' });
+    }
+});
+
+// Endpoint ultraligero en RAM (0 escrituras en BD) para registrar visitantes reales y enviar señal de reinicio en vivo
 app.post('/api/store/ping', (req, res) => {
     try {
         const { visitorId, inDashboard, leave } = req.body || {};
@@ -10112,24 +10160,28 @@ app.post('/api/store/ping', (req, res) => {
                 _ramOnlineVisitorsMap.set(key, Date.now());
             }
         }
-        return res.json({ onlineNow: limpiarYObtenerVisitantesEnLineaAhora() });
+        return res.json({
+            onlineNow: limpiarYObtenerVisitantesEnLineaAhora(),
+            forceReloadEpoch: _ramForceReloadEpoch
+        });
     } catch (e) {
-        return res.json({ onlineNow: 0 });
+        return res.json({ onlineNow: 0, forceReloadEpoch: _ramForceReloadEpoch });
     }
 });
 
-// Inyectar automáticamente onlineVisitorsNow en /api/admin/overview y /api/worker/queue
-app.use(['/api/admin/overview', '/api/worker/queue'], (req, res, next) => {
-    const _origJson = res.json.bind(res);
+// Inyectar automáticamente onlineVisitorsNow y forceReloadEpoch en bootstrap, overview y cola de trabajo
+app.use(['/api/store/bootstrap', '/api/admin/overview', '/api/worker/queue'], (req, res, next) => {
+    const jsonOriginal = res.json.bind(res);
     res.json = function(body) {
         if (body && typeof body === 'object') {
             const countOnline = limpiarYObtenerVisitantesEnLineaAhora();
             body.onlineVisitorsNow = countOnline;
+            body.forceReloadEpoch = _ramForceReloadEpoch;
             if (body.analytics && typeof body.analytics === 'object') {
                 body.analytics.onlineVisitorsNow = countOnline;
             }
         }
-        return _origJson(body);
+        return jsonOriginal(body);
     };
     next();
 });
