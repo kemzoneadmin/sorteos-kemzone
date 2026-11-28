@@ -7323,21 +7323,21 @@ if (!SupportTicket.prototype._kzQueueCacheHooked) {
     };
 }
 
+let _ramOperatorTotalsCache = null;
+let _ramOperatorTotalsTs = 0;
+
 app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
     res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     try {
         const { statusFilter, knownVersion, closedLimit, searchQuery } = req.query;
-        // Por defecto envía solo 3 páginas (45 órdenes cerradas por operador) para que vuele en 0.08s
-        const limiteCerradasPorOp = Math.min(5000, Math.max(45, parseInt(closedLimit, 10) || 45));
-        const qBusqueda = String(searchQuery || '').trim().toLowerCase();
+        const limiteCerradas = Math.min(1500, Math.max(45, parseInt(closedLimit, 10) || 45));
+        const qBusqueda = String(searchQuery || '').trim();
         const workerEmail = (req.staffUser.email || '').trim().toLowerCase();
         const isOwner = req.effectiveRole === 'admin';
         const ahoraMs = Date.now();
 
-        const hayEnEjecucionEnCache = Array.isArray(_ramQueueAllOrdersCache) && _ramQueueAllOrdersCache.some(o => o.status === 'EJECUTANDO_API');
-        const intervaloCoCheck = hayEnEjecucionEnCache ? 2500 : 10000;
-
-        if (ahoraMs - _lastWorkerQueueCoSyncMs > intervaloCoCheck) {
+        // 1. Verificar órdenes en EJECUTANDO_API contra Central One en segundo plano sin frenar la respuesta
+        if (ahoraMs - _lastWorkerQueueCoSyncMs > 2500) {
             _lastWorkerQueueCoSyncMs = ahoraMs;
             setImmediate(async () => {
                 try {
@@ -7365,6 +7365,7 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
                             ordExec.statusMessage = '¡Tu pedido ha sido entregado automáticamente con éxito!';
                             ordExec.completedAt = ordExec.completedAt || new Date();
                             await ordExec.save();
+                            _ramOperatorTotalsTs = 0;
                             continue;
                         }
 
@@ -7395,6 +7396,7 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
                                         ordExec.markModified('algoExecutionState');
                                     }
                                     await ordExec.save();
+                                    _ramOperatorTotalsTs = 0;
                                 } else if (check.state === 'PROCESSING') {
                                     if (!activeCentralOnePollers.has(ordExec.orderId)) {
                                         programarSeguimientoOrdenCentralOne(ordExec.orderId, ordExec.apiOrderId);
@@ -7410,6 +7412,7 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
                                         ordExec.workerNotes = `⚠️ Central One reembolsó/canceló el intento (${check.failureCode || 'fallo'}): ${check.errorMsg || 'Puedes reintentar el envío.'}`;
                                         ordExec.apiOrderId = '';
                                         await ordExec.save();
+                                        _ramOperatorTotalsTs = 0;
                                     }
                                 }
                             } catch (eCheck) {}
@@ -7426,27 +7429,129 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
 
         const projectionCola = '-costUSD -apiRawResponse -internalAccountLogin.accountPass -algoExecutionState.pendingReplacementBody -algoExecutionState.perGamePlans';
 
-        if (!_ramQueueAllOrdersCache || (ahoraMs - _ramQueueAllOrdersTs > 600000)) {
-            _ramQueueAllOrdersCache = await Order.find({
-                $nor: [{ status: 'INICIANDO', isWaitingBinanceAuto: true }]
-            })
-            .sort({ fecha: -1 })
-            .limit(5000)
-            .select(projectionCola)
-            .lean() || [];
-            _ramQueueAllOrdersTs = ahoraMs;
+        // 2. Conteo Histórico Real por Operador vía Aggregation de MongoDB (Tarda 4ms sin descargar 5,000 documentos)
+        if (!_ramOperatorTotalsCache || (ahoraMs - _ramOperatorTotalsTs > 8000)) {
+            const aggRows = await Order.aggregate([
+                { $match: { status: { $in: ['ENTREGADO', 'RECHAZADO', 'EN_REVISION', 'EN_PROCESO', 'EJECUTANDO_API', 'ERROR_API'] }, isWaitingBinanceAuto: { $ne: true } } },
+                {
+                    $project: {
+                        status: 1,
+                        claimed: { $toLower: { $ifNull: ['$claimedByWorker', ''] } },
+                        approved: { $toLower: { $ifNull: ['$approvedByWorker', ''] } },
+                        reviewed: { $toLower: { $ifNull: ['$reviewedByWorker', ''] } }
+                    }
+                },
+                {
+                    $group: {
+                        _id: { status: '$status', claimed: '$claimed', approved: '$approved', reviewed: '$reviewed' },
+                        count: { $sum: 1 }
+                    }
+                }
+            ]).catch(() => []);
+
+            const totalsMap = {};
+            const ensureOp = (k) => {
+                if (!totalsMap[k]) totalsMap[k] = { approved: 0, rejected: 0, review: 0, claimed: 0, all: 0 };
+            };
+
+            aggRows.forEach(row => {
+                const { status, claimed, approved, reviewed } = row._id || {};
+                const cnt = Number(row.count) || 0;
+                let opKey = '__AUTO_OR_OWNER__';
+                if (claimed && claimed.includes('@')) opKey = claimed;
+                else if (approved && approved.includes('@') && !approved.startsWith('auto-')) opKey = approved;
+                else if (reviewed && reviewed.includes('@')) opKey = reviewed;
+
+                ensureOp(opKey);
+                if (status === 'ENTREGADO') {
+                    totalsMap[opKey].approved += cnt;
+                    totalsMap[opKey].all += cnt;
+                } else if (status === 'RECHAZADO') {
+                    totalsMap[opKey].rejected += cnt;
+                    totalsMap[opKey].all += cnt;
+                } else if (status === 'EN_REVISION') {
+                    totalsMap[opKey].review += cnt;
+                    totalsMap[opKey].all += cnt;
+                } else if (claimed) {
+                    totalsMap[opKey].claimed += cnt;
+                    totalsMap[opKey].all += cnt;
+                }
+            });
+
+            _ramOperatorTotalsCache = totalsMap;
+            _ramOperatorTotalsTs = ahoraMs;
         }
 
-        if (!_ramQueueAllTicketsCache || (ahoraMs - _ramQueueAllTicketsTs > 4000)) {
+        // 3. CONSULTA DIRECTA EN TIEMPO REAL A MONGODB (ÍNDICE { status: 1, fecha: -1 } ➔ 12 milisegundos, CERO CACHÉ CONGELADA)
+        let promesasOrdenes = [];
+
+        if (qBusqueda) {
+            const esc = qBusqueda.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const rx = new RegExp(esc, 'i');
+            promesasOrdenes = [
+                Order.find({
+                    isWaitingBinanceAuto: { $ne: true },
+                    $or: [
+                        { orderId: { $regex: rx } },
+                        { paymentReference: { $regex: rx } },
+                        { binanceTransactionId: { $regex: rx } },
+                        { playerUid: { $regex: rx } },
+                        { productName: { $regex: rx } },
+                        { userEmail: { $regex: rx } },
+                        { userWhatsapp: { $regex: rx } },
+                        { deliveredCode: { $regex: rx } }
+                    ]
+                }).sort({ fecha: -1 }).limit(120).select(projectionCola).lean()
+            ];
+        } else {
+            // Traer SIEMPRE el 100% de las órdenes activas en vivo + las N cerradas de cada operador (45 por defecto = 3 páginas)
+            const workersEmails = (global._ramWorkersListCache || []).map(w => String(w.email || '').trim().toLowerCase()).filter(Boolean);
+            const operadoresParaCerradas = isOwner ? Array.from(new Set([workerEmail, ...workersEmails])) : [workerEmail];
+
+            promesasOrdenes = [
+                Order.find({
+                    status: { $in: ['EN_PROCESO', 'EN_REVISION', 'EJECUTANDO_API', 'ERROR_API'] },
+                    isWaitingBinanceAuto: { $ne: true }
+                }).sort({ fecha: -1 }).limit(200).select(projectionCola).lean(),
+                ...operadoresParaCerradas.map(em => {
+                    const esAdminTarget = isOwner && em === workerEmail;
+                    const filtroOp = esAdminTarget
+                        ? {
+                            status: { $in: ['ENTREGADO', 'RECHAZADO'] },
+                            $or: [
+                                { claimedByWorker: em },
+                                { claimedByWorker: { $in: ['', null] }, approvedByWorker: { $in: [em, 'AUTO-TOKEMS-API', 'AUTO-BINANCE-PAY', ''] } }
+                            ]
+                        }
+                        : {
+                            status: { $in: ['ENTREGADO', 'RECHAZADO'] },
+                            $or: [{ claimedByWorker: em }, { approvedByWorker: em }, { reviewedByWorker: em }]
+                        };
+                    return Order.find(filtroOp).sort({ fecha: -1 }).limit(limiteCerradas).select(projectionCola).lean();
+                })
+            ];
+        }
+
+        if (!_ramQueueAllTicketsCache || (ahoraMs - _ramQueueAllTicketsTs > 3000)) {
             _ramQueueAllTicketsCache = await SupportTicket.find({})
                 .sort({ updatedAt: -1 })
-                .limit(120)
+                .limit(100)
                 .select('-messages.attachmentUrl')
                 .lean() || [];
             _ramQueueAllTicketsTs = ahoraMs;
         }
 
-        const pendientesSinApartarCount = _ramQueueAllOrdersCache.filter(o =>
+        const resultadosLotes = await Promise.all(promesasOrdenes);
+        const mapaUnicoOrdenes = new Map();
+        resultadosLotes.forEach(lote => {
+            (lote || []).forEach(o => {
+                if (o && o.orderId) mapaUnicoOrdenes.set(o.orderId, o);
+            });
+        });
+
+        let orders = Array.from(mapaUnicoOrdenes.values()).sort((a, b) => new Date(b.fecha) - new Date(a.fecha));
+
+        const pendientesSinApartarCount = orders.filter(o =>
             (o.status === 'EN_PROCESO' || o.status === 'ERROR_API') &&
             !o.isWaitingBinanceAuto &&
             !o.claimedByWorker &&
@@ -7455,11 +7560,11 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
             !o.binanceCheckoutId
         ).length;
 
-        const firmaTop35 = _ramQueueAllOrdersCache.slice(0, 35).map(o =>
+        const firmaActivas = orders.slice(0, 40).map(o =>
             `${o.orderId}:${o.status}:${o.claimedByWorker || ''}:${(o.deliveredCode || '').length}`
         ).join('|');
         const topTk = _ramQueueAllTicketsCache[0];
-        const versionActualCola = `qv_L${limiteCerradasPorOp}_Q${qBusqueda}_${_ramQueueMutationCounter}_${_ramQueueAllOrdersCache.length}_${pendientesSinApartarCount}_${firmaTop35}_${_ramQueueAllTicketsCache.length}_${topTk ? `${topTk.ticketId}:${topTk.status}:${(topTk.messages || []).length}` : '0'}`;
+        const versionActualCola = `qv_L${limiteCerradas}_Q${qBusqueda}_${orders.length}_${pendientesSinApartarCount}_${firmaActivas}_${_ramQueueAllTicketsCache.length}_${topTk ? `${topTk.ticketId}:${topTk.status}:${(topTk.messages || []).length}` : '0'}`;
 
         if (knownVersion && String(knownVersion).trim() === versionActualCola) {
             return res.json({
@@ -7470,85 +7575,18 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
             });
         }
 
-        // 📊 Calcular los Totales Históricos Reales por Operador en RAM y recortar solo las páginas pedidas (Múltiplos de 45 = 3 páginas de 15)
-        const operatorTotals = {};
-        const cerradasEnviadasPorOp = {};
-        const ordenesRecortadas = [];
-
-        const asegurarBucketOp = (em) => {
-            if (!operatorTotals[em]) {
-                operatorTotals[em] = { approved: 0, rejected: 0, review: 0, claimed: 0, all: 0, loadedClosed: 0 };
-                cerradasEnviadasPorOp[em] = 0;
-            }
-        };
-
-        const detectarOpPropietarioServer = (o) => {
-            const claimed = String(o.claimedByWorker || '').trim().toLowerCase();
-            if (claimed && claimed.includes('@')) return claimed;
-            const approved = String(o.approvedByWorker || '').trim().toLowerCase();
-            if (approved && approved.includes('@') && !approved.startsWith('auto-')) return approved;
-            const reviewed = String(o.reviewedByWorker || '').trim().toLowerCase();
-            if (reviewed && reviewed.includes('@')) return reviewed;
-            return '__AUTO_OR_OWNER__';
-        };
-
-        for (let i = 0; i < _ramQueueAllOrdersCache.length; i++) {
-            const o = _ramQueueAllOrdersCache[i];
-            const opKey = detectarOpPropietarioServer(o);
-            asegurarBucketOp(opKey);
-
-            const st = o.status;
-            const esActiva = (st === 'EN_PROCESO' || st === 'EN_REVISION' || st === 'EJECUTANDO_API' || st === 'ERROR_API');
-            const esAutoEjecutando = (st === 'EJECUTANDO_API' && (String(o.approvedByWorker || '').toUpperCase().startsWith('AUTO-') || o.paidWithTokems || o.binanceCheckoutId));
-
-            // Contabilizar en los totales históricos reales
-            if (st === 'ENTREGADO' || esAutoEjecutando) {
-                operatorTotals[opKey].approved++;
-                operatorTotals[opKey].all++;
-            } else if (st === 'RECHAZADO') {
-                operatorTotals[opKey].rejected++;
-                operatorTotals[opKey].all++;
-            } else if (st === 'EN_REVISION') {
-                operatorTotals[opKey].review++;
-                operatorTotals[opKey].all++;
-            } else if (esActiva && o.claimedByWorker) {
-                operatorTotals[opKey].claimed++;
-                operatorTotals[opKey].all++;
-            }
-
-            // Si el trabajador no es Dueño, filtrar solo las suyas o las libres por apartar
-            if (!isOwner) {
-                const claimed = String(o.claimedByWorker || '').trim().toLowerCase();
-                const esSinApartar = esActiva && !claimed;
-                if (!esSinApartar && opKey !== workerEmail) continue;
-            }
-
-            // Si hay búsqueda activa, incluir cualquier orden histórica que coincida con la búsqueda
-            if (qBusqueda) {
-                const txt = `${o.orderId || ''} ${o.paymentReference || ''} ${o.binanceTransactionId || ''} ${o.playerUid || ''} ${o.productName || ''} ${o.userEmail || ''} ${o.userWhatsapp || ''} ${o.deliveredCode || ''}`.toLowerCase();
-                if (txt.includes(qBusqueda)) {
-                    ordenesRecortadas.push(o);
-                }
-                continue;
-            }
-
-            // Incluir SIEMPRE el 100% de las órdenes activas (Por Apartar, Mis Apartadas, En Revisión)
-            if (esActiva && !esAutoEjecutando) {
-                ordenesRecortadas.push(o);
-                continue;
-            }
-
-            // Para órdenes cerradas (Aprobadas y Rechazadas), enviar solo hasta el límite de páginas pedido (ej: 45 = 3 páginas de 15 por operador)
-            if (cerradasEnviadasPorOp[opKey] < limiteCerradasPorOp) {
-                cerradasEnviadasPorOp[opKey]++;
-                operatorTotals[opKey].loadedClosed++;
-                ordenesRecortadas.push(o);
-            }
-        }
-
-        let orders = ordenesRecortadas;
         if (statusFilter && statusFilter !== 'TODAS') {
             orders = orders.filter(o => o.status === statusFilter);
+        }
+
+        if (!isOwner) {
+            orders = orders.filter(o => {
+                const claimed = String(o.claimedByWorker || '').trim().toLowerCase();
+                const approved = String(o.approvedByWorker || '').trim().toLowerCase();
+                const reviewed = String(o.reviewedByWorker || '').trim().toLowerCase();
+                const esSinApartarActiva = (o.status === 'EN_PROCESO' || o.status === 'ERROR_API' || o.status === 'EJECUTANDO_API') && !claimed;
+                return esSinApartarActiva || claimed === workerEmail || approved === workerEmail || reviewed === workerEmail;
+            });
         }
 
         let ticketsAbiertos = _ramQueueAllTicketsCache;
@@ -7561,8 +7599,8 @@ app.get('/api/worker/queue', verificarTrabajadorOAdmin, async (req, res) => {
 
         return res.json({
             success: true,
-            closedLimitApplied: limiteCerradasPorOp,
-            operatorTotals,
+            closedLimitApplied: limiteCerradas,
+            operatorTotals: _ramOperatorTotalsCache || {},
             version: versionActualCola,
             workerEmail,
             workerName: req.staffUser.accountName || workerEmail.split('@')[0],
